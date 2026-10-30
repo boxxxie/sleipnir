@@ -196,43 +196,75 @@ assert(len(track.allocation_map) == 0) // Zero bytes leaked!
 
 ---
 
-### 7. AST Metaprogramming (`@(actor)` & `@(behavior)`)
+### 7. Optional AST Metaprogramming (`@(actor)` & `@(behavior)`)
 
-Using Odin's standard-library AST parser (`core:odin/parser` + `core:odin/ast`), [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans your package for `@(actor)` structs and `@(behavior)` procedures and generates message structs, tagged unions, dispatchers, `spawn_<actor>` constructors, and Pony-style `be_<behavior>` async callers:
+If you want Pony-style `be` behaviors without writing message structs, `union` definitions, or `switch` dispatchers by hand, Sleipnir includes an **optional** zero-dependency AST code generator ([`actor/codegen`](actor/codegen/codegen.odin) & [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin)) built on Odin's standard library (`core:odin/parser` + `core:odin/ast`).
+
+#### What You Write:
+
+Annotate any struct with `@(actor)` and any procedure whose `self` parameter is `^Your_Actor` with `@(behavior)` (across a single file or split across multiple `.odin` files in the same package):
 
 ```odin
+package main
+
+import "actor"
+
 @(actor)
 Bank_Account :: struct {
-    owner:   string,
-    balance: i64,
+    owner:    string,
+    balance:  i64,
+    tx_count: int,
 }
 
 @(behavior)
 deposit :: proc(self: ^Bank_Account, amount: i64, memo: string = "deposit") {
-    self.balance += amount
+    self.balance  += amount
+    self.tx_count += 1
 }
 
 @(behavior)
 withdraw :: proc(self: ^Bank_Account, amount: i64) {
-    self.balance -= amount
+    self.balance  -= amount
+    self.tx_count += 1
+}
+
+// Multiple actors can share a behavior name (e.g. `be_reset`) via `@(behavior="reset")`:
+@(behavior="reset")
+account_reset :: proc(self: ^Bank_Account) {
+    self.balance  = 0
+    self.tx_count = 0
 }
 
 main :: proc() {
     _ = actor.scoped_scheduler(num_workers = 2)
 
+    // `spawn_bank_account` and `be_*` / `send_*` are generated in `actors_gen.odin`:
     account := spawn_bank_account(Bank_Account{owner = "Sleipnir", balance = 500})
-    be_deposit(account, 250)            // Generated Pony-style `be` behavior!
-    be_deposit(account, 100, "wire-in")
+
+    be_deposit(account, 250)            // Uses default `memo = "deposit"`
+    be_deposit(account, 100, "wire-in") // Explicit `memo`
     be_withdraw(account, 175)
+    be_reset(account)
 }
 ```
 
-Generate bindings and run with Odin's `-custom-attribute:actor,behavior` flag:
+#### What `sleipnir_gen` Generates (`actors_gen.odin`):
+
+Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` files in the target package directory, matches every `@(behavior)` to its `@(actor)` by `self: ^Actor_Type`, forwards any cross-file `import` declarations used in parameter types, and writes `actors_gen.odin` containing:
+- Message structs (`Bank_Account_Msg_deposit`, `Bank_Account_Msg_withdraw`, `Bank_Account_Msg_reset`)
+- Tagged union (`Bank_Account_Msg`) and type aliases (`Bank_Account_Actor`, `Bank_Account_PID`)
+- `bank_account_dispatch` procedure and `spawn_bank_account` constructor
+- Overloaded `be_<behavior>` and `send_<behavior>` proc groups (accepting both `^Bank_Account_Actor` and `Bank_Account_PID`)
 
 ```bash
+# 1. Generate `actors_gen.odin` for one or more package directories:
 odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
+
+# 2. Compile or run with Odin's `-custom-attribute` flag:
 odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
 ```
+
+> See [`examples/05_ast_metaprogramming/`](examples/05_ast_metaprogramming/) ([`audit_logger.odin`](examples/05_ast_metaprogramming/audit_logger.odin), [`bank_account.odin`](examples/05_ast_metaprogramming/bank_account.odin), [`main.odin`](examples/05_ast_metaprogramming/main.odin), and generated [`actors_gen.odin`](examples/05_ast_metaprogramming/actors_gen.odin)) for a complete multi-file example.
 
 ---
 
