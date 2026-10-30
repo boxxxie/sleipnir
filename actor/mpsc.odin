@@ -50,9 +50,10 @@ mpsc_push_chain :: #force_inline proc(q: ^MPSC_Queue($T), first: ^T, last: ^T) {
 // Check if the queue currently has no elements ready for immediate pop.
 // In a Vyukov detached MPSC queue, the queue is empty when `head == tail` AND
 // when `tail == &stub`, `stub.next == nil`.
+@(require_results)
 mpsc_is_empty :: #force_inline proc(q: ^MPSC_Queue($T)) -> bool {
 	head := intrinsics.atomic_load_explicit(&q.head, .Seq_Cst)
-	tail := q.tail
+	tail := intrinsics.atomic_load_explicit(&q.tail, .Relaxed)
 	if head != tail {
 		return false
 	}
@@ -135,7 +136,8 @@ shard_push :: #force_inline proc(s: ^RunQ_Shard($T), item: ^T) {
 
 shard_pop_or_steal :: proc(s: ^RunQ_Shard($T)) -> ^T {
 	// Fast lock-free check before acquiring ticket lock
-	if s.tail == &s.stub && intrinsics.atomic_load_explicit(&s.stub.next, .Relaxed) == nil {
+	if intrinsics.atomic_load_explicit(&s.tail, .Relaxed) == &s.stub &&
+	   intrinsics.atomic_load_explicit(&s.stub.next, .Relaxed) == nil {
 		return nil
 	}
 	sync.ticket_mutex_lock(&s.pop_lock)

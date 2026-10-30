@@ -37,6 +37,7 @@ Context :: struct {
 	sched:       ^Scheduler,
 	worker_id:   int,
 	current_env: rawptr, // Pointer to the active `^Envelope(Msg)` being processed
+	forwarded:   bool,   // Set to `true` when `forward` transfers ownership of `current_env`
 }
 
 // Concrete typed Actor parameterized over its private `$State` and `$Msg` type.
@@ -237,11 +238,6 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 	quota      := s.batch_quota
 
 	for intrinsics.atomic_load_explicit(&s.running, .Acquire) {
-		if s.target_messages > 0 &&
-		   intrinsics.atomic_load_explicit(&s.total_processed, .Relaxed) >= s.target_messages {
-			break
-		}
-
 		// 1. Pop from worker's home shard, then steal from peer shards
 		a := shard_pop_or_steal(&s.shards[wid % num_shards])
 		if a == nil && num_shards > 1 {
@@ -277,9 +273,6 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 
 		// 2. Execute up to `quota` messages on the actor
 		processed, has_more := a.step_proc(a, &ctx, quota)
-		if processed > 0 && s.target_messages > 0 {
-			intrinsics.atomic_add_explicit(&s.total_processed, i64(processed), .Release)
-		}
 
 		// 3. Reschedule or unschedule with `.Seq_Cst` Dekker barrier to prevent lost wakeups
 		if has_more {
@@ -292,6 +285,10 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 			if still_has_more {
 				scheduler_schedule_actor(s, a, wid)
 			}
+		}
+
+		if processed > 0 {
+			intrinsics.atomic_add_explicit(&s.total_processed, i64(processed), .Release)
 		}
 	}
 }
@@ -361,10 +358,11 @@ actor_generic_step_proc :: proc($State: typeid, $Msg: typeid) -> proc(base: ^Act
 			if env == nil do break
 
 			ctx.current_env = env
+			ctx.forwarded   = false
 			self.receive(ctx, self, &env.msg)
 			processed += 1
 
-			if (env.flags & ENVELOPE_FLAG_FORWARDED) == 0 {
+			if !ctx.forwarded {
 				if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
 					pid := env.pool_id
 					alloc := self.pools[pid].allocator if (has_pools && int(pid) < len(self.pools)) else self.allocator
@@ -451,16 +449,16 @@ send_ctx :: #force_inline proc(
 }
 
 // Zero-copy `iso` ownership transfer inside an actor's `receive` callback!
-// Marks the currently executing `Envelope(Msg)` as forwarded so the caller actor
-// does NOT recycle it, mutates its payload to `updated_msg`, and pushes the exact
-// same memory node directly onto `target.mailbox` (zero allocation, zero free!).
+// Marks `ctx.forwarded = true` on the worker's stack so the caller actor does
+// NOT recycle `current_env`, mutates its payload to `updated_msg`, and pushes
+// the exact same memory node directly onto `target.mailbox` (zero allocation, zero free!).
 forward :: #force_inline proc(
 	ctx: ^Context,
 	target: ^Actor($State, $Msg),
 	updated_msg: Msg,
 ) {
 	env := cast(^Envelope(Msg))ctx.current_env
-	env.flags |= ENVELOPE_FLAG_FORWARDED
+	ctx.forwarded = true
 	env.msg = updated_msg
 	send_envelope(ctx.sched, target, env, ctx.worker_id)
 }
