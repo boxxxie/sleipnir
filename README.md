@@ -1,298 +1,274 @@
-# Sleipnir (`package actor`) — Lock-Free Pony-Style M:N Actors for Odin
+# Sleipnir (`package actor`)
 
-[![Odin](https://img.shields.io/badge/Odin-dev--2026-3882D2?logo=odin&logoColor=white)](https://odin-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+High-throughput, zero-GC, Pony-style actor runtime for [Odin](https://odin-lang.org/).
 
-> **Sleipnir** — Odin's legendary eight-legged steed (*"Odin's Pony"*).
+Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N` thread scheduler, lock-free `Envelope_Pool` slab recycling, and a wait-free `Sharded_SPSC_Mailbox`—all integrated with Odin's `context.allocator` and explicit `destroy` lifecycle.
 
-**Sleipnir** (`package actor`) is a zero-dependency, pure-Odin concurrency library inspired by the **[Pony programming language](https://www.ponylang.io/)** (`libponyrt`) and Microsoft's **[snmalloc](https://github.com/microsoft/snmalloc)** message-passing allocator. It brings Pony's **lock-free intrusive MPSC actor mailboxes**, **batched message pool reclamation**, **zero-copy `iso` (isolated) message forwarding**, and **wait-free sharded SPSC ring mailboxes** directly to Odin.
-
----
-
-## Why "Sleipnir"? (The Pony Connection)
-
-The [Pony language](https://www.ponylang.io/) pioneered one of the fastest actor runtimes in systems programming (`libponyrt`) by combining:
-1. **Intrusive lock-free MPSC actor mailboxes** (`libponyrt/actor/messageq.c`) where producers enqueue messages via a single atomic `XCHG` and consumers pop with zero atomic Read-Modify-Write instructions.
-2. **Reference capabilities (`iso` / isolated pointers)** that allow mutable message payloads to be transferred across actors with **zero copying** and **zero data races**.
-3. **Cooperative M:N work-stealing scheduling** where actors execute up to a fixed batch quantum of messages before yielding the worker thread.
-
-**Sleipnir** (Odin's mythological steed—literally *"Odin's Pony"*) adapts Pony's runtime architecture and `snmalloc`'s batched cross-thread memory return into idiomatic, generic, zero-dependency Odin (`base:intrinsics`, `core:sync`, `core:thread`, and `core:mem`).
+- **Zero Garbage Collector:** Deterministic memory management via `actor.Envelope_Pool(Msg)` or custom `mem.Allocator`.
+- **Heterogeneous Actors:** Spawn arbitrarily many actor types `(State, Msg)` onto a single shared `actor.Scheduler`.
+- **Overloaded `actor API`:** Ergonomic proc groups (`actor.init`, `actor.destroy`, `actor.send`, `actor.forward`) work from both external threads and inside actor handlers.
+- **Performance:** **31–78M msgs/sec** on 4-producer MPSC fan-in, **827M msgs/sec** (`1.2 ns/msg`) on wait-free sharded SPSC, and **16.65M hops/sec** across 1,024 autonomous actors on 8 cores—matching or outperforming the official Pony C runtime (`libponyrt` 0.77.2) and raw C11 (`stdatomic.h`). See the full [**Benchmark Report & Cross-Runtime Comparison (`benchmarks/README.md`)**](benchmarks/README.md).
 
 ---
 
-## Features
+## Quick Start
 
-* **Heterogeneous M:N Work-Stealing Scheduler (`actor.Scheduler`)**
-  Multiplexes thousands of lightweight, strongly-typed `actor.Actor($State, $Msg)` instances onto a configurable pool of OS worker threads with per-worker run-queue shards and work-stealing.
-* **Lock-Free Intrusive MPSC Mailboxes (`actor.MPSC_Queue`)**
-  Single-instruction atomic `XCHG` message enqueue (`mpsc_push`) and `pony_sendv`-style batch chain splicing (`mpsc_push_chain` / `send_batch_from_pool`). Supports both detached Vyukov pop (`mpsc_pop_detached`) and Pony's zero-RMW dummy-tail pop (`mpsc_pop_dummy`).
-* **`snmalloc`-Style Batched Envelope Recycling (`actor.Envelope_Pool`)**
-  Eliminates cross-core per-message cache-line invalidations by grouping consumed message envelopes by their origin pool during an actor's batch quantum and returning the entire linked chain in **one single atomic `XCHG`**.
-* **Zero-Copy `iso` Ownership Forwarding (`actor.forward`)**
-  Allows an actor to mutate and forward the currently executing message envelope directly to another actor's mailbox with **zero allocations and zero frees**.
-* **Wait-Free Sharded SPSC Mailboxes (`actor.Sharded_SPSC_Mailbox`)**
-  Replaces shared MPSC atomic exchanges with one cache-aligned ring lane per producer thread—reaching **750–900+ million msgs/sec (~1.1 ns/msg)** with zero `lock xchg` instructions.
-* **Adaptive 2-Phase `sync.Futex` Parking (`enable_parking = true`)**
-  Spins briefly with `intrinsics.cpu_relax()` under bursty traffic before sleeping idle worker threads on a kernel `Futex` for **0% idle CPU usage**, protected by a `.Seq_Cst` Dekker barrier to prevent lost wakeups.
-* **First-Class Custom Allocator Support (`context.allocator`)**
-  Every allocation point accepts an explicit `mem.Allocator` and is verified leak-free under Odin's `mem.Tracking_Allocator`.
+Import `./actor` into your Odin project and run tests or examples:
 
----
-
-## Repository Structure
-
-```text
-sleipnir/
-├── actor/                              # Reusable library package (`package actor`)
-│   ├── doc.odin                        # Package docs (`odin doc ./actor`) & overload groups
-│   ├── mpsc.odin                       # Intrusive lock-free MPSC queue & RunQ_Shard
-│   ├── spsc.odin                       # Wait-free SPSC_Lane & Sharded_SPSC_Mailbox
-│   ├── pool.odin                       # Envelope_Pool (chain return) & Watermark_Slab
-│   ├── actor.odin                      # Actor($State, $Msg), Scheduler, spawn/send/forward
-│   └── actor_test.odin                 # Unit test suite (`odin test ./actor`)
-├── examples/                           # Standalone runnable examples
-│   ├── 01_ping_pong.odin               # Minimal 2-actor zero-copy ping-pong
-│   ├── 02_heterogeneous_pipeline.odin  # Multiple actor types on one M:N scheduler
-│   ├── 03_sharded_spsc_mailbox.odin    # Wait-free Sharded_SPSC_Mailbox fan-in
-│   └── library_demo.odin               # Combined demo & benchmark verification
-└── benchmarks/                         # Comparative Odin, Pony (libponyrt), & C11 benchmark suite
-    ├── README.md                       # Microarchitectural analysis & full empirical results
-    ├── actor_benchmark.odin            # Full 5-workload comparative Odin + libponyrt C FFI suite
-    ├── build_libponyrt.sh              # One-command builder for official libponyrt (0.77.2)
-    └── actor_benchmark_c11.c           # Matching C11 / pthreads reference benchmark
-```
-
----
-
-## Installation
-
-Because **Sleipnir** has zero external dependencies beyond Odin's `base:` and `core:` collections, you can add it to any Odin project in two ways:
-
-### Option 1: Copy or Submodule into Your Project
 ```bash
-git submodule add https://github.com/boxxxie/sleipnir.git third_party/sleipnir
-```
-Then import it directly via relative path:
-```odin
-import "third_party/sleipnir/actor"
-```
-
-### Option 2: Use an Odin Compiler Collection (`-collection`)
-Pass `-collection:sleipnir=./path/to/sleipnir` (or `-collection:actor=./path/to/sleipnir/actor` as configured in `ols.json`):
-```bash
-odin run src/ -collection:sleipnir=./third_party/sleipnir -o:speed
-```
-```odin
-import "sleipnir:actor"
+odin test actor
+odin run examples/01_ping_pong.odin -file
+odin run examples/02_heterogeneous_pipeline.odin -file
+odin run examples/03_sharded_spsc_mailbox.odin -file
 ```
 
 ---
 
-## Quickstart
+## Examples
 
-### 1. Heterogeneous Actors with Pooled Messages & Futex Parking
+### 1. Basic Actor & Pooled Message Passing
 
-See [`examples/02_heterogeneous_pipeline.odin`](examples/02_heterogeneous_pipeline.odin):
+Create a [`Scheduler`](actor/scheduler.odin), an [`Envelope_Pool`](actor/pool.odin) for zero-allocation message recycling, and spawn an actor with [`actor.spawn`](actor/scheduler.odin):
 
 ```odin
 package main
 
-import "actor"
 import "core:fmt"
+import "core:sync"
+import "actor"
+
+Counter :: struct {
+    total: int,
+    done:  ^sync.Sema,
+}
 
 Add_Msg :: struct {
-	amount:   i64,
-	reply_to: ^actor.Actor(Aggregator_State, i64),
+    amount: int,
+    final:  bool,
 }
 
-Counter_State    :: struct { count: i64 }
-Aggregator_State :: struct { total: i64 }
-
-counter_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(Counter_State, Add_Msg), msg: ^Add_Msg) {
-	self.state.count += msg.amount
-	if msg.reply_to != nil {
-		// Send our subtotal to a completely different Actor type on the same scheduler:
-		actor.send(ctx, msg.reply_to, self.state.count)
-	}
-}
-
-aggregator_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(Aggregator_State, i64), msg: ^i64) {
-	self.state.total += msg^
-	actor.complete_token(ctx, 1)
+handle_add :: proc(ctx: ^actor.Context, state: ^Counter, msg: ^Add_Msg) {
+    state.total += msg.amount
+    if msg.final {
+        fmt.printf("Total: %d\n", state.total)
+        sync.sema_post(state.done)
+    }
 }
 
 main :: proc() {
-	sched: actor.Scheduler
-	actor.init(&sched, actor.Scheduler_Config{
-		num_workers    = 2,
-		enable_parking = true, // 0% CPU when idle
-	})
-	defer actor.destroy(&sched)
+    sched: actor.Scheduler
+    actor.init(&sched, num_workers = 2)
+    defer actor.destroy(&sched)
 
-	add_pools := make([]actor.Envelope_Pool(Add_Msg), 2)
-	rep_pools := make([]actor.Envelope_Pool(i64), 2)
-	for w := 0; w < 2; w += 1 {
-		actor.init(&add_pools[w], u16(w), 128)
-		actor.init(&rep_pools[w], u16(w), 128)
-	}
-	defer {
-		for w := 0; w < 2; w += 1 {
-			actor.destroy(&add_pools[w])
-			actor.destroy(&rep_pools[w])
-		}
-		delete(add_pools)
-		delete(rep_pools)
-	}
+    pool: actor.Envelope_Pool(Add_Msg)
+    actor.init(&pool, num_threads = 1, slots_per_shard = 1024)
+    defer actor.destroy(&pool)
 
-	agg     := actor.spawn(Aggregator_State{}, aggregator_receive, rep_pools)
-	counter := actor.spawn(Counter_State{}, counter_receive, add_pools)
-	defer actor.destroy(agg)
-	defer actor.destroy(counter)
+    actor.start(&sched)
 
-	sched.pending_tokens = 1
-	actor.scheduler_start(&sched)
+    done: sync.Sema
+    counter := actor.spawn(&sched, Counter{done = &done}, handle_add)
 
-	actor.send(&sched, &add_pools[0], counter, Add_Msg{amount = 20, reply_to = nil})
-	actor.send(&sched, &add_pools[0], counter, Add_Msg{amount = 22, reply_to = agg})
+    // Send 1,000 pooled messages from the main thread (shard 0)
+    for i in 1 ..= 1000 {
+        actor.send(&sched, &pool, counter, Add_Msg{
+            amount = i,
+            final  = (i == 1000),
+        })
+    }
 
-	actor.scheduler_wait_tokens(&sched)
-	fmt.printfln("Total = %d", agg.state.total) // Output: Total = 42
+    sync.sema_wait(&done) // Prints: Total: 500500
 }
 ```
 
-### 2. Zero-Copy `iso` Message Forwarding (`actor.forward`)
+---
 
-When messages circulate through an actor graph (e.g., state machines, pipelines, token rings, or large payloads), `actor.forward` transfers ownership of the active `Envelope($Msg)` directly to the next actor without touching any memory pool or allocator (see [`examples/01_ping_pong.odin`](examples/01_ping_pong.odin)):
+### 2. Batched Message Splicing (`Chain=K`)
+
+When a producer emits multiple messages to the same actor, passing a slice `[]Msg` to [`actor.send`](actor/actor.odin) links all $K$ envelopes locally in thread-local storage and splices the entire chain into the target actor's mailbox with **a single atomic `XCHG`** (reducing atomic contention by $K\times$):
 
 ```odin
-player_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(Table_State, Ball_Msg), msg: ^Ball_Msg) {
-	if msg.bounces < msg.target_bounces {
-		// Reuses the active Envelope(Ball_Msg) in-place (zero allocation, zero free):
-		actor.forward(ctx, self.state.partner, Ball_Msg{
-			bounces        = msg.bounces + 1,
-			target_bounces = msg.target_bounces,
-		})
-	} else {
-		actor.complete_token(ctx, 1)
-	}
+batch := [4]Add_Msg{
+    {amount = 10},
+    {amount = 20},
+    {amount = 30},
+    {amount = 40, final = true},
+}
+
+// Links all 4 envelopes locally and performs 1 atomic XCHG on `counter`'s mailbox
+actor.send(&sched, &pool, counter, batch[:], producer_shard = 0)
+```
+
+---
+
+### 3. Zero-Copy `iso` Message Forwarding (`actor.forward`)
+
+In Pony-style reference capabilities, an isolated (`iso`) message envelope can be mutated in place and forwarded to another actor without allocating or freeing a new envelope. Calling [`actor.forward`](actor/actor.odin) inside a handler transfers ownership of the current envelope directly to the next actor:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:sync"
+import "actor"
+
+Ball :: struct {
+    hops_left: int,
+}
+
+Player :: struct {
+    partner: actor.PID(Ball),
+    done:    ^sync.Sema,
+}
+
+on_ball :: proc(ctx: ^actor.Context, self: ^Player, ball: ^Ball) {
+    if ball.hops_left <= 0 {
+        sync.sema_post(self.done)
+        return
+    }
+    ball.hops_left -= 1
+    // Mutate `ball` in place and forward the existing envelope with zero allocation!
+    actor.forward(ctx, self.partner, ball)
+}
+
+main :: proc() {
+    sched: actor.Scheduler
+    actor.init(&sched, num_workers = 2)
+    defer actor.destroy(&sched)
+
+    done: sync.Sema
+    ping := actor.spawn(&sched, Player{done = &done}, on_ball)
+    pong := actor.spawn(&sched, Player{partner = ping, done = &done}, on_ball)
+    ping.raw.user_state = rawptr(&Player{partner = pong, done = &done}) // or send init msg
+
+    actor.start(&sched)
+
+    // Heap-allocated one-off message (freed automatically when no longer forwarded)
+    actor.send(&sched, ping, Ball{hops_left = 100_000})
+    sync.sema_wait(&done)
 }
 ```
 
-### 3. Wait-Free Sharded SPSC Mailbox (`actor.Sharded_SPSC_Mailbox`)
+> See [`examples/01_ping_pong.odin`](examples/01_ping_pong.odin) for the complete runnable ping-pong example.
 
-When a known number of producer threads feed a hot actor, `Sharded_SPSC_Mailbox` eliminates `lock xchg` contention by giving each producer its own cache-aligned wait-free ring lane (see [`examples/03_sharded_spsc_mailbox.odin`](examples/03_sharded_spsc_mailbox.odin)):
+---
+
+### 4. Heterogeneous Actors on a Shared Scheduler
+
+Multiple actor types with distinct `(State, Msg)` pairs coexist on the same [`actor.Scheduler`](actor/scheduler.odin). Inside an actor handler, pass `ctx` (`^actor.Context`) to `actor.send` to automatically route via the current worker thread's shard without atomic contention:
 
 ```odin
-mbox: actor.Sharded_SPSC_Mailbox(Event, 8192)
-actor.init(&mbox, num_producers)
-defer actor.destroy(&mbox)
+// Worker actor state & message
+Work_Req :: struct {
+    value:    u64,
+    reply_to: actor.PID(Work_Result),
+}
+Worker :: struct {
+    result_pool: ^actor.Envelope_Pool(Work_Result),
+}
 
-// On Producer Thread `p`:
-actor.push(&mbox, p, my_event)
+// Aggregator actor state & message
+Work_Result :: struct {
+    hashed: u64,
+}
+Aggregator :: struct {
+    received: int,
+}
 
-// On Consumer Actor:
-processed := actor.sharded_spsc_consume(&mbox, 128, &actor_state, proc(s: ^State, ev: ^Event) {
-	// Process up to 128 events per lane with a single .Release index update per batch!
-})
+worker_receive :: proc(ctx: ^actor.Context, state: ^Worker, req: ^Work_Req) {
+    res := Work_Result{hashed = req.value ~ 0x9e3779b97f4a7c15}
+    // Send a typed `Work_Result` to the `Aggregator` actor using `ctx`
+    actor.send(ctx, state.result_pool, req.reply_to, res)
+}
+
+aggregator_receive :: proc(ctx: ^actor.Context, state: ^Aggregator, res: ^Work_Result) {
+    state.received += 1
+}
+```
+
+> See [`examples/02_heterogeneous_pipeline.odin`](examples/02_heterogeneous_pipeline.odin) for a full multi-stage heterogeneous pipeline.
+
+---
+
+### 5. Wait-Free `Sharded_SPSC_Mailbox` (`827M msgs/sec`)
+
+When an actor receives from a known set of $P$ producer threads (`0 ..< num_producers`), [`actor.Sharded_SPSC_Mailbox`](actor/spsc_mailbox.odin) gives each producer its own cache-line-isolated Single-Producer Single-Consumer ring buffer—**zero `LOCK XCHG` or `LOCK CMPXCHG` instructions on the data path**:
+
+```odin
+package main
+
+import "core:fmt"
+import "actor"
+
+Sensor_Event :: struct {
+    sensor_id: u32,
+    reading:   f64,
+}
+
+main :: proc() {
+    mbox: actor.Sharded_SPSC_Mailbox(Sensor_Event, 1024)
+    actor.init(&mbox, num_producers = 4)
+    defer actor.destroy(&mbox)
+
+    // Producer 0 and Producer 1 push concurrently with zero atomic RMW contention
+    actor.push(&mbox, producer_id = 0, val = Sensor_Event{sensor_id = 1, reading = 42.5})
+    actor.push(&mbox, producer_id = 1, val = Sensor_Event{sensor_id = 2, reading = 99.1})
+
+    // Single consumer drains up to 64 events across all producer lanes
+    total := 0.0
+    drained := actor.sharded_spsc_consume(&mbox, max_per_lane = 64, state = &total,
+        handler = proc(total: ^f64, ev: ^Sensor_Event) {
+            total^ += ev.reading
+        },
+    )
+    fmt.printf("Drained %d events, sum = %.1f\n", drained, total)
+}
+```
+
+> See [`examples/03_sharded_spsc_mailbox.odin`](examples/03_sharded_spsc_mailbox.odin) for a multi-threaded producer-consumer example.
+
+---
+
+### 6. Custom Allocators & Leak-Free Verification
+
+Every `actor.init`, `actor.spawn`, and `actor.send` accepts an optional `allocator := context.allocator`, making it trivial to verify zero memory leaks with Odin's `mem.Tracking_Allocator` or run actors inside a fixed arena:
+
+```odin
+track: mem.Tracking_Allocator
+mem.tracking_allocator_init(&track, context.allocator)
+defer mem.tracking_allocator_destroy(&track)
+alloc := mem.tracking_allocator(&track)
+
+sched: actor.Scheduler
+actor.init(&sched, num_workers = 4, allocator = alloc)
+actor.start(&sched, allocator = alloc)
+
+pid := actor.spawn(&sched, My_State{}, my_handler, allocator = alloc)
+actor.send(&sched, pid, My_Msg{id = 1}, allocator = alloc)
+
+// Shutdown and free all actors, queues, and worker threads
+actor.destroy(&sched)
+assert(len(track.allocation_map) == 0)
 ```
 
 ---
 
-## Core API & Procedure Overload Groups
+## API Reference Summary
 
-Following Odin's `core:` conventions, `package actor` provides both explicit procedure names and overloaded verb groups:
-
-| Overload Group | Underlying Procedures | Description |
-| :--- | :--- | :--- |
-| **`actor.init`** | `scheduler_init`, `actor_init`, `pool_init`, `watermark_slab_init`, `mpsc_init`, `shard_init`, `sharded_spsc_init` | Initialize a scheduler, in-place actor, envelope pool, watermark slab, or queue. |
-| **`actor.destroy`** | `scheduler_stop_and_destroy`, `actor_destroy`, `pool_destroy`, `watermark_slab_destroy`, `sharded_spsc_destroy` | Stop workers and free all memory associated with the resource. |
-| **`actor.spawn`** | `spawn(initial_state, receive_proc, pools, id, allocator)` | Heap-allocate and initialize a typed `^Actor($State, $Msg)`. |
-| **`actor.send`** | `send_ctx`, `send_from_pool`, `send_batch_from_pool`, `send_envelope`, `send_envelope_chain` | Send a single message, a pre-linked batch of messages (`Chain=K`), or a static envelope to an actor. |
-| **`actor.forward`** | `forward(ctx, target_actor, updated_msg)` | Zero-copy `iso` ownership transfer of the active envelope to `target_actor`. |
-| **`actor.push`** | `mpsc_push`, `shard_push`, `spsc_try_push`, `sharded_spsc_push` | Low-level lock-free MPSC or wait-free SPSC enqueue. |
-
----
-
-## Benchmark Suite & Empirical Results (Including Official Pony `libponyrt` 0.77.2)
-
-Captured on an **AMD Ryzen 7 7735U** (8 Cores / 16 Threads, Zen 3+, 16 MiB L3, Linux `7.1.13-2-MANJARO`, `odin version dev-2026-09 -o:speed`, official `ponylang/ponyc` `libponyrt` `0.77.2`).
-
-Run the pure-Odin suite locally or include official `libponyrt` via C FFI:
-```bash
-# Pure Odin benchmark suite (zero external dependencies)
-odin run benchmarks/actor_benchmark.odin -file -o:speed
-
-# Build official `libponyrt` 0.77.2 & run with Pony C FFI enabled
-./benchmarks/build_libponyrt.sh
-odin run benchmarks/actor_benchmark.odin -file -o:speed \
-  -define:USE_LIBPONYRT=true -extra-linker-flags:"-latomic -lm -ldl"
-```
-
-### Workload 1: 4-Producer $\rightarrow$ 1-Actor Fan-In Contention (2,000,000 Messages)
-
-| Implementation | Total Time | Throughput | Latency / Msg | Speedup vs. `chan` |
-| :--- | ---: | ---: | ---: | ---: |
-| **3e. Sharded SPSC Ring Lanes (`Sharded_SPSC_Mailbox`)** | **2.42 ms** | **827.45 M/s** | **1.2 ns** | **624.1x** |
-| **2a. DOD Batch Array (Single-Thread Baseline)** | 5.16 ms | 387.54 M/s | 2.6 ns | 292.7x |
-| **3d. Pony MPSC (`mpsc_push_chain` Chain=32 Splice)** | 6.37 ms | 313.83 M/s | 3.2 ns | 237.1x |
-| **2b. DOD Multi-Thread (4 TLS Buffers + Barrier Drain)** | 10.12 ms | 197.70 M/s | 5.1 ns | 149.2x |
-| **5a. Sleipnir `package actor` (`send_batch_from_pool` Chain=32)** | **25.68 ms** | **77.89 M/s** | **12.8 ns** | **58.8x** |
-| **4b. Official Pony (`libponyrt` 0.77.2 `pony_chain` Chain=32)** | **27.74 ms** | **72.10 M/s** | **13.9 ns** | **54.4x** |
-| **3c. Pony MPSC (`Watermark_Slab` Batched FIFO 8K)** | 59.63 ms | 33.54 M/s | 29.8 ns | 25.3x |
-| **3b. Pony MPSC (Per-Message `in_use` 8K Slab)** | 60.90 ms | 32.84 M/s | 30.4 ns | 24.8x |
-| **5a. Sleipnir `package actor` (`Envelope_Pool` Single Send)** | **64.36 ms** | **31.08 M/s** | **32.2 ns** | **23.5x** |
-| **3f. Pony MPSC + Adaptive Futex Parker (`sync.Futex`)** | 69.46 ms | 28.79 M/s | 34.7 ns | 21.7x |
-| **4a. Official Pony (`libponyrt` 0.77.2 `pony_alloc_msg` Single)** | **85.32 ms** | **23.44 M/s** | **42.7 ns** | **17.7x** |
-| **1. Traditional (`core:sync/chan` + `core:thread`)** | 1,510.33 ms | 1.32 M/s | 755.2 ns | 1.0x |
-
-### Workloads 2–5 Summary (Sleipnir vs. Official Pony `libponyrt` 0.77.2)
-
-* **Workload 2 (Cross-Thread 1-to-1 Ping-Pong, 200,000 Hops):** Odin Pony MPSC completes in **24.30 ms (121.5 ns/hop)** vs. official `libponyrt` 0.77.2 at **38.48 ms (192.4 ns/hop)** and `core:sync/chan` at **1,009.37 ms (5,046.8 ns/hop)**.
-* **Workload 3 (512-Byte Large Payload Zero-Copy `iso` Transfer, 500,000 Messages):** Odin Pony MPSC Zero-Copy completes in **14.76 ms (33.88 M/s, 29.5 ns/msg)** vs. official `libponyrt` 512B Pool Arena at **44.92 ms (11.13 M/s, 89.8 ns/msg)**.
-* **Workload 4 (1,024-Actor Work-Stealing Swarm, 2,000,000 Messages):** Sleipnir `package actor` M:N Swarm processes 2M messages across 1,024 actors in **41.85 ms (47.79 M/s, 20.9 ns/msg)** vs. official `libponyrt` M:N Swarm at **103.69 ms (19.29 M/s, 51.8 ns/msg)** (**2.48x faster** thanks to sharded run queues vs. `libponyrt`'s global `inject` queue).
-* **Workload 5 (Autonomous 1,024-Actor Graph + 64 Rounds of SplitMix64 CPU Work/Hop, 500,000 Hops):**
-  * **1 Worker:** Sleipnir `package actor` **168.80 ms (2.96 M/s)** vs. official `libponyrt` **179.28 ms (2.79 M/s)**
-  * **2 Workers:** Sleipnir `package actor` **86.00 ms (5.81 M/s)** vs. official `libponyrt` **96.60 ms (5.18 M/s)**
-  * **4 Workers:** Sleipnir `package actor` **47.53 ms (10.52 M/s)** vs. official `libponyrt` **48.94 ms (10.22 M/s)**
-  * **8 Workers:** Sleipnir `package actor` **30.03 ms (16.65 M/s)** vs. official `libponyrt` **25.38 ms (19.70 M/s)** and Hand-Rolled Odin `3h` **26.74 ms (18.70 M/s)**
-
-For the full system configuration, C11 `pthreads` parity comparison, and a deep-dive microarchitectural write-up of the engineering lessons learned, see [`benchmarks/README.md`](benchmarks/README.md).
+| Procedure / Type | Description |
+| :--- | :--- |
+| [`actor.Scheduler`](actor/scheduler.odin) | Work-stealing `M:N` actor scheduler with per-worker Chase-Lev deques and adaptive `sync.Futex` parking. |
+| [`actor.Envelope_Pool(Msg)`](actor/pool.odin) | Sharded watermark ring slab + per-shard intrusive return stack for $O(1)$ lock-free message recycling. |
+| [`actor.Sharded_SPSC_Mailbox(T, N)`](actor/spsc_mailbox.odin) | Wait-free cache-line-isolated SPSC ring lanes (`1.2 ns/msg`, zero atomic RMW instructions). |
+| [`actor.init`](actor/actor.odin) / [`actor.destroy`](actor/actor.odin) | Overloaded lifecycle procedures for `Scheduler`, `Envelope_Pool`, `MPSC_Queue`, and `Sharded_SPSC_Mailbox`. |
+| [`actor.spawn`](actor/scheduler.odin) | Allocates and registers a typed actor `(State, Msg)` on a `Scheduler`, returning a type-safe `PID(Msg)`. |
+| [`actor.send`](actor/actor.odin) | Sends a single `Msg` or batched `[]Msg` (`Chain=K`) via `Envelope_Pool` or heap allocator. |
+| [`actor.forward`](actor/actor.odin) | Zero-copy `iso` forwarding of the currently executing message envelope to another actor of the same `Msg` type. |
 
 ---
 
-## Testing & Documentation
+## Benchmarks
 
-Run the unit test suite (which validates all queues, pools, slabs, and schedulers under `mem.Tracking_Allocator` for zero memory leaks):
+Curious how Sleipnir (`package actor`) compares against the **official Pony language C runtime (`libponyrt` 0.77.2)**, **raw C11 (`stdatomic.h` + `pthreads`)**, **Odin `core:sync/chan`**, and **Data-Oriented Design (DOD) batch arrays**?
 
-```bash
-odin test ./actor
-```
-
-Generate package documentation using `odin doc`:
-
-```bash
-odin doc ./actor
-```
-
-Run the standalone examples:
-
-```bash
-odin run examples/01_ping_pong.odin -file -o:speed
-odin run examples/02_heterogeneous_pipeline.odin -file -o:speed
-odin run examples/03_sharded_spsc_mailbox.odin -file -o:speed
-odin run examples/library_demo.odin -file -o:speed
-```
-
----
-
-## Acknowledgements & Prior Art
-
-* **[Pony Language & `libponyrt`](https://github.com/ponylang/ponyc)**: For the intrusive MPSC mailbox design (`libponyrt/actor/messageq.c`), `pony_sendv` chain splicing, M:N cooperative actor scheduling, and `iso` reference capability semantics.
-* **[Microsoft `snmalloc`](https://github.com/microsoft/snmalloc)**: For the batched cross-thread message return queue design that eliminates per-message cache-line invalidation during remote deallocation.
-* **[Dmitry Vyukov](https://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue)**: For the foundational intrusive MPSC node-based queue algorithm.
-
----
-
-## License
-
-Released under the [MIT License](LICENSE).
+Read the full [**Benchmark Suite & Cross-Runtime Analysis (`benchmarks/README.md`)**](benchmarks/README.md).
