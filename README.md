@@ -55,9 +55,10 @@ sleipnir/
 │   ├── 02_heterogeneous_pipeline.odin  # Multiple actor types on one M:N scheduler
 │   ├── 03_sharded_spsc_mailbox.odin    # Wait-free Sharded_SPSC_Mailbox fan-in
 │   └── library_demo.odin               # Combined demo & benchmark verification
-└── benchmarks/                         # Comparative Odin & C11 benchmark suite
+└── benchmarks/                         # Comparative Odin, Pony (libponyrt), & C11 benchmark suite
     ├── README.md                       # Microarchitectural analysis & full empirical results
-    ├── actor_benchmark.odin            # Full 5-workload comparative Odin benchmark suite
+    ├── actor_benchmark.odin            # Full 5-workload comparative Odin + libponyrt C FFI suite
+    ├── build_libponyrt.sh              # One-command builder for official libponyrt (0.77.2)
     └── actor_benchmark_c11.c           # Matching C11 / pthreads reference benchmark
 ```
 
@@ -212,31 +213,48 @@ Following Odin's `core:` conventions, `package actor` provides both explicit pro
 
 ---
 
-## Benchmark Suite & Empirical Results
+## Benchmark Suite & Empirical Results (Including Official Pony `libponyrt` 0.77.2)
 
-Captured on an **AMD Ryzen 7 7735U** (8 Cores / 16 Threads, Zen 3+, 16 MiB L3, Linux `7.1.13-2-MANJARO`, `odin version dev-2026-09 -o:speed`). Run the suite locally via `odin run benchmarks/actor_benchmark.odin -file -o:speed`:
+Captured on an **AMD Ryzen 7 7735U** (8 Cores / 16 Threads, Zen 3+, 16 MiB L3, Linux `7.1.13-2-MANJARO`, `odin version dev-2026-09 -o:speed`, official `ponylang/ponyc` `libponyrt` `0.77.2`).
+
+Run the pure-Odin suite locally or include official `libponyrt` via C FFI:
+```bash
+# Pure Odin benchmark suite (zero external dependencies)
+odin run benchmarks/actor_benchmark.odin -file -o:speed
+
+# Build official `libponyrt` 0.77.2 & run with Pony C FFI enabled
+./benchmarks/build_libponyrt.sh
+odin run benchmarks/actor_benchmark.odin -file -o:speed \
+  -define:USE_LIBPONYRT=true -extra-linker-flags:"-latomic -lm -ldl"
+```
 
 ### Workload 1: 4-Producer $\rightarrow$ 1-Actor Fan-In Contention (2,000,000 Messages)
 
 | Implementation | Total Time | Throughput | Latency / Msg | Speedup vs. `chan` |
 | :--- | ---: | ---: | ---: | ---: |
-| **3e. Sharded SPSC Ring Lanes (`Sharded_SPSC_Mailbox`)** | **2.31 ms** | **866.97 M/s** | **1.2 ns** | **624.0x** |
-| **2a. DOD Batch Array (Single-Thread Baseline)** | 4.75 ms | 421.48 M/s | 2.4 ns | 303.4x |
-| **3d. Pony MPSC (`mpsc_push_chain` Chain=32 Splice)** | 6.27 ms | 318.73 M/s | 3.1 ns | 229.9x |
-| **2b. DOD Multi-Thread (4 TLS Buffers + Barrier Drain)** | 9.19 ms | 217.64 M/s | 4.6 ns | 156.8x |
-| **5a. `package actor` (`send_batch_from_pool` Chain=32)** | **26.82 ms** | **74.56 M/s** | **13.4 ns** | **53.7x** |
-| **3c. Pony MPSC (`Watermark_Slab` Batched FIFO 8K)** | 58.88 ms | 33.97 M/s | 29.4 ns | 24.5x |
-| **3b. Pony MPSC (Per-Message `in_use` 8K Slab)** | 61.21 ms | 32.67 M/s | 30.6 ns | 23.5x |
-| **5a. `package actor` (`Envelope_Pool` Single Send)** | **67.83 ms** | **29.49 M/s** | **33.9 ns** | **21.2x** |
-| **3f. Pony MPSC + Adaptive Futex Parker (`sync.Futex`)** | 68.73 ms | 29.10 M/s | 34.4 ns | 21.0x |
-| **1. Traditional (`core:sync/chan` + `core:thread`)** | 1,441.32 ms | 1.39 M/s | 720.7 ns | 1.0x |
+| **3e. Sharded SPSC Ring Lanes (`Sharded_SPSC_Mailbox`)** | **2.42 ms** | **827.45 M/s** | **1.2 ns** | **624.1x** |
+| **2a. DOD Batch Array (Single-Thread Baseline)** | 5.16 ms | 387.54 M/s | 2.6 ns | 292.7x |
+| **3d. Pony MPSC (`mpsc_push_chain` Chain=32 Splice)** | 6.37 ms | 313.83 M/s | 3.2 ns | 237.1x |
+| **2b. DOD Multi-Thread (4 TLS Buffers + Barrier Drain)** | 10.12 ms | 197.70 M/s | 5.1 ns | 149.2x |
+| **5a. Sleipnir `package actor` (`send_batch_from_pool` Chain=32)** | **25.68 ms** | **77.89 M/s** | **12.8 ns** | **58.8x** |
+| **4b. Official Pony (`libponyrt` 0.77.2 `pony_chain` Chain=32)** | **27.74 ms** | **72.10 M/s** | **13.9 ns** | **54.4x** |
+| **3c. Pony MPSC (`Watermark_Slab` Batched FIFO 8K)** | 59.63 ms | 33.54 M/s | 29.8 ns | 25.3x |
+| **3b. Pony MPSC (Per-Message `in_use` 8K Slab)** | 60.90 ms | 32.84 M/s | 30.4 ns | 24.8x |
+| **5a. Sleipnir `package actor` (`Envelope_Pool` Single Send)** | **64.36 ms** | **31.08 M/s** | **32.2 ns** | **23.5x** |
+| **3f. Pony MPSC + Adaptive Futex Parker (`sync.Futex`)** | 69.46 ms | 28.79 M/s | 34.7 ns | 21.7x |
+| **4a. Official Pony (`libponyrt` 0.77.2 `pony_alloc_msg` Single)** | **85.32 ms** | **23.44 M/s** | **42.7 ns** | **17.7x** |
+| **1. Traditional (`core:sync/chan` + `core:thread`)** | 1,510.33 ms | 1.32 M/s | 755.2 ns | 1.0x |
 
-### Workloads 2–5 Summary
+### Workloads 2–5 Summary (Sleipnir vs. Official Pony `libponyrt` 0.77.2)
 
-* **Workload 2 (Cross-Thread 1-to-1 Ping-Pong, 200,000 Hops):** Lock-free Pony MPSC completes in **24.22 ms (121.1 ns/hop)** vs. `core:sync/chan` at **968.33 ms (4,841.6 ns/hop)** (**40x faster**).
-* **Workload 3 (512-Byte Large Payload Zero-Copy `iso` Transfer, 500,000 Messages):** Completes in **14.63 ms (34.19 M/s, 29.3 ns/msg)** by passing 8-byte pointers in-place rather than copying 512B payloads into ring buffers.
-* **Workload 4 (1,024-Actor Work-Stealing Swarm, 2,000,000 Messages):** `package actor` M:N Swarm processes 2M messages across 1,024 actors in **45.80 ms (43.66 M/s, 22.9 ns/msg)**.
-* **Workload 5 (Autonomous 1,024-Actor Graph + 64 Rounds of SplitMix64 CPU Work/Hop, 500,000 Hops):** Scales linearly from **163.10 ms (3.07 M hops/s)** on 1 worker to **29.25 ms (17.09 M hops/s)** on 8 workers using `actor.forward`.
+* **Workload 2 (Cross-Thread 1-to-1 Ping-Pong, 200,000 Hops):** Odin Pony MPSC completes in **24.30 ms (121.5 ns/hop)** vs. official `libponyrt` 0.77.2 at **38.48 ms (192.4 ns/hop)** and `core:sync/chan` at **1,009.37 ms (5,046.8 ns/hop)**.
+* **Workload 3 (512-Byte Large Payload Zero-Copy `iso` Transfer, 500,000 Messages):** Odin Pony MPSC Zero-Copy completes in **14.76 ms (33.88 M/s, 29.5 ns/msg)** vs. official `libponyrt` 512B Pool Arena at **44.92 ms (11.13 M/s, 89.8 ns/msg)**.
+* **Workload 4 (1,024-Actor Work-Stealing Swarm, 2,000,000 Messages):** Sleipnir `package actor` M:N Swarm processes 2M messages across 1,024 actors in **41.85 ms (47.79 M/s, 20.9 ns/msg)** vs. official `libponyrt` M:N Swarm at **103.69 ms (19.29 M/s, 51.8 ns/msg)** (**2.48x faster** thanks to sharded run queues vs. `libponyrt`'s global `inject` queue).
+* **Workload 5 (Autonomous 1,024-Actor Graph + 64 Rounds of SplitMix64 CPU Work/Hop, 500,000 Hops):**
+  * **1 Worker:** Sleipnir `package actor` **168.80 ms (2.96 M/s)** vs. official `libponyrt` **179.28 ms (2.79 M/s)**
+  * **2 Workers:** Sleipnir `package actor` **86.00 ms (5.81 M/s)** vs. official `libponyrt` **96.60 ms (5.18 M/s)**
+  * **4 Workers:** Sleipnir `package actor` **47.53 ms (10.52 M/s)** vs. official `libponyrt` **48.94 ms (10.22 M/s)**
+  * **8 Workers:** Sleipnir `package actor` **30.03 ms (16.65 M/s)** vs. official `libponyrt` **25.38 ms (19.70 M/s)** and Hand-Rolled Odin `3h` **26.74 ms (18.70 M/s)**
 
 For the full system configuration, C11 `pthreads` parity comparison, and a deep-dive microarchitectural write-up of the engineering lessons learned, see [`benchmarks/README.md`](benchmarks/README.md).
 

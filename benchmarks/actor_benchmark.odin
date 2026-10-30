@@ -15,6 +15,11 @@
 //
 // Run pure Odin benchmark:
 //   odin run benchmarks/actor_benchmark.odin -file -o:speed
+//
+// Run with official Pony runtime (`libponyrt` 0.77.2) C FFI comparison:
+//   ./benchmarks/build_libponyrt.sh
+//   odin run benchmarks/actor_benchmark.odin -file -o:speed \
+//     -define:USE_LIBPONYRT=true -extra-linker-flags:"-latomic -lm -ldl"
 // =============================================================================
 
 package actor_benchmark
@@ -1154,7 +1159,7 @@ bench_work_stealing_swarm :: proc(total_msgs: int, num_producers: int, num_actor
 //     token directly to another actor!
 // =============================================================================
 
-simulate_cpu_work :: #force_inline proc(seed: u64) -> u64 {
+simulate_cpu_work :: #force_inline proc "contextless" (seed: u64) -> u64 {
 	z := seed
 	for i := 0; i < A2A_CPU_ITERS; i += 1 {
 		z += 0x9e3779b97f4a7c15
@@ -1679,6 +1684,550 @@ bench_library_a2a :: proc(total_hops: int, num_workers: int) -> (time.Duration, 
 }
 
 // =============================================================================
+// IMPLEMENTATION 4: Official Pony Runtime (`libponyrt` 0.77.2) via Odin C FFI
+// Enabled with `-define:USE_LIBPONYRT=true`
+// =============================================================================
+
+USE_LIBPONYRT :: #config(USE_LIBPONYRT, false)
+
+when USE_LIBPONYRT {
+	foreign import ponyrt "../.tmp/ponyc_build/libponyrt.a"
+
+	Pony_Msg :: struct {
+		index: u32,
+		id:    u32,
+		next:  ^Pony_Msg,
+	}
+
+	Pony_Msg_Int :: struct {
+		msg: Pony_Msg,
+		i:   int,
+	}
+
+	Pony_Msg_Large :: struct {
+		msg:  Pony_Msg,
+		data: [64]i64,
+	}
+
+	Pony_MessageQ :: struct #align(64) {
+		head:  ^Pony_Msg,
+		tail:  ^Pony_Msg,
+		_pad0: [48]u8,
+	}
+
+	Pony_Actor_Pad :: struct #align(64) {
+		type: rawptr,
+		pad:  [296]u8,
+	}
+
+	Pony_Type :: struct {
+		id:                    u32,
+		size:                  u32,
+		field_count:           u32,
+		field_offset:          u32,
+		instance:              rawptr,
+		name:                  cstring,
+		get_behavior_name:     rawptr,
+		trace:                 rawptr,
+		dispatch:              proc "c" (ctx: rawptr, actor: rawptr, msg: ^Pony_Msg),
+		final:                 rawptr,
+		event_notify:          u32,
+		might_reference_actor: bool,
+		traits:                rawptr,
+		fields:                rawptr,
+		vtable:                rawptr,
+	}
+
+	@(default_calling_convention = "c")
+	foreign ponyrt {
+		pony_init                    :: proc(argc: c.int, argv: [^]cstring) -> c.int ---
+		pony_start                   :: proc(exit_code: ^c.int, language_features: rawptr) -> bool ---
+		pony_ctx                     :: proc() -> rawptr ---
+		pony_create                  :: proc(ctx: rawptr, type: ^Pony_Type, orphaned: bool) -> rawptr ---
+		pony_alloc_msg               :: proc(index: u32, id: u32) -> ^Pony_Msg ---
+		pony_chain                   :: proc(prev: ^Pony_Msg, next: ^Pony_Msg) ---
+		pony_sendv                   :: proc(ctx: rawptr, to: rawptr, first: ^Pony_Msg, last: ^Pony_Msg, has_app_msg: bool) ---
+		ponyint_sendv_inject         :: proc(to: rawptr, msg: ^Pony_Msg) ---
+		ponyint_sendi_inject         :: proc(to: rawptr, id: u32, i: int) ---
+		ponyint_register_thread      :: proc() ---
+		ponyint_unregister_thread    :: proc() ---
+		ponyint_messageq_init        :: proc(q: ^Pony_MessageQ) ---
+		ponyint_messageq_destroy     :: proc(q: ^Pony_MessageQ, maybe_non_empty: bool) ---
+		ponyint_messageq_markempty   :: proc(q: ^Pony_MessageQ) -> bool ---
+		ponyint_actor_messageq_push  :: proc(q: ^Pony_MessageQ, first: ^Pony_Msg, last: ^Pony_Msg) -> bool ---
+		ponyint_actor_messageq_pop   :: proc(q: ^Pony_MessageQ) -> ^Pony_Msg ---
+		ponyint_pool_index           :: proc(size: c.size_t) -> c.size_t ---
+		ponyint_pool_drain           :: proc() ---
+		ponyint_pool_thread_cleanup  :: proc() ---
+		ponyint_asio_noisy_add       :: proc() -> u64 ---
+		ponyint_asio_noisy_remove    :: proc() -> u64 ---
+	}
+
+	@(export, link_name = "Main_runtime_override_defaults_oo")
+	main_runtime_override_defaults_oo :: proc "c" (opt: rawptr) {}
+
+	foreign import libc "system:c"
+	@(default_calling_convention = "c")
+	foreign libc {
+		fork    :: proc() -> c.int ---
+		execv   :: proc(path: cstring, argv: [^]cstring) -> c.int ---
+		waitpid :: proc(pid: c.int, status: ^c.int, options: c.int) -> c.int ---
+		_exit   :: proc(status: c.int) -> ! ---
+	}
+
+	// -------------------------------------------------------------------------
+	// 4a / 4b: Workload 1 — `libponyrt` MPSC Fan-In (Single & Chain=32)
+	// -------------------------------------------------------------------------
+	PonyRT_FanIn_Prod_Ctx :: struct {
+		q:         ^Pony_MessageQ,
+		count:     int,
+		use_chain: bool,
+		wg:        ^sync.Wait_Group,
+	}
+
+	ponyrt_fanin_producer_proc :: proc(t: ^thread.Thread) {
+		ctx := cast(^PonyRT_FanIn_Prod_Ctx)t.data
+		idx := u32(ponyint_pool_index(size_of(Pony_Msg_Int)))
+		if !ctx.use_chain {
+			for i := 0; i < ctx.count; i += 1 {
+				m := cast(^Pony_Msg_Int)pony_alloc_msg(idx, 0)
+				m.i = 1
+				ponyint_actor_messageq_push(ctx.q, &m.msg, &m.msg)
+			}
+		} else {
+			rem := ctx.count
+			for rem > 0 {
+				k := min(CHAIN_BATCH_LEN, rem)
+				first := cast(^Pony_Msg_Int)pony_alloc_msg(idx, 0)
+				first.i = 1
+				prev := &first.msg
+				for j := 1; j < k; j += 1 {
+					cur := cast(^Pony_Msg_Int)pony_alloc_msg(idx, 0)
+					cur.i = 1
+					pony_chain(prev, &cur.msg)
+					prev = &cur.msg
+				}
+				ponyint_actor_messageq_push(ctx.q, &first.msg, prev)
+				rem -= k
+			}
+		}
+		ponyint_pool_thread_cleanup()
+		sync.wait_group_done(ctx.wg)
+	}
+
+	bench_libponyrt_fan_in :: proc(total_msgs: int, num_producers: int, use_chain: bool) -> (time.Duration, i64) {
+		q := new(Pony_MessageQ)
+		defer free(q)
+		ponyint_messageq_init(q)
+
+		var_wg: sync.Wait_Group
+		sync.wait_group_add(&var_wg, num_producers)
+
+		msgs_per_prod := total_msgs / num_producers
+		producers := make([]^thread.Thread, num_producers)
+		ctxs      := make([]PonyRT_FanIn_Prod_Ctx, num_producers)
+		defer delete(producers)
+		defer delete(ctxs)
+
+		start := time.tick_now()
+		for p := 0; p < num_producers; p += 1 {
+			ctxs[p] = PonyRT_FanIn_Prod_Ctx{
+				q         = q,
+				count     = msgs_per_prod,
+				use_chain = use_chain,
+				wg        = &var_wg,
+			}
+			producers[p] = thread.create(ponyrt_fanin_producer_proc)
+			producers[p].data = &ctxs[p]
+			thread.start(producers[p])
+		}
+
+		received := 0
+		score: i64 = 0
+		for received < total_msgs {
+			batch := 0
+			raw_head := uintptr(intrinsics.atomic_load_explicit(&q.head, .Acquire))
+			head := (^Pony_Msg)(raw_head & ~uintptr(1))
+			for batch < PONY_BATCH_QUOTA {
+				msg := ponyint_actor_messageq_pop(q)
+				if msg == nil do break
+				m := cast(^Pony_Msg_Int)msg
+				score += i64(m.i)
+				received += 1
+				batch += 1
+				if msg == head do break
+			}
+			if batch == 0 {
+				ponyint_messageq_markempty(q)
+				intrinsics.cpu_relax()
+			}
+		}
+
+		sync.wait_group_wait(&var_wg)
+		elapsed := time.tick_since(start)
+
+		for p := 0; p < num_producers; p += 1 {
+			thread.destroy(producers[p])
+		}
+		ponyint_messageq_markempty(q)
+		ponyint_messageq_destroy(q, true)
+		ponyint_pool_drain()
+		return elapsed, score
+	}
+
+	// -------------------------------------------------------------------------
+	// 4: Workload 2 — `libponyrt` Cross-Thread 1-to-1 Ping-Pong
+	// -------------------------------------------------------------------------
+	PonyRT_PingPong_Ctx :: struct #align(64) {
+		q_a:   Pony_MessageQ,
+		q_b:   Pony_MessageQ,
+		trips: int,
+	}
+
+	ponyrt_pong_worker_proc :: proc(t: ^thread.Thread) {
+		ctx := cast(^PonyRT_PingPong_Ctx)t.data
+		idx := u32(ponyint_pool_index(size_of(Pony_Msg_Int)))
+		for i := 0; i < ctx.trips; i += 1 {
+			msg: ^Pony_Msg
+			for {
+				msg = ponyint_actor_messageq_pop(&ctx.q_a)
+				if msg != nil do break
+				intrinsics.cpu_relax()
+			}
+			v := (cast(^Pony_Msg_Int)msg).i
+			ponyint_messageq_markempty(&ctx.q_a)
+
+			out_m := cast(^Pony_Msg_Int)pony_alloc_msg(idx, 0)
+			out_m.i = v + 1
+			ponyint_actor_messageq_push(&ctx.q_b, &out_m.msg, &out_m.msg)
+		}
+		ponyint_pool_thread_cleanup()
+	}
+
+	bench_libponyrt_ping_pong :: proc(trips: int) -> (time.Duration, i64) {
+		ctx := new(PonyRT_PingPong_Ctx)
+		defer free(ctx)
+		ponyint_messageq_init(&ctx.q_a)
+		ponyint_messageq_init(&ctx.q_b)
+		ctx.trips = trips
+
+		pong_thread := thread.create(ponyrt_pong_worker_proc)
+		pong_thread.data = ctx
+		defer thread.destroy(pong_thread)
+
+		idx := u32(ponyint_pool_index(size_of(Pony_Msg_Int)))
+		val := 0
+
+		start := time.tick_now()
+		thread.start(pong_thread)
+
+		for i := 0; i < trips; i += 1 {
+			m := cast(^Pony_Msg_Int)pony_alloc_msg(idx, 0)
+			m.i = val
+			ponyint_actor_messageq_push(&ctx.q_a, &m.msg, &m.msg)
+
+			for {
+				rep := ponyint_actor_messageq_pop(&ctx.q_b)
+				if rep != nil {
+					val = (cast(^Pony_Msg_Int)rep).i
+					ponyint_messageq_markempty(&ctx.q_b)
+					break
+				}
+				intrinsics.cpu_relax()
+			}
+		}
+		thread.join(pong_thread)
+		elapsed := time.tick_since(start)
+
+		ponyint_messageq_destroy(&ctx.q_a, true)
+		ponyint_messageq_destroy(&ctx.q_b, true)
+		ponyint_pool_drain()
+		return elapsed, i64(val)
+	}
+
+	// -------------------------------------------------------------------------
+	// 4c: Workload 3 — `libponyrt` 512-Byte Large Payload Pool
+	// -------------------------------------------------------------------------
+	ponyrt_large_producer_proc :: proc(t: ^thread.Thread) {
+		ctx := cast(^PonyRT_FanIn_Prod_Ctx)t.data
+		idx := u32(ponyint_pool_index(size_of(Pony_Msg_Large)))
+		for i := 0; i < ctx.count; i += 1 {
+			m := cast(^Pony_Msg_Large)pony_alloc_msg(idx, 0)
+			m.data[0]  = 1
+			m.data[63] = 1
+			ponyint_actor_messageq_push(ctx.q, &m.msg, &m.msg)
+		}
+		ponyint_pool_thread_cleanup()
+		sync.wait_group_done(ctx.wg)
+	}
+
+	bench_libponyrt_large :: proc(total_msgs: int, num_producers: int) -> (time.Duration, i64) {
+		q := new(Pony_MessageQ)
+		defer free(q)
+		ponyint_messageq_init(q)
+
+		var_wg: sync.Wait_Group
+		sync.wait_group_add(&var_wg, num_producers)
+
+		msgs_per_prod := total_msgs / num_producers
+		producers := make([]^thread.Thread, num_producers)
+		ctxs      := make([]PonyRT_FanIn_Prod_Ctx, num_producers)
+		defer delete(producers)
+		defer delete(ctxs)
+
+		start := time.tick_now()
+		for p := 0; p < num_producers; p += 1 {
+			ctxs[p] = PonyRT_FanIn_Prod_Ctx{
+				q     = q,
+				count = msgs_per_prod,
+				wg    = &var_wg,
+			}
+			producers[p] = thread.create(ponyrt_large_producer_proc)
+			producers[p].data = &ctxs[p]
+			thread.start(producers[p])
+		}
+
+		received := 0
+		score: i64 = 0
+		for received < total_msgs {
+			batch := 0
+			raw_head := uintptr(intrinsics.atomic_load_explicit(&q.head, .Acquire))
+			head := (^Pony_Msg)(raw_head & ~uintptr(1))
+			for batch < PONY_BATCH_QUOTA {
+				msg := ponyint_actor_messageq_pop(q)
+				if msg == nil do break
+				m := cast(^Pony_Msg_Large)msg
+				score += m.data[0] + m.data[63]
+				received += 1
+				batch += 1
+				if msg == head do break
+			}
+			if batch == 0 {
+				ponyint_messageq_markempty(q)
+				intrinsics.cpu_relax()
+			}
+		}
+
+		sync.wait_group_wait(&var_wg)
+		elapsed := time.tick_since(start)
+
+		for p := 0; p < num_producers; p += 1 {
+			thread.destroy(producers[p])
+		}
+		ponyint_messageq_markempty(q)
+		ponyint_messageq_destroy(q, true)
+		ponyint_pool_drain()
+		return elapsed, score
+	}
+
+	// -------------------------------------------------------------------------
+	// 4d & 4e: Full `libponyrt` M:N Runtime (Workloads 4 & 5) via Isolated Exec
+	// (`pony_init` / `pony_start` can only be called once per OS process, and
+	// `libponyrt`'s global pool arena state must start clean before any thread
+	// allocates from `pony_alloc_msg`).
+	// -------------------------------------------------------------------------
+	PonyRT_Swarm_Actor :: struct #align(64) {
+		pad:   Pony_Actor_Pad,
+		score: i64,
+	}
+
+	g_ponyrt_swarm_rem:   int
+	g_ponyrt_finish_tick: time.Tick
+
+	ponyrt_swarm_dispatch :: proc "c" (ctx: rawptr, actor_ptr: rawptr, m: ^Pony_Msg) {
+		self := cast(^PonyRT_Swarm_Actor)actor_ptr
+		msg  := cast(^Pony_Msg_Int)m
+		self.score += i64(msg.i)
+		if intrinsics.atomic_sub_explicit(&g_ponyrt_swarm_rem, 1, .Acq_Rel) == 1 {
+			g_ponyrt_finish_tick = time.tick_now()
+			ponyint_asio_noisy_remove()
+		}
+	}
+
+	g_ponyrt_swarm_type := Pony_Type{
+		id           = 0,
+		size         = size_of(PonyRT_Swarm_Actor),
+		name         = "SwarmActor",
+		dispatch     = ponyrt_swarm_dispatch,
+		event_notify = 0xFFFFFFFF,
+	}
+
+	PonyRT_Swarm_Prod_Ctx :: struct {
+		actors: []^PonyRT_Swarm_Actor,
+		count:  int,
+		seed:   u32,
+		wg:     ^sync.Wait_Group,
+	}
+
+	ponyrt_swarm_prod_proc :: proc(t: ^thread.Thread) {
+		ctx := cast(^PonyRT_Swarm_Prod_Ctx)t.data
+		ponyint_register_thread()
+		for i := 0; i < ctx.count; i += 1 {
+			target := ctx.actors[(ctx.seed + u32(i)) & SWARM_MASK]
+			ponyint_sendi_inject(target, 0, 1)
+		}
+		ponyint_unregister_thread()
+		sync.wait_group_done(ctx.wg)
+	}
+
+	run_child_ponyrt_swarm :: proc(total_msgs: int, num_producers: int, num_actors: int) {
+		argv := [?]cstring{"bench", "--ponymaxthreads=2", "--ponynoscale", "--ponynoblock", nil}
+		pony_init(4, raw_data(argv[:]))
+		ctx := pony_ctx()
+
+		actors := make([]^PonyRT_Swarm_Actor, num_actors)
+		for i := 0; i < num_actors; i += 1 {
+			a := cast(^PonyRT_Swarm_Actor)pony_create(ctx, &g_ponyrt_swarm_type, false)
+			// Keep rc > 0 (`offsetof(pony_actor_t, gc.rc) == 224`) so actors aren't fast-reaped between waves
+			(^c.size_t)(uintptr(a) + 224)^ = 1
+			a.score = 0
+			actors[i] = a
+		}
+
+		g_ponyrt_swarm_rem = total_msgs
+		ponyint_asio_noisy_add()
+		var_wg: sync.Wait_Group
+		sync.wait_group_add(&var_wg, num_producers)
+
+		producers := make([]^thread.Thread, num_producers)
+		pctxs     := make([]PonyRT_Swarm_Prod_Ctx, num_producers)
+		msgs_per_prod := total_msgs / num_producers
+
+		start := time.tick_now()
+		for p := 0; p < num_producers; p += 1 {
+			pctxs[p] = PonyRT_Swarm_Prod_Ctx{
+				actors = actors,
+				count  = msgs_per_prod,
+				seed   = u32(p * msgs_per_prod),
+				wg     = &var_wg,
+			}
+			producers[p] = thread.create(ponyrt_swarm_prod_proc)
+			producers[p].data = &pctxs[p]
+			thread.start(producers[p])
+		}
+
+		exit_code: c.int = 0
+		pony_start(&exit_code, nil)
+		sync.wait_group_wait(&var_wg)
+
+		elapsed := time.tick_diff(start, g_ponyrt_finish_tick)
+		total_score: i64 = 0
+		for i := 0; i < num_actors; i += 1 {
+			total_score += actors[i].score
+		}
+		print_row("4d. Official Pony (`libponyrt` 0.77.2 M:N Swarm)", total_msgs, elapsed, total_score)
+		_exit(0)
+	}
+
+	PonyRT_A2A_Msg :: struct {
+		msg:       Pony_Msg,
+		payload:   u64,
+		hops_left: u32,
+	}
+
+	PonyRT_A2A_Actor :: struct #align(64) {
+		pad:   Pony_Actor_Pad,
+		id:    u32,
+		state: u64,
+		peers: [^]^PonyRT_A2A_Actor,
+	}
+
+	g_ponyrt_a2a_rem:   int
+	g_ponyrt_a2a_index: u32
+
+	ponyrt_a2a_dispatch :: proc "c" (ctx: rawptr, actor_ptr: rawptr, m: ^Pony_Msg) {
+		self := cast(^PonyRT_A2A_Actor)actor_ptr
+		tok  := cast(^PonyRT_A2A_Msg)m
+
+		res := simulate_cpu_work(tok.payload ~ self.state)
+		self.state ~= res
+
+		if tok.hops_left > 1 {
+			target_id := (self.id * 31 + u32(res)) & SWARM_MASK
+			target := self.peers[target_id]
+			next_m := cast(^PonyRT_A2A_Msg)pony_alloc_msg(g_ponyrt_a2a_index, 0)
+			next_m.payload   = res
+			next_m.hops_left = tok.hops_left - 1
+			pony_sendv(ctx, target, &next_m.msg, &next_m.msg, true)
+		} else {
+			if intrinsics.atomic_sub_explicit(&g_ponyrt_a2a_rem, 1, .Acq_Rel) == 1 {
+				g_ponyrt_finish_tick = time.tick_now()
+			}
+		}
+	}
+
+	g_ponyrt_a2a_type := Pony_Type{
+		id           = 1,
+		size         = size_of(PonyRT_A2A_Actor),
+		name         = "A2AActor",
+		dispatch     = ponyrt_a2a_dispatch,
+		event_notify = 0xFFFFFFFF,
+	}
+
+	run_child_ponyrt_a2a :: proc(total_hops: int, num_threads: int) {
+		arg_buf: [32]u8
+		arg_str := fmt.bprintf(arg_buf[:], "--ponymaxthreads=%d\x00", num_threads)
+		argv := [?]cstring{"bench", cstring(raw_data(arg_str)), "--ponynoscale", "--ponynoblock", nil}
+		pony_init(4, raw_data(argv[:]))
+		ctx := pony_ctx()
+
+		g_ponyrt_a2a_index = u32(ponyint_pool_index(size_of(PonyRT_A2A_Msg)))
+		actors := make([]^PonyRT_A2A_Actor, NUM_SWARM_ACTORS)
+		for i := 0; i < NUM_SWARM_ACTORS; i += 1 {
+			a := cast(^PonyRT_A2A_Actor)pony_create(ctx, &g_ponyrt_a2a_type, false)
+			// `offsetof(pony_actor_t, gc.rc) == 224`
+			(^c.size_t)(uintptr(a) + 224)^ = 1
+			a.id    = u32(i)
+			a.state = 0
+			a.peers = raw_data(actors)
+			actors[i] = a
+		}
+
+		g_ponyrt_a2a_rem = A2A_INIT_TOKENS
+		base_hops := total_hops / A2A_INIT_TOKENS
+		extra     := total_hops % A2A_INIT_TOKENS
+
+		for i := 0; i < A2A_INIT_TOKENS; i += 1 {
+			m := cast(^PonyRT_A2A_Msg)pony_alloc_msg(g_ponyrt_a2a_index, 0)
+			m.payload   = u64(i + 1)
+			m.hops_left = u32(base_hops + (1 if i < extra else 0))
+			ponyint_sendv_inject(actors[u32(i) & SWARM_MASK], &m.msg)
+		}
+
+		start := time.tick_now()
+		exit_code: c.int = 0
+		pony_start(&exit_code, nil)
+		elapsed := time.tick_diff(start, g_ponyrt_finish_tick)
+
+		checksum: u64 = 0
+		for i := 0; i < NUM_SWARM_ACTORS; i += 1 {
+			checksum ~= actors[i].state
+		}
+		label_buf: [64]u8
+		label := fmt.bprintf(
+			label_buf[:],
+			"4e. Official Pony (`libponyrt` 0.77.2, %d %s)",
+			num_threads,
+			"Thread" if num_threads == 1 else "Threads",
+		)
+		print_row(label, total_hops, elapsed, i64(checksum & 0x7FFFFFFFFFFFFFFF))
+		_exit(0)
+	}
+
+	spawn_self_mode :: proc(mode_arg: cstring) {
+		pid := fork()
+		if pid == 0 {
+			exe: cstring = "/proc/self/exe"
+			argv := [?]cstring{exe, mode_arg, nil}
+			execv(exe, raw_data(argv[:]))
+			_exit(1)
+		}
+		status: c.int
+		waitpid(pid, &status, 0)
+	}
+}
+
+// =============================================================================
 // Main Benchmark Runner
 // =============================================================================
 
@@ -1697,6 +2246,25 @@ print_row :: proc(name: string, msgs: int, elapsed: time.Duration, score: i64) {
 }
 
 main :: proc() {
+	when USE_LIBPONYRT {
+		if len(runtime.args__) > 1 {
+			mode := string(runtime.args__[1])
+			switch mode {
+			case "--child-pony-w4":
+				run_child_ponyrt_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
+			case "--child-pony-w5-1":
+				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 1)
+			case "--child-pony-w5-2":
+				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 2)
+			case "--child-pony-w5-4":
+				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 4)
+			case "--child-pony-w5-8":
+				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 8)
+			}
+			return
+		}
+	}
+
 	fmt.println("===========================================================================================================")
 	fmt.printfln("WORKLOAD 1: MPSC Fan-In Contention (%d messages, %d producers -> 1 actor)", TOTAL_MESSAGES, NUM_PRODUCERS)
 	fmt.println("===========================================================================================================")
@@ -1727,6 +2295,14 @@ main :: proc() {
 	t3f, s3f := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false, true)
 	print_row("3f. Self-Impl Pony MPSC + Adaptive Futex Parker", TOTAL_MESSAGES, t3f, s3f)
 
+	when USE_LIBPONYRT {
+		t4a, s4a := bench_libponyrt_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false)
+		print_row("4a. Official Pony (`libponyrt` 0.77.2 Single)", TOTAL_MESSAGES, t4a, s4a)
+
+		t4b, s4b := bench_libponyrt_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true)
+		print_row("4b. Official Pony (`libponyrt` 0.77.2 Chain=32)", TOTAL_MESSAGES, t4b, s4b)
+	}
+
 	t_lib1, s_lib1 := bench_library_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false)
 	print_row("5a. `package actor` (Envelope_Pool Single Send)", TOTAL_MESSAGES, t_lib1, s_lib1)
 
@@ -1745,6 +2321,11 @@ main :: proc() {
 	pp_t3, pp_s3 := bench_self_pony_ping_pong(PING_PONG_TRIPS)
 	print_row("3. Self-Impl Pony MPSC Ping-Pong", PING_PONG_TRIPS * 2, pp_t3, pp_s3)
 
+	when USE_LIBPONYRT {
+		pp_t4, pp_s4 := bench_libponyrt_ping_pong(PING_PONG_TRIPS)
+		print_row("4. Official Pony (`libponyrt` 0.77.2) Ping-Pong", PING_PONG_TRIPS * 2, pp_t4, pp_s4)
+	}
+
 	fmt.println("-----------------------------------------------------------------------------------------------------------")
 	fmt.println("")
 	fmt.println("===========================================================================================================")
@@ -1754,6 +2335,11 @@ main :: proc() {
 	lp_t3, lp_s3 := bench_large_pony_zerocopy(LARGE_MESSAGES, NUM_PRODUCERS)
 	print_row("3c. Pony MPSC Zero-Copy `iso` Pointer (512B)", LARGE_MESSAGES, lp_t3, lp_s3)
 
+	when USE_LIBPONYRT {
+		lp_t4, lp_s4 := bench_libponyrt_large(LARGE_MESSAGES, NUM_PRODUCERS)
+		print_row("4c. Official Pony (`libponyrt` 0.77.2 512B Pool)", LARGE_MESSAGES, lp_t4, lp_s4)
+	}
+
 	fmt.println("-----------------------------------------------------------------------------------------------------------")
 	fmt.println("")
 	fmt.println("===========================================================================================================")
@@ -1762,6 +2348,10 @@ main :: proc() {
 
 	ws_t3, ws_s3 := bench_work_stealing_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
 	print_row("3g. Sharded Work-Stealing M:N Swarm (1,024)", TOTAL_MESSAGES, ws_t3, ws_s3)
+
+	when USE_LIBPONYRT {
+		spawn_self_mode("--child-pony-w4")
+	}
 
 	ws_lib_t, ws_lib_s := bench_library_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
 	print_row("5b. `package actor` M:N Swarm (Chain Return)", TOTAL_MESSAGES, ws_lib_t, ws_lib_s)
@@ -1786,6 +2376,13 @@ main :: proc() {
 
 	a2a_t16, a2a_s16 := bench_pony_mn_a2a(A2A_TOTAL_HOPS, 16)
 	print_row("3h. Pony M:N Actor-to-Actor + CPU (16 Workers)", A2A_TOTAL_HOPS, a2a_t16, a2a_s16)
+
+	when USE_LIBPONYRT {
+		spawn_self_mode("--child-pony-w5-1")
+		spawn_self_mode("--child-pony-w5-2")
+		spawn_self_mode("--child-pony-w5-4")
+		spawn_self_mode("--child-pony-w5-8")
+	}
 
 	lib_a2a_t1, lib_a2a_s1 := bench_library_a2a(A2A_TOTAL_HOPS, 1)
 	print_row("5c. `package actor` A2A + CPU (1 Worker)", A2A_TOTAL_HOPS, lib_a2a_t1, lib_a2a_s1)

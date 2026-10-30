@@ -36,3 +36,8 @@ jobs:
 
       - name: Type-check full benchmark suite
         run: odin check benchmarks/actor_benchmark.odin -file
+
+      - name: Build official Pony runtime (libponyrt) and type-check C FFI benchmark
+        run: |
+          ./benchmarks/build_libponyrt.sh
+          odin check benchmarks/actor_benchmark.odin -file -define:USE_LIBPONYRT=true
