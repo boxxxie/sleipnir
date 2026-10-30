@@ -196,6 +196,46 @@ assert(len(track.allocation_map) == 0) // Zero bytes leaked!
 
 ---
 
+### 7. AST Metaprogramming (`@(actor)` & `@(behavior)`)
+
+Using Odin's standard-library AST parser (`core:odin/parser` + `core:odin/ast`), [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans your package for `@(actor)` structs and `@(behavior)` procedures and generates message structs, tagged unions, dispatchers, `spawn_<actor>` constructors, and Pony-style `be_<behavior>` async callers:
+
+```odin
+@(actor)
+Bank_Account :: struct {
+    owner:   string,
+    balance: i64,
+}
+
+@(behavior)
+deposit :: proc(self: ^Bank_Account, amount: i64, memo: string = "deposit") {
+    self.balance += amount
+}
+
+@(behavior)
+withdraw :: proc(self: ^Bank_Account, amount: i64) {
+    self.balance -= amount
+}
+
+main :: proc() {
+    _ = actor.scoped_scheduler(num_workers = 2)
+
+    account := spawn_bank_account(Bank_Account{owner = "Sleipnir", balance = 500})
+    be_deposit(account, 250)            // Generated Pony-style `be` behavior!
+    be_deposit(account, 100, "wire-in")
+    be_withdraw(account, 175)
+}
+```
+
+Generate bindings and run with Odin's `-custom-attribute:actor,behavior` flag:
+
+```bash
+odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
+odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
+```
+
+---
+
 ## API Reference Summary
 
 | Procedure / Type | Description |

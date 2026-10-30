@@ -37,6 +37,12 @@ jobs:
       - name: Run example 04 (Ergonomic Actor DSL)
         run: odin run examples/04_ergonomic_dsl.odin -file -o:speed
 
+      - name: Run AST Metaprogramming Codegen tests & Example 05
+        run: |
+          odin test ./actor/codegen
+          odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
+          odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
+
       - name: Type-check full benchmark suite
         run: odin check benchmarks/actor_benchmark.odin -file
 
