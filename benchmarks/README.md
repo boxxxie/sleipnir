@@ -40,9 +40,15 @@ odin run benchmarks/actor_benchmark.odin -file -o:speed
 odin run benchmarks/actor_benchmark.odin -file -o:speed \
   -define:USE_LIBPONYRT=true -extra-linker-flags:"-latomic -lm -ldl"
 
-# 3. Compile and run the C11 / pthreads reference suite
-gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o benchmarks/actor_benchmark_c11
-./benchmarks/actor_benchmark_c11
+# 3. Compile and run the C11 / pthreads reference suite (with or without `libponyrt`)
+gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o .tmp/actor_benchmark_c11
+./.tmp/actor_benchmark_c11
+
+gcc -O3 -march=native -pthread -DUSE_LIBPONYRT \
+  -I.tmp/ponyc_src/src/libponyrt -I.tmp/ponyc_src/src/common \
+  benchmarks/actor_benchmark_c11.c .tmp/ponyc_build/libponyrt.a \
+  -latomic -lm -ldl -o .tmp/actor_benchmark_c11_pony
+./.tmp/actor_benchmark_c11_pony
 ```
 
 ---
@@ -83,8 +89,10 @@ gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o benchmarks/ac
 | **`2a`** | DOD Batch Array (Single-Thread Auto-Vectorized) | 2.47 ms | 811.26 M/s | 5.16 ms | 387.54 M/s |
 | **`2b`** | DOD Multi-Thread (4 TLS Buffers + Barrier Drain) | 6.41 ms | 311.77 M/s | 10.12 ms | 197.70 M/s |
 | **`3c`** | Pony MPSC (Batched FIFO Watermark 8K Slab) | 59.94 ms | 33.37 M/s | **59.63 ms** | **33.54 M/s** |
-| **`3d`** | Pony MPSC (`mpsc_push_chain` Chain=32 Splice 8K Slab) | 6.06 ms | 330.02 M/s | **6.37 ms** | **313.83 M/s** |
-| **`3e`** | Sharded SPSC Ring Lanes (Zero RMW Atomics) | 2.94 ms | 680.06 M/s | **2.42 ms** | **827.45 M/s** |
+| **`3d`** | Pony MPSC (`mpsc_push_chain` Chain=32 Splice 8K Slab) | 6.50 ms | 307.53 M/s | **6.37 ms** | **313.83 M/s** |
+| **`3e`** | Sharded SPSC Ring Lanes (Zero RMW Atomics) | 3.56 ms | 561.76 M/s | **2.42 ms** | **827.45 M/s** |
+| **`4a`** | Official Pony (`libponyrt` 0.77.2 Single Send) | 89.34 ms | 22.39 M/s | **85.32 ms** | **23.44 M/s** |
+| **`4b`** | Official Pony (`libponyrt` 0.77.2 `pony_chain` Chain=32) | 27.00 ms | 74.07 M/s | **27.74 ms** | **72.10 M/s** |
 
 ---
 

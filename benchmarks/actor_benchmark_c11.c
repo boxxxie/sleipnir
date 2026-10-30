@@ -7,9 +7,17 @@
  *   - Workload 4: 1,024-Actor Swarm Scaling (2,000,000 messages)
  *   - Workload 5: Autonomous Actor-to-Actor Graph + Per-Message CPU Work (500,000 hops)
  *
- * Compile & run:
- *   gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o benchmarks/actor_benchmark_c11
- *   ./benchmarks/actor_benchmark_c11
+ * Compile & run (pure C11 + pthreads):
+ *   gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o .tmp/actor_benchmark_c11
+ *   ./.tmp/actor_benchmark_c11
+ *
+ * Compile & run with official Pony runtime (`libponyrt` 0.77.2):
+ *   ./benchmarks/build_libponyrt.sh
+ *   gcc -O3 -march=native -pthread -DUSE_LIBPONYRT \
+ *     -I.tmp/ponyc_src/src/libponyrt -I.tmp/ponyc_src/src/common \
+ *     benchmarks/actor_benchmark_c11.c .tmp/ponyc_build/libponyrt.a \
+ *     -latomic -lm -ldl -o .tmp/actor_benchmark_c11_pony
+ *   ./.tmp/actor_benchmark_c11_pony
  */
 
 #define _GNU_SOURCE
@@ -23,8 +31,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <linux/futex.h>
 #include <immintrin.h>
+
+#ifdef USE_LIBPONYRT
+#define PONY_WANT_ATOMIC_DEFS
+#include "pony.h"
+#include "actor/actor.h"
+#include "actor/messageq.h"
+#include "mem/pool.h"
+#include "sched/scheduler.h"
+#include "asio/asio.h"
+
+void Main_runtime_override_defaults_oo(void *opt) { (void)opt; }
+#endif
 
 #define TOTAL_MSGS      2000000
 #define LARGE_MSGS      500000
@@ -748,8 +769,206 @@ static double bench_pony_mn_a2a(int total_hops, int num_workers, int64_t *out_sc
     return elapsed;
 }
 
-int main(void) {
+#ifdef USE_LIBPONYRT
+/* ============================================================================
+ * 4a / 4b / 4e. Official Pony Runtime (`libponyrt` 0.77.2) in C11
+ * ============================================================================ */
+
+typedef struct {
+    messageq_t *q;
+    int         count;
+    bool        use_chain;
+} ponyrt_fanin_arg_t;
+
+static void *ponyrt_fanin_producer(void *arg) {
+    ponyrt_fanin_arg_t *pa = (ponyrt_fanin_arg_t *)arg;
+    uint32_t idx = (uint32_t)POOL_INDEX(sizeof(pony_msgi_t));
+    if (!pa->use_chain) {
+        for (int i = 0; i < pa->count; i++) {
+            pony_msgi_t *m = (pony_msgi_t *)pony_alloc_msg(idx, 0);
+            m->i = 1;
+            ponyint_actor_messageq_push(pa->q, &m->msg, &m->msg);
+        }
+    } else {
+        int rem = pa->count;
+        while (rem > 0) {
+            int k = (rem < CHAIN_LEN) ? rem : CHAIN_LEN;
+            pony_msgi_t *first = (pony_msgi_t *)pony_alloc_msg(idx, 0);
+            first->i = 1;
+            pony_msg_t *prev = &first->msg;
+            for (int j = 1; j < k; j++) {
+                pony_msgi_t *cur = (pony_msgi_t *)pony_alloc_msg(idx, 0);
+                cur->i = 1;
+                pony_chain(prev, &cur->msg);
+                prev = &cur->msg;
+            }
+            ponyint_actor_messageq_push(pa->q, &first->msg, prev);
+            rem -= k;
+        }
+    }
+    ponyint_pool_thread_cleanup();
+    return NULL;
+}
+
+static double bench_ponyrt_fanin(int total_msgs, int nprod, bool use_chain, int64_t *out_score) {
+    messageq_t q;
+    ponyint_messageq_init(&q);
+
+    pthread_t prods[16];
+    ponyrt_fanin_arg_t args[16];
+    int per_prod = total_msgs / nprod;
+
+    double t0 = now_sec();
+    for (int p = 0; p < nprod; p++) {
+        args[p].q         = &q;
+        args[p].count     = per_prod;
+        args[p].use_chain = use_chain;
+        pthread_create(&prods[p], NULL, ponyrt_fanin_producer, &args[p]);
+    }
+
+    int received = 0;
+    int64_t score = 0;
+    while (received < total_msgs) {
+        int batch = 0;
+        pony_msg_t *head = atomic_load_explicit(&q.head, memory_order_acquire);
+        head = (pony_msg_t *)((uintptr_t)head & ~(uintptr_t)1);
+        pony_msg_t *msg;
+        while (batch < BATCH_QUOTA && (msg = ponyint_actor_messageq_pop(&q)) != NULL) {
+            pony_msgi_t *m = (pony_msgi_t *)msg;
+            score += m->i;
+            received++;
+            batch++;
+            if (msg == head) break;
+        }
+        if (batch == 0) {
+            ponyint_messageq_markempty(&q);
+            _mm_pause();
+        }
+    }
+
+    for (int p = 0; p < nprod; p++) pthread_join(prods[p], NULL);
+    double elapsed = now_sec() - t0;
+
+    ponyint_messageq_markempty(&q);
+    ponyint_messageq_destroy(&q, true);
+    ponyint_pool_drain();
+    *out_score = score;
+    return elapsed;
+}
+
+typedef struct {
+    pony_msg_t msg;
+    uint64_t   payload;
+    uint32_t   hops_left;
+} pony_a2a_msg_t;
+
+typedef struct pony_a2a_actor_t {
+    pony_actor_pad_t         pad;
+    uint32_t                 id;
+    uint64_t                 state;
+    struct pony_a2a_actor_t **peers;
+} pony_a2a_actor_t;
+
+static _Atomic(int) g_pony_a2a_rem;
+static double       g_pony_a2a_finish;
+
+static void pony_a2a_dispatch(pony_ctx_t *ctx, pony_actor_t *actor, pony_msg_t *m) {
+    pony_a2a_actor_t *self = (pony_a2a_actor_t *)actor;
+    pony_a2a_msg_t *tok = (pony_a2a_msg_t *)m;
+
+    uint64_t res = simulate_cpu_work(tok->payload ^ self->state);
+    self->state ^= res;
+
+    if (tok->hops_left > 1) {
+        uint32_t target_id = (self->id * 31u + (uint32_t)res) & SWARM_MASK;
+        pony_actor_t *target = (pony_actor_t *)self->peers[target_id];
+        uint32_t idx = (uint32_t)POOL_INDEX(sizeof(pony_a2a_msg_t));
+        pony_a2a_msg_t *next_m = (pony_a2a_msg_t *)pony_alloc_msg(idx, 0);
+        next_m->payload   = res;
+        next_m->hops_left = tok->hops_left - 1;
+        pony_sendv(ctx, target, &next_m->msg, &next_m->msg, true);
+    } else {
+        if (atomic_fetch_sub_explicit(&g_pony_a2a_rem, 1, memory_order_acq_rel) == 1) {
+            g_pony_a2a_finish = now_sec();
+        }
+    }
+}
+
+static pony_type_t g_pony_a2a_type = {
+    .id = 0,
+    .size = sizeof(pony_a2a_actor_t),
+    .name = "A2AActor",
+    .dispatch = pony_a2a_dispatch,
+    .event_notify = UINT32_MAX,
+};
+
+static void run_child_pony_a2a(int total_hops, int num_threads) {
+    char arg_max[32];
+    snprintf(arg_max, sizeof(arg_max), "--ponymaxthreads=%d", num_threads);
+    char *argv[] = { "bench", arg_max, "--ponynoscale", "--ponynoblock", NULL };
+    pony_init(4, argv);
+    pony_ctx_t *ctx = pony_ctx();
+
+    pony_a2a_actor_t **actors = calloc(SWARM_ACTORS, sizeof(pony_a2a_actor_t *));
+    for (int i = 0; i < SWARM_ACTORS; i++) {
+        actors[i] = (pony_a2a_actor_t *)pony_create(ctx, &g_pony_a2a_type, false);
+        ((pony_actor_t *)actors[i])->gc.rc = 1;
+        actors[i]->id    = (uint32_t)i;
+        actors[i]->state = 0;
+        actors[i]->peers = actors;
+    }
+
+    atomic_init(&g_pony_a2a_rem, A2A_INIT_TOKENS);
+    int base_hops = total_hops / A2A_INIT_TOKENS;
+    int extra     = total_hops % A2A_INIT_TOKENS;
+    uint32_t idx  = (uint32_t)POOL_INDEX(sizeof(pony_a2a_msg_t));
+
+    for (int i = 0; i < A2A_INIT_TOKENS; i++) {
+        pony_a2a_msg_t *m = (pony_a2a_msg_t *)pony_alloc_msg(idx, 0);
+        m->payload   = (uint64_t)(i + 1);
+        m->hops_left = (uint32_t)(base_hops + (i < extra ? 1 : 0));
+        ponyint_sendv_inject((pony_actor_t *)actors[i & SWARM_MASK], &m->msg);
+    }
+
+    double t0 = now_sec();
+    int ec = 0;
+    pony_start(&ec, NULL);
+    double elapsed = g_pony_a2a_finish - t0;
+
+    uint64_t sum = 0;
+    for (int i = 0; i < SWARM_ACTORS; i++) sum ^= actors[i]->state;
+    char label[64];
+    snprintf(label, sizeof(label), "4e. Official Pony (`libponyrt` 0.77.2, %d %s)",
+             num_threads, num_threads == 1 ? "Thread" : "Threads");
+    print_row(label, total_hops, elapsed, (int64_t)(sum & 0x7FFFFFFFULL));
+    _exit(0);
+}
+
+static void spawn_self_pony_a2a(const char *mode_arg) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = { "/proc/self/exe", (char *)mode_arg, NULL };
+        execv("/proc/self/exe", argv);
+        _exit(1);
+    }
+    waitpid(pid, NULL, 0);
+}
+#endif
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef USE_LIBPONYRT
+    if (argc > 1) {
+        if (strcmp(argv[1], "--child-pony-1") == 0) run_child_pony_a2a(A2A_TOTAL_HOPS, 1);
+        if (strcmp(argv[1], "--child-pony-2") == 0) run_child_pony_a2a(A2A_TOTAL_HOPS, 2);
+        if (strcmp(argv[1], "--child-pony-4") == 0) run_child_pony_a2a(A2A_TOTAL_HOPS, 4);
+        if (strcmp(argv[1], "--child-pony-8") == 0) run_child_pony_a2a(A2A_TOTAL_HOPS, 8);
+        return 0;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
     int64_t score = 0;
 
     printf("===========================================================================================================\n");
@@ -776,6 +995,14 @@ int main(void) {
     double t3e = bench_sharded_spsc(TOTAL_MSGS, NUM_PRODUCERS, &score);
     print_row("3e. Sharded SPSC Ring Lanes (Zero RMW Atomics)", TOTAL_MSGS, t3e, score);
 
+#ifdef USE_LIBPONYRT
+    double t4a = bench_ponyrt_fanin(TOTAL_MSGS, NUM_PRODUCERS, false, &score);
+    print_row("4a. Official Pony (`libponyrt` 0.77.2 Single)", TOTAL_MSGS, t4a, score);
+
+    double t4b = bench_ponyrt_fanin(TOTAL_MSGS, NUM_PRODUCERS, true, &score);
+    print_row("4b. Official Pony (`libponyrt` 0.77.2 Chain=32)", TOTAL_MSGS, t4b, score);
+#endif
+
     printf("\n===========================================================================================================\n");
     printf("WORKLOAD 5: Autonomous Actor-to-Actor Graph + CPU Work (%d hops, %d actors)\n", A2A_TOTAL_HOPS, SWARM_ACTORS);
     printf("===========================================================================================================\n");
@@ -794,6 +1021,13 @@ int main(void) {
 
     double t5_16 = bench_pony_mn_a2a(A2A_TOTAL_HOPS, 16, &score);
     print_row("3h. Pony M:N Actor-to-Actor + CPU (16 Workers)", A2A_TOTAL_HOPS, t5_16, score);
+
+#ifdef USE_LIBPONYRT
+    spawn_self_pony_a2a("--child-pony-1");
+    spawn_self_pony_a2a("--child-pony-2");
+    spawn_self_pony_a2a("--child-pony-4");
+    spawn_self_pony_a2a("--child-pony-8");
+#endif
 
     return 0;
 }
