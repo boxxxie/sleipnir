@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Odin compiler
+        uses: ActionLovers/setup-odin@v2
+        with:
+          release: latest
+          cache: false
+
+      - name: Run package unit tests (with memory leak detection)
+        run: odin test ./actor
+
+      - name: Verify package documentation generation
+        run: odin doc ./actor > /dev/null
+
+      - name: Run example 01 (Ping-Pong)
+        run: odin run examples/01_ping_pong.odin -file -o:speed
+
+      - name: Run example 02 (Heterogeneous Pipeline)
+        run: odin run examples/02_heterogeneous_pipeline.odin -file -o:speed
+
+      - name: Run example 03 (Sharded SPSC Mailbox)
+        run: odin run examples/03_sharded_spsc_mailbox.odin -file -o:speed
+
+      - name: Type-check full benchmark suite
+        run: odin check actor_benchmark.odin -file

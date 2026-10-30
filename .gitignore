@@ -1,0 +1,29 @@
+# Compiled Odin & C binaries
+actor_benchmark
+actor_benchmark.bin
+actor_benchmark_c11
+library_demo
+01_ping_pong
+02_heterogeneous_pipeline
+03_sharded_spsc_mailbox
+actor_test
+*.bin
+*.exe
+*.out
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.pdb
+*.ilk
+
+# Temporary & scratch files
+.tmp/
+*.patch
+
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
