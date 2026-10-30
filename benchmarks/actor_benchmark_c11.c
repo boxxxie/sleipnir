@@ -8,8 +8,8 @@
  *   - Workload 5: Autonomous Actor-to-Actor Graph + Per-Message CPU Work (500,000 hops)
  *
  * Compile & run:
- *   gcc -O3 -march=native -pthread actor_benchmark_c11.c -o actor_benchmark_c11
- *   ./actor_benchmark_c11
+ *   gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o benchmarks/actor_benchmark_c11
+ *   ./benchmarks/actor_benchmark_c11
  */
 
 #define _GNU_SOURCE

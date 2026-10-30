@@ -14,12 +14,12 @@
 //                 (500,000 Hops, 1,024 Actors, 64 SplitMix64 Ops/Hop — No External Producers)
 //
 // Run pure Odin benchmark:
-//   odin run actor_benchmark.odin -file -o:speed
+//   odin run benchmarks/actor_benchmark.odin -file -o:speed
 // =============================================================================
 
 package actor_benchmark
 
-import "./actor"
+import "../actor"
 import "base:intrinsics"
 import "base:runtime"
 import "core:c"

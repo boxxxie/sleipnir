@@ -2,6 +2,8 @@
 actor_benchmark
 actor_benchmark.bin
 actor_benchmark_c11
+benchmarks/actor_benchmark
+benchmarks/actor_benchmark_c11
 library_demo
 01_ping_pong
 02_heterogeneous_pipeline

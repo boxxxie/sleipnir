@@ -6,19 +6,19 @@ Based on the architectures discussed in the [Shared Gemini Conversation](https:/
 
 Both benchmark files are self-contained and will regenerate the full benchmark tables on your hardware:
 
-* **Run the Pure Odin Benchmark Suite (`actor_benchmark.odin`):**
+* **Run the Pure Odin Benchmark Suite (`benchmarks/actor_benchmark.odin`):**
   ```bash
-  odin run actor_benchmark.odin -file -o:speed
+  odin run benchmarks/actor_benchmark.odin -file -o:speed
   ```
 * **Run with Direct `libponyrt` C FFI Enabled (`-define:USE_LIBPONYRT=true`):**
   ```bash
-  odin run actor_benchmark.odin -file -o:speed -define:USE_LIBPONYRT=true \
+  odin run benchmarks/actor_benchmark.odin -file -o:speed -define:USE_LIBPONYRT=true \
     -extra-linker-flags:"-L/usr/local/lib -lponyrt -lpthread -ldl -lm"
   ```
-* **Run the Unified C11 / pthreads Reference Suite (`actor_benchmark_c11.c`):**
+* **Run the Unified C11 / pthreads Reference Suite (`benchmarks/actor_benchmark_c11.c`):**
   ```bash
-  gcc -O3 -march=native -pthread actor_benchmark_c11.c -o actor_benchmark_c11
-  ./actor_benchmark_c11
+  gcc -O3 -march=native -pthread benchmarks/actor_benchmark_c11.c -o benchmarks/actor_benchmark_c11
+  ./benchmarks/actor_benchmark_c11
   ```
 
 ## 2. Complete Empirical Benchmark Scoreboard (v1–v6)

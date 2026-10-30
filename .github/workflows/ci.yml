@@ -35,4 +35,4 @@ jobs:
         run: odin run examples/03_sharded_spsc_mailbox.odin -file -o:speed
 
       - name: Type-check full benchmark suite
-        run: odin check actor_benchmark.odin -file
+        run: odin check benchmarks/actor_benchmark.odin -file
