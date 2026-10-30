@@ -272,3 +272,18 @@ assert(len(track.allocation_map) == 0)
 Curious how Sleipnir (`package actor`) compares against the **official Pony language C runtime (`libponyrt` 0.77.2)**, **raw C11 (`stdatomic.h` + `pthreads`)**, **Odin `core:sync/chan`**, and **Data-Oriented Design (DOD) batch arrays**?
 
 Read the full [**Benchmark Suite & Cross-Runtime Analysis (`benchmarks/README.md`)**](benchmarks/README.md).
+
+---
+
+## Acknowledgements & Prior Art
+
+* **[Pony Language & `libponyrt`](https://github.com/ponylang/ponyc)**: For the intrusive MPSC mailbox design (`libponyrt/actor/messageq.c`), `pony_sendv` chain splicing, M:N cooperative actor scheduling, and `iso` reference capability semantics.
+* **[Microsoft `snmalloc`](https://github.com/microsoft/snmalloc)**: For the batched cross-thread message return queue design that eliminates per-message cache-line invalidation during remote deallocation.
+* **[Dmitry Vyukov](https://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue)**: For the foundational intrusive MPSC node-based queue algorithm.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
+
