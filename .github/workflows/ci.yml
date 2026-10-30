@@ -34,6 +34,9 @@ jobs:
       - name: Run example 03 (Sharded SPSC Mailbox)
         run: odin run examples/03_sharded_spsc_mailbox.odin -file -o:speed
 
+      - name: Run example 04 (Ergonomic Actor DSL)
+        run: odin run examples/04_ergonomic_dsl.odin -file -o:speed
+
       - name: Type-check full benchmark suite
         run: odin check benchmarks/actor_benchmark.odin -file
 

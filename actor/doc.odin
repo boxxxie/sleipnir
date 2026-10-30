@@ -23,12 +23,13 @@ Pony-style M:N Actor runtime and concurrency primitives for Odin.
    remote frees by collecting consumed message envelopes during an actor's batch quantum
    and splicing the entire retired chain back to its origin pool in a single atomic operation.
 
-4. **Sharded Work-Stealing M:N Scheduler (`Scheduler` & `Actor($State, $Msg)`)**:
+4. **Sharded Work-Stealing M:N Scheduler (`Scheduler`, `Actor($State, $Msg)`, & `PID($Msg)`)**:
    Multiplexes thousands of lightweight, strongly-typed `Actor($State, $Msg)` instances
    onto a configurable pool of OS worker threads. Supports heterogeneous actor types on
    the same scheduler, zero-copy `iso` message forwarding (`actor.forward`), lock-free
-   `.Seq_Cst` Dekker wake/unschedule barriers, and optional adaptive 2-phase `sync.Futex`
-   worker parking (`enable_parking = true`) for 0% idle CPU utilization.
+   `.Seq_Cst` Dekker wake/unschedule barriers, optional adaptive 2-phase `sync.Futex`
+   worker parking (`enable_parking = true`), single-line `scoped_scheduler` (`@(deferred_out)`),
+   ambient thread-local context, and automatic per-message-type `Envelope_Pool` management.
 */
 package actor
 
@@ -39,7 +40,11 @@ package actor
 // Initialize an actor, scheduler, memory pool, watermark slab, or queue.
 init :: proc {
 	scheduler_init,
+	scheduler_init_workers,
 	actor_init,
+	actor_init_state,
+	actor_init_simple,
+	actor_init_val,
 	pool_init,
 	watermark_slab_init,
 	mpsc_init,
@@ -64,11 +69,28 @@ push :: proc {
 	sharded_spsc_push,
 }
 
-// Send a message or envelope to a typed `Actor($State, $Msg)`.
+// Send a message, batch slice, or envelope to a typed `^Actor($State, $Msg)` or `PID($Msg)`.
 send :: proc {
 	send_ctx,
+	send_ctx_pid,
+	send_ctx_batch,
+	send_ctx_batch_pid,
 	send_from_pool,
+	send_from_pool_pid,
 	send_batch_from_pool,
+	send_batch_from_pool_pid,
+	send_sched_auto,
+	send_sched_auto_pid,
+	send_sched_batch_auto,
+	send_sched_batch_auto_pid,
 	send_envelope,
+	send_envelope_pid,
 	send_envelope_chain,
+	send_envelope_chain_pid,
+	send_ambient,
+	send_ambient_pid,
+	send_ambient_batch,
+	send_ambient_batch_pid,
+	send_ambient_envelope,
+	send_ambient_envelope_pid,
 }

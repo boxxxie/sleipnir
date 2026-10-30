@@ -497,3 +497,177 @@ test_12_actor_zero_copy_forward_returns_to_pool :: proc(t: ^testing.T) {
 		testing.expect_value(t, sink.state.sum, i64(num_msgs * 25))
 	})
 }
+
+// =============================================================================
+// 5. Ergonomic DSL Features: `scoped_scheduler`, Ambient Context, Auto-Pools, & `PID`
+// =============================================================================
+
+@(test)
+test_13_scoped_scheduler_and_auto_pooled_ambient_api :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		final_total: i64 = 0
+		final_msgs:  int = 0
+		{
+			// 1-line RAII scheduler scope (`@(deferred_out = scheduler_scope_end)`)
+			_ = scoped_scheduler(num_workers = 2)
+
+			// Spawn actor with 2-arg `(state: ^State, msg: ^Msg)` handler — no manual pool or defer destroy!
+			counter := spawn(Counter_State{}, proc(state: ^Counter_State, msg: ^i64) {
+				state.total += msg^
+				state.messages += 1
+			})
+
+			// Ambient single-message sends (`actor.send(target, msg)`)
+			for i: i64 = 1; i <= 10; i += 1 {
+				send(counter, i)
+			}
+
+			// Ambient batch slice splice (`actor.send(target, batch[:])`)
+			batch := [4]i64{10, 20, 30, 40}
+			send(counter, batch[:])
+
+			wait_messages(14)
+			wait_idle()
+
+			final_total = counter.state.total
+			final_msgs  = counter.state.messages
+		}
+		// At block exit, `scoped_scheduler` automatically destroyed `counter`, its auto-pools, and the scheduler!
+		testing.expect_value(t, final_msgs, 14)
+		testing.expect_value(t, final_total, 55 + 100)
+	})
+}
+
+@(private = "file")
+Calc_Add :: struct {
+	amount: i64,
+}
+@(private = "file")
+Calc_Mul :: struct {
+	factor: i64,
+}
+@(private = "file")
+Calc_Report :: struct {
+	reply_to: PID(i64), // Decoupled from the sink actor's private `$State`!
+}
+@(private = "file")
+Calc_Msg :: union {
+	Calc_Add,
+	Calc_Mul,
+	Calc_Report,
+}
+
+@(test)
+test_14_pid_handle_and_tagged_union_value_behaviors :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		reported_val: i64 = 0
+		{
+			sched := scoped_scheduler(num_workers = 2)
+			sched.pending_tokens = 1
+
+			// Sink actor accepts `i64`
+			sink := spawn(Counter_State{}, proc(state: ^Counter_State, val: i64) {
+				state.total = val
+				complete_token() // Ambient 0-arg `complete_token()`!
+			})
+
+			// Calculator actor with multi-behavior tagged `union` (`Calc_Msg` by value)
+			calc := spawn(Counter_State{}, proc(state: ^Counter_State, msg: Calc_Msg) {
+				switch m in msg {
+				case Calc_Add:
+					state.total += m.amount
+				case Calc_Mul:
+					state.total *= m.factor
+				case Calc_Report:
+					send(m.reply_to, state.total) // Ambient send to `PID(i64)`!
+				}
+			})
+
+			calc_pid := pid(calc)
+			send(calc_pid, Calc_Msg(Calc_Add{amount = 7}))
+			send(calc_pid, Calc_Msg(Calc_Mul{factor = 6}))
+			send(calc_pid, Calc_Msg(Calc_Report{reply_to = pid(sink)}))
+
+			wait_tokens()
+			wait_idle()
+			reported_val = sink.state.total
+		}
+		testing.expect_value(t, reported_val, 42)
+	})
+}
+
+@(private = "file")
+Hop_Stage :: struct {
+	next_pid: PID(i64),
+	sum:      i64,
+}
+
+@(test)
+test_15_ambient_zero_copy_forward_and_unchanged_forward :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		final_sum: i64 = 0
+		{
+			sched := scoped_scheduler(num_workers = 2)
+			sched.pending_tokens = 10
+
+			on_hop :: proc(state: ^Hop_Stage, msg: ^i64) {
+				if state.next_pid.ref != nil {
+					// Mutate `msg^` in place and forward the envelope via 1-arg `forward(next_pid)`
+					msg^ += 5
+					forward(state.next_pid)
+				} else {
+					state.sum += msg^
+					complete_token()
+				}
+			}
+
+			sink   := spawn(Hop_Stage{}, on_hop)
+			stage2 := spawn(Hop_Stage{next_pid = pid(sink)}, on_hop)
+			stage1 := spawn(Hop_Stage{next_pid = pid(stage2)}, on_hop)
+
+			for i := 0; i < 10; i += 1 {
+				send(stage1, i64(10))
+			}
+
+			wait_tokens()
+			wait_idle()
+			final_sum = sink.state.sum
+		}
+		// 10 messages * (10 + 5 + 5) = 200
+		testing.expect_value(t, final_sum, 200)
+	})
+}
+
+@(private = "file")
+Self_Contained_Actor :: struct {
+	accum:   i64,
+	receive: proc(self: ^Self_Contained_Actor, msg: i64),
+}
+
+@(test)
+test_16_compile_time_structural_typing_spawn_self :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		result: i64 = 0
+		{
+			_ = scoped_scheduler(num_workers = 2)
+
+			// Spawn a struct that embeds its own `receive` behavior using `base:intrinsics`!
+			a := spawn_self(Self_Contained_Actor{
+				accum = 100,
+				receive = proc(self: ^Self_Contained_Actor, msg: i64) {
+					self.accum += msg
+				},
+			})
+
+			send(a, i64(23))
+			send(a, i64(19))
+
+			wait_messages(2)
+			wait_idle()
+			result = a.state.accum
+		}
+		testing.expect_value(t, result, 142)
+	})
+}
+
+

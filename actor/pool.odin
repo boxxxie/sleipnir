@@ -37,12 +37,15 @@ Envelope :: struct($Msg: typeid) {
 // and a lock-free `remote_returns` MPSC queue for cross-thread batched reclamation.
 Envelope_Pool :: struct($Msg: typeid) #align(64) {
 	// Producer-local fields (Cache Line 0 - zero cross-thread contention)
-	local_free: ^Envelope(Msg),
-	slab:       []Envelope(Msg),
-	slab_idx:   int,
-	pool_id:    u16,
-	allocator:  mem.Allocator,
-	_pad0:      [64 - (size_of(rawptr) + size_of([]Envelope(Msg)) + size_of(int) + size_of(u16) + size_of(mem.Allocator)) % 64]u8,
+	local_free:    ^Envelope(Msg),
+	slab:          []Envelope(Msg),
+	slab_idx:      int,
+	pool_id:       u16,
+	heap_fallback: bool,
+	_align_busy:   u8,
+	busy:          u32,
+	allocator:     mem.Allocator,
+	_pad0:         [8]u8,
 
 	// Cross-thread batched return queue (Cache Lines 1..3)
 	// Consumers return chains of `[first .. last]` here once per batch quantum.
@@ -55,8 +58,11 @@ pool_init :: proc(
 	pool_id: u16,
 	slab_capacity: int = 8192,
 	allocator := context.allocator,
+	heap_fallback: bool = false,
 ) -> mem.Allocator_Error {
 	p.pool_id = pool_id
+	p.heap_fallback = heap_fallback
+	p.busy = 0
 	p.allocator = allocator
 	p.local_free = nil
 	p.slab_idx = 0
@@ -117,8 +123,9 @@ pool_acquire :: #force_inline proc(p: ^Envelope_Pool($Msg), spin_if_exhausted: b
 			return env
 		}
 
-		if !spin_if_exhausted {
+		if !spin_if_exhausted || p.heap_fallback {
 			env_heap := new(Envelope(Msg), p.allocator)
+			env_heap.next = nil
 			env_heap.pool_id = p.pool_id
 			env_heap.flags = ENVELOPE_FLAG_HEAP
 			return env_heap
