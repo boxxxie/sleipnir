@@ -13,8 +13,11 @@ Audit_Logger_Msg_record_snapshot :: struct {
 	tx_count: int,
 }
 
+Audit_Logger_Msg_reset :: struct {}
+
 Audit_Logger_Msg :: union {
 	Audit_Logger_Msg_record_snapshot,
+	Audit_Logger_Msg_reset,
 }
 
 Audit_Logger_Actor :: actor.Actor(Audit_Logger, Audit_Logger_Msg)
@@ -24,6 +27,8 @@ audit_logger_dispatch :: proc(ctx: ^actor.Context, self: ^Audit_Logger, msg: ^Au
 	switch m in msg^ {
 	case Audit_Logger_Msg_record_snapshot:
 		record_snapshot(self, m.owner, m.balance, m.tx_count)
+	case Audit_Logger_Msg_reset:
+		logger_reset(self)
 	}
 }
 
@@ -51,20 +56,21 @@ spawn_audit_logger :: proc {
 	spawn_audit_logger_sched,
 }
 
-send_record_snapshot_actor :: #force_inline proc(target: ^Audit_Logger_Actor, owner: string, balance: i64, tx_count: int) {
+send_audit_logger_record_snapshot_actor :: #force_inline proc(target: ^Audit_Logger_Actor, owner: string, balance: i64, tx_count: int) {
 	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_record_snapshot{owner = owner, balance = balance, tx_count = tx_count}))
 }
 
-send_record_snapshot_pid :: #force_inline proc(target: Audit_Logger_PID, owner: string, balance: i64, tx_count: int) {
+send_audit_logger_record_snapshot_pid :: #force_inline proc(target: Audit_Logger_PID, owner: string, balance: i64, tx_count: int) {
 	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_record_snapshot{owner = owner, balance = balance, tx_count = tx_count}))
 }
 
-send_record_snapshot :: proc {
-	send_record_snapshot_actor,
-	send_record_snapshot_pid,
+send_audit_logger_reset_actor :: #force_inline proc(target: ^Audit_Logger_Actor) {
+	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_reset{}))
 }
 
-be_record_snapshot :: send_record_snapshot
+send_audit_logger_reset_pid :: #force_inline proc(target: Audit_Logger_PID) {
+	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_reset{}))
+}
 
 // =============================================================================
 // Generated Actor Bindings for `Bank_Account`
@@ -79,7 +85,7 @@ Bank_Account_Msg_withdraw :: struct {
 	amount: i64,
 }
 
-Bank_Account_Msg_reset_account :: struct {}
+Bank_Account_Msg_reset :: struct {}
 
 Bank_Account_Msg_audit_snapshot :: struct {
 	logger: Audit_Logger_PID,
@@ -88,7 +94,7 @@ Bank_Account_Msg_audit_snapshot :: struct {
 Bank_Account_Msg :: union {
 	Bank_Account_Msg_deposit,
 	Bank_Account_Msg_withdraw,
-	Bank_Account_Msg_reset_account,
+	Bank_Account_Msg_reset,
 	Bank_Account_Msg_audit_snapshot,
 }
 
@@ -101,8 +107,8 @@ bank_account_dispatch :: proc(ctx: ^actor.Context, self: ^Bank_Account, msg: ^Ba
 		deposit(self, m.amount, m.memo)
 	case Bank_Account_Msg_withdraw:
 		withdraw(self, m.amount)
-	case Bank_Account_Msg_reset_account:
-		reset_account(self)
+	case Bank_Account_Msg_reset:
+		account_reset(self)
 	case Bank_Account_Msg_audit_snapshot:
 		audit_snapshot(self, m.logger)
 	}
@@ -132,62 +138,89 @@ spawn_bank_account :: proc {
 	spawn_bank_account_sched,
 }
 
-send_deposit_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64, memo: string = "deposit") {
+send_bank_account_deposit_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64, memo: string = "deposit") {
 	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_deposit{amount = amount, memo = memo}))
 }
 
-send_deposit_pid :: #force_inline proc(target: Bank_Account_PID, amount: i64, memo: string = "deposit") {
+send_bank_account_deposit_pid :: #force_inline proc(target: Bank_Account_PID, amount: i64, memo: string = "deposit") {
 	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_deposit{amount = amount, memo = memo}))
 }
+
+send_bank_account_withdraw_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
+}
+
+send_bank_account_withdraw_pid :: #force_inline proc(target: Bank_Account_PID, amount: i64) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
+}
+
+send_bank_account_reset_actor :: #force_inline proc(target: ^Bank_Account_Actor) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset{}))
+}
+
+send_bank_account_reset_pid :: #force_inline proc(target: Bank_Account_PID) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset{}))
+}
+
+send_bank_account_audit_snapshot_actor :: #force_inline proc(target: ^Bank_Account_Actor, logger: Audit_Logger_PID) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
+}
+
+send_bank_account_audit_snapshot_pid :: #force_inline proc(target: Bank_Account_PID, logger: Audit_Logger_PID) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
+}
+
+// =============================================================================
+// Unified Behavior Overload Groups (`be_<behavior>` & `send_<behavior>`)
+// =============================================================================
+
+send_record_snapshot :: proc {
+	send_audit_logger_record_snapshot_actor,
+	send_audit_logger_record_snapshot_pid,
+}
+
+be_record_snapshot :: send_record_snapshot
+
+send_reset :: proc {
+	send_audit_logger_reset_actor,
+	send_audit_logger_reset_pid,
+	send_bank_account_reset_actor,
+	send_bank_account_reset_pid,
+}
+
+be_reset :: send_reset
+
+send_logger_reset :: proc {
+	send_audit_logger_reset_actor,
+	send_audit_logger_reset_pid,
+}
+
+be_logger_reset :: send_logger_reset
 
 send_deposit :: proc {
-	send_deposit_actor,
-	send_deposit_pid,
+	send_bank_account_deposit_actor,
+	send_bank_account_deposit_pid,
 }
 
 be_deposit :: send_deposit
 
-send_withdraw_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
-}
-
-send_withdraw_pid :: #force_inline proc(target: Bank_Account_PID, amount: i64) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
-}
-
 send_withdraw :: proc {
-	send_withdraw_actor,
-	send_withdraw_pid,
+	send_bank_account_withdraw_actor,
+	send_bank_account_withdraw_pid,
 }
 
 be_withdraw :: send_withdraw
 
-send_reset_account_actor :: #force_inline proc(target: ^Bank_Account_Actor) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset_account{}))
+send_account_reset :: proc {
+	send_bank_account_reset_actor,
+	send_bank_account_reset_pid,
 }
 
-send_reset_account_pid :: #force_inline proc(target: Bank_Account_PID) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset_account{}))
-}
-
-send_reset_account :: proc {
-	send_reset_account_actor,
-	send_reset_account_pid,
-}
-
-be_reset_account :: send_reset_account
-
-send_audit_snapshot_actor :: #force_inline proc(target: ^Bank_Account_Actor, logger: Audit_Logger_PID) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
-}
-
-send_audit_snapshot_pid :: #force_inline proc(target: Bank_Account_PID, logger: Audit_Logger_PID) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
-}
+be_account_reset :: send_account_reset
 
 send_audit_snapshot :: proc {
-	send_audit_snapshot_actor,
-	send_audit_snapshot_pid,
+	send_bank_account_audit_snapshot_actor,
+	send_bank_account_audit_snapshot_pid,
 }
 
 be_audit_snapshot :: send_audit_snapshot

@@ -1,14 +1,10 @@
 // =============================================================================
-// Example 05: Pony-Style `@(actor)` & `@(behavior)` AST Metaprogramming
+// Example 05: Multi-File Pony-Style `@(actor)` & `@(behavior)` AST Metaprogramming
 //
-// Demonstrates defining actors and behaviors using Odin custom attributes
-// `@(actor)` and `@(behavior)`. Running `tools/sleipnir_gen` parses this file
-// with `core:odin/parser` and generates `actors_gen.odin` containing:
-//   - Message structs (`Bank_Account_Msg_deposit`, etc.)
-//   - Tagged union (`Bank_Account_Msg`) & `PID` alias (`Bank_Account_PID`)
-//   - Dispatcher (`bank_account_dispatch`)
-//   - Constructor (`spawn_bank_account`)
-//   - Async behavior callers (`be_deposit`, `be_withdraw`, `be_audit_snapshot`)
+// Demonstrates defining `@(actor)` structs and `@(behavior)` procedures across
+// multiple `.odin` files (`audit_logger.odin`, `bank_account.odin`, `main.odin`).
+// Running `tools/sleipnir_gen` scans the entire package directory and emits
+// `actors_gen.odin` with unified `be_*` overload groups.
 //
 // Generate & Run:
 //   odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
@@ -18,57 +14,6 @@
 package main
 
 import "../../actor"
-import "core:fmt"
-
-// --- Actor 1: Audit Logger ---
-
-@(actor)
-Audit_Logger :: struct {
-	entries_logged: int,
-	last_balance:   i64,
-}
-
-@(behavior)
-record_snapshot :: proc(self: ^Audit_Logger, owner: string, balance: i64, tx_count: int) {
-	self.entries_logged += 1
-	self.last_balance    = balance
-	fmt.printfln("[Audit #%d] Account '%s' balance = $%d (after %d transactions)",
-		self.entries_logged, owner, balance, tx_count)
-	actor.complete_token()
-}
-
-// --- Actor 2: Bank Account ---
-
-@(actor)
-Bank_Account :: struct {
-	owner:    string,
-	balance:  i64,
-	tx_count: int,
-}
-
-@(behavior)
-deposit :: proc(self: ^Bank_Account, amount: i64, memo: string = "deposit") {
-	self.balance  += amount
-	self.tx_count += 1
-}
-
-@(behavior)
-withdraw :: proc(self: ^Bank_Account, amount: i64) {
-	self.balance  -= amount
-	self.tx_count += 1
-}
-
-@(behavior)
-reset_account :: proc(self: ^Bank_Account) {
-	self.balance  = 0
-	self.tx_count = 0
-}
-
-@(behavior)
-audit_snapshot :: proc(self: ^Bank_Account, logger: Audit_Logger_PID) {
-	// Call a Pony-style behavior on another generated actor (`logger`)!
-	be_record_snapshot(logger, self.owner, self.balance, self.tx_count)
-}
 
 main :: proc() {
 	sched := actor.scoped_scheduler(num_workers = 2)
@@ -76,6 +21,9 @@ main :: proc() {
 
 	logger  := spawn_audit_logger(Audit_Logger{})
 	account := spawn_bank_account(Bank_Account{owner = "Sleipnir", balance = 500})
+
+	// Both `Audit_Logger` and `Bank_Account` support `be_reset` via unified proc overloading!
+	be_reset(logger)
 
 	// Call generated Pony-style `be_*` behaviors directly!
 	be_deposit(account, 250)               // Uses default `memo = "deposit"`

@@ -13,10 +13,15 @@ import "core:strings"
 // =============================================================================
 // Sleipnir AST Metaprogramming Generator (`core:odin/parser` + `core:odin/ast`)
 //
-// Parses Odin source files containing `@(actor)` structs and `@(behavior)`
-// procedures and generates strongly-typed message structs, tagged `union`
-// mailboxes, `PID` aliases, dispatchers, `spawn_<actor>` constructors, and
-// Pony-style `be_<behavior>` / `send_<behavior>` async message senders.
+// Multi-file package support:
+//   1. Two-pass package AST scan: `@(actor)` structs and `@(behavior)` procedures
+//      can be split across any number of `.odin` files in the same package directory.
+//   2. Cross-file import forwarding: Imports (`import "core:time"`, etc.) used in
+//      behavior parameter types across any file are automatically forwarded to
+//      `actors_gen.odin`.
+//   3. Cross-actor behavior overloading: If multiple actors in different files
+//      define behaviors that map to the same `be_<name>` / `send_<name>` group,
+//      all overloads are merged into a single Odin `proc { ... }` group!
 // =============================================================================
 
 Behavior_Param :: struct {
@@ -26,10 +31,11 @@ Behavior_Param :: struct {
 }
 
 Behavior_Spec :: struct {
-	proc_name:  string,
-	actor_type: string,
-	takes_ctx:  bool,
-	params:     [dynamic]Behavior_Param,
+	proc_name:   string, // Actual Odin procedure name (e.g. `deposit` or `account_reset`)
+	short_name:  string, // Optional short behavior name or `proc_name`
+	actor_type:  string,
+	takes_ctx:   bool,
+	params:      [dynamic]Behavior_Param,
 }
 
 Actor_Spec :: struct {
@@ -37,15 +43,23 @@ Actor_Spec :: struct {
 	behaviors: [dynamic]Behavior_Spec,
 }
 
+Import_Spec :: struct {
+	alias:    string, // Effective local identifier (e.g. `time` for `import "core:time"`)
+	raw_decl: string, // Full `import ...` declaration text
+	fullpath: string,
+}
+
 Module_Spec :: struct {
 	package_name: string,
 	actor_import: string,
+	imports:      [dynamic]Import_Spec,
 	actors:       [dynamic]Actor_Spec,
 	ast_arena:    mem.Dynamic_Arena,
 }
 
 init_module_spec :: proc(m: ^Module_Spec) {
-	m.actors = make([dynamic]Actor_Spec)
+	m.imports = make([dynamic]Import_Spec)
+	m.actors  = make([dynamic]Actor_Spec)
 	mem.dynamic_arena_init(&m.ast_arena)
 }
 
@@ -57,6 +71,7 @@ destroy_module_spec :: proc(m: ^Module_Spec) {
 		delete(a.behaviors)
 	}
 	delete(m.actors)
+	delete(m.imports)
 	mem.dynamic_arena_destroy(&m.ast_arena)
 }
 
@@ -77,21 +92,27 @@ to_snake_case :: proc(s: string, allocator := context.allocator) -> string {
 	return strings.to_string(b)
 }
 
-// Check if a `Value_Decl` has `@(attr_name)` or `@attr_name`.
-has_attribute :: proc(decl: ^ast.Value_Decl, attr_name: string) -> bool {
+// Check if a `Value_Decl` has `@(attr_name)` or `@(attr_name="value")`.
+get_attribute :: proc(decl: ^ast.Value_Decl, attr_name: string) -> (val: string, found: bool) {
 	for attr in decl.attributes {
 		for elem in attr.elems {
 			#partial switch e in elem.derived {
 			case ^ast.Ident:
-				if e.name == attr_name do return true
+				if e.name == attr_name do return "", true
 			case ^ast.Field_Value:
-				if ident, ok := e.field.derived.(^ast.Ident); ok {
-					if ident.name == attr_name do return true
+				if ident, ok := e.field.derived.(^ast.Ident); ok && ident.name == attr_name {
+					if lit, lit_ok := e.value.derived.(^ast.Basic_Lit); lit_ok {
+						return strings.trim(lit.tok.text, "\""), true
+					}
+					if v_ident, v_ok := e.value.derived.(^ast.Ident); v_ok {
+						return v_ident.name, true
+					}
+					return "", true
 				}
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 // Extract the raw source substring corresponding to an AST node.
@@ -121,8 +142,23 @@ extract_pointer_ident :: proc(expr: ^ast.Expr) -> (string, bool) {
 	return "", false
 }
 
-// Parse a single Odin source buffer and append discovered `@(actor)` structs and
-// `@(behavior)` procedures into `mod` and `pending_behaviors`.
+// Derive the local package alias for an `Import_Decl` (e.g. `import "core:time"` -> `"time"`).
+import_local_alias :: proc(imp: ^ast.Import_Decl) -> string {
+	if imp.name.text != "" {
+		return imp.name.text
+	}
+	clean := strings.trim(imp.fullpath, "\"")
+	if colon := strings.last_index_byte(clean, ':'); colon >= 0 {
+		clean = clean[colon + 1:]
+	}
+	if slash := strings.last_index_byte(clean, '/'); slash >= 0 {
+		clean = clean[slash + 1:]
+	}
+	return clean
+}
+
+// Parse a single Odin source buffer and append discovered imports, `@(actor)` structs,
+// and `@(behavior)` procedures into `mod` and `pending_behaviors`.
 parse_source_into_spec :: proc(
 	src: string,
 	filename: string,
@@ -149,8 +185,24 @@ parse_source_into_spec :: proc(
 	for decl_stmt in file.decls {
 		#partial switch d in decl_stmt.derived {
 		case ^ast.Import_Decl:
-			if strings.has_suffix(d.fullpath, "actor\"") || strings.has_suffix(d.fullpath, "/actor\"") {
+			alias := import_local_alias(d)
+			if alias == "actor" || strings.has_suffix(d.fullpath, "actor\"") || strings.has_suffix(d.fullpath, "/actor\"") {
 				mod.actor_import = d.fullpath
+			} else {
+				already := false
+				for existing in mod.imports {
+					if existing.alias == alias {
+						already = true
+						break
+					}
+				}
+				if !already {
+					append(&mod.imports, Import_Spec{
+						alias    = alias,
+						raw_decl = node_source(src, d),
+						fullpath = d.fullpath,
+					})
+				}
 			}
 		case ^ast.Value_Decl:
 			if d.is_mutable || len(d.names) == 0 || len(d.values) == 0 {
@@ -159,7 +211,7 @@ parse_source_into_spec :: proc(
 			ident, ok := d.names[0].derived.(^ast.Ident)
 			if !ok do continue
 
-			if has_attribute(d, "actor") {
+			if _, is_actor := get_attribute(d, "actor"); is_actor {
 				if _, is_struct := d.values[0].derived.(^ast.Struct_Type); is_struct {
 					already_exists := false
 					for existing in mod.actors {
@@ -175,7 +227,7 @@ parse_source_into_spec :: proc(
 						})
 					}
 				}
-			} else if has_attribute(d, "behavior") {
+			} else if custom_be_name, is_behavior := get_attribute(d, "behavior"); is_behavior {
 				proc_lit, is_proc := d.values[0].derived.(^ast.Proc_Lit)
 				if !is_proc || proc_lit.type == nil || proc_lit.type.params == nil {
 					continue
@@ -204,8 +256,10 @@ parse_source_into_spec :: proc(
 
 				if actor_type == "" do continue
 
+				short := custom_be_name if len(custom_be_name) > 0 else ident.name
 				bspec := Behavior_Spec{
 					proc_name  = ident.name,
+					short_name = short,
 					actor_type = actor_type,
 					takes_ctx  = takes_ctx,
 					params     = make([dynamic]Behavior_Param),
@@ -246,6 +300,21 @@ finalize_module_spec :: proc(mod: ^Module_Spec, pending_behaviors: []Behavior_Sp
 	}
 }
 
+// Check if an import alias (e.g. `time.`) is referenced in any behavior parameter type or default.
+is_import_referenced :: proc(mod: ^Module_Spec, alias: string) -> bool {
+	prefix := fmt.tprintf("%s.", alias)
+	for a in mod.actors {
+		for b in a.behaviors {
+			for p in b.params {
+				if strings.contains(p.type_expr, prefix) || strings.contains(p.default_expr, prefix) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // Generate the Odin source code for a `Module_Spec`.
 emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> string {
 	sb := strings.builder_make(allocator)
@@ -255,7 +324,32 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 	fmt.sbprintln(&sb, "// Code generated by Sleipnir AST Metaprogramming Generator (`tools/sleipnir_gen`). DO NOT EDIT.")
 	fmt.sbprintf(&sb, "package %s\n\n", pkg)
-	fmt.sbprintf(&sb, "import %s\n\n", actor_imp)
+	fmt.sbprintf(&sb, "import %s\n", actor_imp)
+	for imp in mod.imports {
+		if is_import_referenced(mod, imp.alias) {
+			fmt.sbprintf(&sb, "%s\n", imp.raw_decl)
+		}
+	}
+	fmt.sbprintln(&sb)
+
+	// Track shared `be_<short_name>` and `send_<short_name>` overload groups across all actors
+	Group_Entry :: struct {
+		name:  string,
+		procs: [dynamic]string,
+	}
+	overload_groups := make([dynamic]Group_Entry, context.temp_allocator)
+
+	add_to_group :: proc(groups: ^[dynamic]Group_Entry, group_name: string, proc_sym: string) {
+		for &g in groups^ {
+			if g.name == group_name {
+				append(&g.procs, proc_sym)
+				return
+			}
+		}
+		procs := make([dynamic]string, context.temp_allocator)
+		append(&procs, proc_sym)
+		append(groups, Group_Entry{name = group_name, procs = procs})
+	}
 
 	for a in mod.actors {
 		if len(a.behaviors) == 0 do continue
@@ -269,7 +363,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 		// 1. Per-behavior message structs
 		for b in a.behaviors {
-			msg_struct_name := fmt.tprintf("%s_Msg_%s", a.name, b.proc_name)
+			msg_struct_name := fmt.tprintf("%s_Msg_%s", a.name, b.short_name)
 			if len(b.params) == 0 {
 				fmt.sbprintf(&sb, "%s :: struct {{}}\n\n", msg_struct_name)
 			} else {
@@ -284,7 +378,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		// 2. Tagged union & Actor / PID aliases
 		fmt.sbprintf(&sb, "%s_Msg :: union {{\n", a.name)
 		for b in a.behaviors {
-			fmt.sbprintf(&sb, "\t%s_Msg_%s,\n", a.name, b.proc_name)
+			fmt.sbprintf(&sb, "\t%s_Msg_%s,\n", a.name, b.short_name)
 		}
 		fmt.sbprintln(&sb, "}\n")
 
@@ -295,7 +389,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		fmt.sbprintf(&sb, "%s_dispatch :: proc(ctx: ^actor.Context, self: ^%s, msg: ^%s_Msg) {{\n", snake_actor, a.name, a.name)
 		fmt.sbprintln(&sb, "\tswitch m in msg^ {")
 		for b in a.behaviors {
-			fmt.sbprintf(&sb, "\tcase %s_Msg_%s:\n", a.name, b.proc_name)
+			fmt.sbprintf(&sb, "\tcase %s_Msg_%s:\n", a.name, b.short_name)
 			fmt.sbprintf(&sb, "\t\t%s(", b.proc_name)
 			if b.takes_ctx {
 				fmt.sbprint(&sb, "ctx, self")
@@ -335,11 +429,10 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		fmt.sbprintf(&sb, "\tspawn_%s_sched,\n", snake_actor)
 		fmt.sbprintln(&sb, "}\n")
 
-		// 5. Generated `be_<behavior>` and `send_<behavior>` async callers
+		// 5. Generated actor-scoped send procedures (collision-free across files & actors)
 		for b in a.behaviors {
-			msg_struct_name := fmt.tprintf("%s_Msg_%s", a.name, b.proc_name)
+			msg_struct_name := fmt.tprintf("%s_Msg_%s", a.name, b.short_name)
 
-			// Build parameter signature suffix and struct literal initializer
 			param_sig_b := strings.builder_make(context.temp_allocator)
 			lit_init_b  := strings.builder_make(context.temp_allocator)
 			for p, idx in b.params {
@@ -356,20 +449,40 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 			param_sig := strings.to_string(param_sig_b)
 			lit_init  := strings.to_string(lit_init_b)
 
-			fmt.sbprintf(&sb, "send_%s_actor :: #force_inline proc(target: ^%s_Actor%s) {{\n", b.proc_name, a.name, param_sig)
+			actor_fn := fmt.tprintf("send_%s_%s_actor", snake_actor, b.short_name)
+			pid_fn   := fmt.tprintf("send_%s_%s_pid", snake_actor, b.short_name)
+
+			fmt.sbprintf(&sb, "%s :: #force_inline proc(target: ^%s_Actor%s) {{\n", actor_fn, a.name, param_sig)
 			fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
 			fmt.sbprintln(&sb, "}\n")
 
-			fmt.sbprintf(&sb, "send_%s_pid :: #force_inline proc(target: %s_PID%s) {{\n", b.proc_name, a.name, param_sig)
+			fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_PID%s) {{\n", pid_fn, a.name, param_sig)
 			fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
 			fmt.sbprintln(&sb, "}\n")
 
-			fmt.sbprintf(&sb, "send_%s :: proc {{\n", b.proc_name)
-			fmt.sbprintf(&sb, "\tsend_%s_actor,\n", b.proc_name)
-			fmt.sbprintf(&sb, "\tsend_%s_pid,\n", b.proc_name)
-			fmt.sbprintln(&sb, "}\n")
+			add_to_group(&overload_groups, b.short_name, actor_fn)
+			add_to_group(&overload_groups, b.short_name, pid_fn)
+			if b.proc_name != b.short_name {
+				add_to_group(&overload_groups, b.proc_name, actor_fn)
+				add_to_group(&overload_groups, b.proc_name, pid_fn)
+			}
+		}
+	}
 
-			fmt.sbprintf(&sb, "be_%s :: send_%s\n\n", b.proc_name, b.proc_name)
+	// 6. Emit unified `send_<behavior>` and `be_<behavior>` procedure overload groups
+	if len(overload_groups) > 0 {
+		fmt.sbprintln(&sb, "// =============================================================================")
+		fmt.sbprintln(&sb, "// Unified Behavior Overload Groups (`be_<behavior>` & `send_<behavior>`)")
+		fmt.sbprintln(&sb, "// =============================================================================")
+		fmt.sbprintln(&sb)
+
+		for g in overload_groups {
+			fmt.sbprintf(&sb, "send_%s :: proc {{\n", g.name)
+			for fn_name in g.procs {
+				fmt.sbprintf(&sb, "\t%s,\n", fn_name)
+			}
+			fmt.sbprintln(&sb, "}\n")
+			fmt.sbprintf(&sb, "be_%s :: send_%s\n\n", g.name, g.name)
 		}
 	}
 
@@ -382,6 +495,16 @@ generate_from_source :: proc(
 	filename: string = "input.odin",
 	allocator := context.allocator,
 ) -> (code: string, ok: bool) {
+	return generate_from_sources({src}, {filename}, allocator)
+}
+
+// High-level helper: parse multiple Odin source strings belonging to the same package
+// and return the combined generated Odin code.
+generate_from_sources :: proc(
+	sources: []string,
+	filenames: []string = nil,
+	allocator := context.allocator,
+) -> (code: string, ok: bool) {
 	mod: Module_Spec
 	init_module_spec(&mod)
 	defer destroy_module_spec(&mod)
@@ -389,15 +512,18 @@ generate_from_source :: proc(
 	pending := make([dynamic]Behavior_Spec)
 	defer delete(pending)
 
-	if !parse_source_into_spec(src, filename, &mod, &pending) {
-		return "", false
+	for src, idx in sources {
+		fname := filenames[idx] if idx < len(filenames) else "input.odin"
+		if !parse_source_into_spec(src, fname, &mod, &pending) {
+			return "", false
+		}
 	}
 	finalize_module_spec(&mod, pending[:])
 	return emit_module_code(&mod, allocator), true
 }
 
 // Scan a directory of `.odin` files (skipping `*_gen.odin`), parse all `@(actor)`
-// and `@(behavior)` declarations, and write `<dir>/actors_gen.odin`.
+// and `@(behavior)` declarations across all files in the package, and write `<dir>/actors_gen.odin`.
 generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.odin") -> (out_path: string, ok: bool) {
 	f, err := os.open(dir_path)
 	if err != nil do return "", false
