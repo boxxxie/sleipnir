@@ -56,9 +56,9 @@ sleipnir/
 │   ├── 03_sharded_spsc_mailbox.odin    # Wait-free Sharded_SPSC_Mailbox fan-in
 │   └── library_demo.odin               # Combined demo & benchmark verification
 └── benchmarks/                         # Comparative Odin & C11 benchmark suite
+    ├── README.md                       # Microarchitectural analysis & full empirical results
     ├── actor_benchmark.odin            # Full 5-workload comparative Odin benchmark suite
-    ├── actor_benchmark_c11.c           # Matching C11 / pthreads reference benchmark
-    └── benchmark_results_and_findings.md # Architectural deep-dive & empirical findings
+    └── actor_benchmark_c11.c           # Matching C11 / pthreads reference benchmark
 ```
 
 ---
@@ -214,7 +214,7 @@ Following Odin's `core:` conventions, `package actor` provides both explicit pro
 
 ## Benchmark Suite & Empirical Results
 
-Run the full 5-workload benchmark suite (`odin run benchmarks/actor_benchmark.odin -file -o:speed`):
+Captured on an **AMD Ryzen 7 7735U** (8 Cores / 16 Threads, Zen 3+, 16 MiB L3, Linux `7.1.13-2-MANJARO`, `odin version dev-2026-09 -o:speed`). Run the suite locally via `odin run benchmarks/actor_benchmark.odin -file -o:speed`:
 
 ### Workload 1: 4-Producer $\rightarrow$ 1-Actor Fan-In Contention (2,000,000 Messages)
 
@@ -238,7 +238,7 @@ Run the full 5-workload benchmark suite (`odin run benchmarks/actor_benchmark.od
 * **Workload 4 (1,024-Actor Work-Stealing Swarm, 2,000,000 Messages):** `package actor` M:N Swarm processes 2M messages across 1,024 actors in **45.80 ms (43.66 M/s, 22.9 ns/msg)**.
 * **Workload 5 (Autonomous 1,024-Actor Graph + 64 Rounds of SplitMix64 CPU Work/Hop, 500,000 Hops):** Scales linearly from **163.10 ms (3.07 M hops/s)** on 1 worker to **29.25 ms (17.09 M hops/s)** on 8 workers using `actor.forward`.
 
-For a detailed write-up of the seven key architectural lessons learned while building this suite, see [`benchmarks/benchmark_results_and_findings.md`](benchmarks/benchmark_results_and_findings.md).
+For the full system configuration, C11 `pthreads` parity comparison, and a deep-dive microarchitectural write-up of the engineering lessons learned, see [`benchmarks/README.md`](benchmarks/README.md).
 
 ---
 
