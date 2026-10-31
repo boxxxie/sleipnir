@@ -1,24 +1,8 @@
-package actor_codegen
+package sleipnir_tests
 
-import "core:mem"
 import "core:strings"
 import "core:testing"
-
-@(private = "file")
-with_leak_check :: proc(t: ^testing.T, body: proc(t: ^testing.T)) {
-	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	defer free_all(context.temp_allocator)
-
-	saved_allocator := context.allocator
-	context.allocator = mem.tracking_allocator(&track)
-	body(t)
-	context.allocator = saved_allocator
-
-	testing.expect_value(t, len(track.allocation_map), 0)
-	testing.expect_value(t, len(track.bad_free_array), 0)
-}
+import "../actor/codegen"
 
 @(test)
 test_01_ast_codegen_parses_actor_and_behaviors :: proc(t: ^testing.T) {
@@ -48,7 +32,7 @@ get_balance :: proc(self: ^Bank_Account) -> i64 {
 }
 `
 
-		generated, ok := generate_from_source(sample_src, "bank.odin")
+		generated, ok := codegen.generate_from_source(sample_src, "bank.odin")
 		defer delete(generated)
 
 		testing.expect(t, ok)
@@ -121,7 +105,7 @@ timer_reset :: proc(self: ^Audit_Timer) {
 }
 `
 
-		generated, ok := generate_from_sources({file_1, file_2}, {"account.odin", "timer.odin"})
+		generated, ok := codegen.generate_from_sources({file_1, file_2}, {"account.odin", "timer.odin"})
 		defer delete(generated)
 
 		testing.expect(t, ok)
@@ -173,7 +157,7 @@ Other_Struct :: struct { a: int }
 unrelated_proc :: proc(self: ^Other_Struct, v: int) {}
 `
 
-		generated, ok := generate_from_source(sample_src, "worker.odin")
+		generated, ok := codegen.generate_from_source(sample_src, "worker.odin")
 		defer delete(generated)
 
 		testing.expect(t, ok)

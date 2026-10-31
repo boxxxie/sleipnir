@@ -8,7 +8,7 @@ High-throughput, zero-GC, Pony-style actor runtime for [Odin](https://odin-lang.
 Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N` thread scheduler, lock-free `Envelope_Pool` slab recycling, and a wait-free `Sharded_SPSC_Mailbox`—all integrated with Odin's `context.allocator` and ergonomic compile-time polymorphism.
 
 - **Zero Garbage Collector:** Deterministic memory management via automatic per-message `Envelope_Pool(Msg)` slabs or custom `mem.Allocator`.
-- **Zero-Ceremony Ergonomics:** Single-line RAII `actor.scoped_scheduler` (`@(deferred_out)`), ambient thread-local context, envelope-header `actor.call` / `actor.reply`, and optional `@(actor)` AST metaprogramming (`account->deposit(250)`, `account->get_balance()`). See the [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md) and [**Testing & 4-Layer ATDD Architecture Guide (`docs/TESTING.md`)**](docs/TESTING.md).
+- **Zero-Ceremony Ergonomics:** Single-line RAII `actor.scoped_scheduler` (`@(deferred_out)`), ambient thread-local context, envelope-header `actor.call` / `actor.reply`, and optional `@(actor)` AST metaprogramming (`account->deposit(250)`, `account->get_balance()`). See the [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md) and [**Testing & 4-Layer ATDD Architecture Guide (`tests/README.md`)**](tests/README.md).
 - **Performance:** **31–44M msgs/sec** on single-message 4-producer MPSC fan-in (**64–78M msgs/sec** with `Chain=32` batching), **827M–1.06B msgs/sec** (`0.9–1.2 ns/msg`) on wait-free sharded SPSC, **48–62M msgs/sec** across a 1,024-actor `M:N` swarm, and **16.65–17.85M hops/sec** across 1,024 autonomous actors on 8 cores—matching or outperforming the official Pony C runtime (`libponyrt` 0.77.2) and raw C11 (`stdatomic.h`). See the full [**Benchmark Report & Cross-Runtime Comparison (`benchmarks/README.md`)**](benchmarks/README.md).
 
 ---
@@ -18,8 +18,7 @@ Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N`
 Import `./actor` into your Odin project and run tests or examples:
 
 ```bash
-odin test ./actor
-odin test ./actor/codegen
+odin test ./tests
 odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior
 odin run examples/01_ping_pong.odin -file -o:speed
 odin run examples/02_heterogeneous_pipeline.odin -file -o:speed

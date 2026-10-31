@@ -1,21 +1,23 @@
-# Sleipnir Testing & 4-Layer ATDD Architecture Guide
+# Sleipnir Testing & 4-Layer ATDD Architecture Guide (`tests/`)
 
-Sleipnir uses **Acceptance Test-Driven Development (ATDD)** and **Dave Farley's 4-Layer Executable Specification Architecture** (popularized during the development of the LMAX Disruptor) across both its low-level lock-free concurrency tests ([`actor/actor_test.odin`](../actor/actor_test.odin)), AST metaprogramming generator tests ([`actor/codegen/codegen_test.odin`](../actor/codegen/codegen_test.odin)), and end-to-end DSL specifications ([`examples/05_ast_metaprogramming/dsl_test.odin`](../examples/05_ast_metaprogramming/dsl_test.odin)).
+Sleipnir separates its test suite into this dedicated `tests/` directory (`package sleipnir_tests`), keeping `actor/` and `actor/codegen/` 100% pure library code while enforcing black-box public API boundaries at compile time.
+
+Tests are structured using **Acceptance Test-Driven Development (ATDD)** and **Dave Farley's 4-Layer Executable Specification Architecture** (popularized during the development of the LMAX Disruptor) across:
+- [`tests/actor_test.odin`](actor_test.odin) — Lock-free MPSC/SPSC mailboxes, `Envelope_Pool` / `Watermark_Slab`, and `M:N` work-stealing `Scheduler` & `Actor` concurrency specifications.
+- [`tests/codegen_test.odin`](codegen_test.odin) — AST metaprogramming parser and code generator specifications (`actor/codegen`).
+- [`examples/05_ast_metaprogramming/dsl_test.odin`](../examples/05_ast_metaprogramming/dsl_test.odin) — End-to-end runtime verification of generated `@(actor)` bindings.
 
 ---
 
 ## Running the Test Suites
 
-Every test in Sleipnir runs inside a `with_leak_check` harness backed by `core:mem.Tracking_Allocator`, verifying **zero leaked bytes** and **zero invalid frees** after every test case:
+Every test in Sleipnir runs inside a `with_leak_check` harness backed by `core:mem.Tracking_Allocator` and `free_all(context.temp_allocator)`, verifying **zero leaked bytes** and **zero invalid frees** after every test case:
 
 ```bash
-# 1. Core runtime, MPSC/SPSC mailboxes, pools, & M:N scheduler (19 tests):
-odin test ./actor
+# 1. Core runtime, MPSC/SPSC mailboxes, pools, scheduler, & AST codegen (22 tests):
+odin test ./tests
 
-# 2. AST metaprogramming parser & code generator (3 tests):
-odin test ./actor/codegen
-
-# 3. End-to-end generated `@(actor)` DSL runtime specification:
+# 2. End-to-end generated `@(actor)` DSL runtime specification:
 odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior
 ```
 
@@ -56,34 +58,34 @@ Sleipnir separates tests into four distinct layers:
 All concrete test inputs (`9`, `10`, `7`, `11`, `{100, 200}`, `balance = 500`) and expected outputs (`91`, `49`, `121`, `675`, `750`) live **explicitly in Layer 1**. Layer 2 and Layer 3 helpers parameterize inputs rather than hardcoding magic numbers inside fixtures.
 
 ### 2. Per-Step Message Deltas Instead of Fragile Cumulative Counts
-In low-level runtime tests ([`actor/actor_test.odin`](../actor/actor_test.odin)), `wait_messages(n)` waits until the scheduler's lifetime message counter reaches `n`. Rather than forcing Layer 1 tests to manually track cumulative totals (`after_messages = 3`, `5`, `7`), Layer 3's `Runtime_Spec` accumulates `total_msgs` internally so Layer 1 only states the **delta for that specific step**:
+In low-level runtime tests ([`tests/actor_test.odin`](actor_test.odin)), `actor.wait_messages(n)` waits until the scheduler's lifetime message counter reaches `n`. Rather than forcing Layer 1 tests to manually track cumulative totals (`after_messages = 3`, `5`, `7`), Layer 3's `Runtime_Spec` accumulates `total_msgs` internally so Layer 1 only states the **delta for that specific step**:
 
 ```odin
 @(private = "file")
 Runtime_Spec :: struct {
 	t:          ^testing.T,
-	sched:      ^Scheduler,
+	sched:      ^actor.Scheduler,
 	total_msgs: i64,
 }
 
 @(private = "file")
 then_actor_state_is :: proc(
 	rt:       ^Runtime_Spec,
-	target:   ^Actor($S, $M),
+	target:   ^actor.Actor($S, $M),
 	expected: S,
 	messages: i64 = 0, // Per-step delta, not cumulative lifetime total!
 ) {
 	if messages > 0 {
 		rt.total_msgs += messages
-		wait_messages(rt.total_msgs)
+		actor.wait_messages(rt.total_msgs)
 	}
-	wait_idle()
+	actor.wait_idle()
 	testing.expect_value(rt.t, target.state, expected)
 }
 ```
 
 ### 3. Reusable Test Probes (`given_probe`) Instead of Ad-Hoc Sink Actors
-When testing asynchronous reply forwarding (`send(target, msg, reply_to)`), Layer 1 does not manually spawn throwaway `sink1`, `sink2`, `sink3` actors. Instead, Layer 3 provides `given_probe(&rt, $T)` and `then_async_reply_resolves`:
+When testing asynchronous reply forwarding (`actor.send(target, msg, reply_to)`), Layer 1 does not manually spawn throwaway `sink1`, `sink2`, `sink3` actors. Instead, Layer 3 provides `given_probe(&rt, $T)` and `then_async_reply_resolves`:
 
 ```odin
 then_async_reply_resolves(&rt, math_worker,
@@ -107,11 +109,11 @@ In [`examples/05_ast_metaprogramming/dsl_test.odin`](../examples/05_ast_metaprog
 5. Asynchronous `send_<behavior>` reply forwarding via `_reply_pid` (`send_get_balance(actor.pid(s.account.raw), actor.pid(reply_pid_sink))`)
 
 ### 5. Explicit vs. Ambient Scheduler Coverage in Helper Signatures
-Because Sleipnir provides both explicit-scheduler overloads (`spawn(sched, ...)`) and ambient thread-local overloads (`spawn(...)`, `send(...)`), Layer 2/3 helper signatures intentionally reflect which API surface they exercise:
+Because Sleipnir provides both explicit-scheduler overloads (`actor.spawn(sched, ...)`) and ambient thread-local overloads (`actor.spawn(...)`, `actor.send(...)`), Layer 2/3 helper signatures intentionally reflect which API surface they exercise:
 - Helpers testing explicit scheduler passing accept `rt: ^Runtime_Spec` and pass `rt.sched`.
-- Helpers testing ambient thread-local lookup omit `rt: ^Runtime_Spec` and call `spawn(...)` / `send(...)` directly.
+- Helpers testing ambient thread-local lookup omit `rt: ^Runtime_Spec` and call `actor.spawn(...)` / `actor.send(...)` directly.
 
 ### 6. Separating Scenario-Specific Fixtures (Layer 2) from Suite-Wide Drivers (Layer 3)
-In [`actor/actor_test.odin`](../actor/actor_test.odin):
+In [`tests/actor_test.odin`](actor_test.odin):
 - **Layer 2 (Scenario-Specific Fixtures):** One-off actor behaviors and message types tailored to a specific concurrency edge case (such as `Compute_Square`, `Orchestrator_Run`, and `given_square_orchestrator` for single-worker cooperative `call` stepping in `test_18`) live immediately below their tests.
 - **Layer 3 (Suite-Wide Protocol Driver):** Generic concurrency primitives (`Runtime_Spec`, `Addressing_Mode`, `given_probe`, `given_accumulator`, `upon_sending`, `upon_sending_batch_to_pid`, `upon_destroying_early`, `then_async_reply_resolves`, `then_actor_state_is`) live in the shared driver section for reuse across the entire test suite.

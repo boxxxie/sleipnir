@@ -1,8 +1,9 @@
-package actor
+package sleipnir_tests
 
 import "base:intrinsics"
 import "core:mem"
 import "core:testing"
+import "../actor"
 
 // =============================================================================
 // Test Utilities
@@ -10,11 +11,11 @@ import "core:testing"
 
 // Runs a test procedure inside a `mem.Tracking_Allocator` and asserts that
 // zero bytes were leaked and zero invalid frees occurred.
-@(private = "file")
 with_leak_check :: proc(t: ^testing.T, body: proc(t: ^testing.T)) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
+	defer free_all(context.temp_allocator)
 
 	saved_allocator := context.allocator
 	context.allocator = mem.tracking_allocator(&track)
@@ -38,33 +39,33 @@ Test_Node :: struct {
 @(test)
 test_01_mpsc_single_push_and_detached_pop :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		q: MPSC_Queue(Test_Node)
-		init(&q)
-		testing.expect(t, mpsc_is_empty(&q))
+		q: actor.MPSC_Queue(Test_Node)
+		actor.init(&q)
+		testing.expect(t, actor.mpsc_is_empty(&q))
 
 		n1 := Test_Node{val = 10}
 		n2 := Test_Node{val = 20}
 		n3 := Test_Node{val = 30}
 
-		push(&q, &n1)
-		push(&q, &n2)
-		push(&q, &n3)
-		testing.expect(t, !mpsc_is_empty(&q))
+		actor.push(&q, &n1)
+		actor.push(&q, &n2)
+		actor.push(&q, &n3)
+		testing.expect(t, !actor.mpsc_is_empty(&q))
 
-		testing.expect_value(t, mpsc_pop_detached(&q).val, 10)
-		testing.expect_value(t, mpsc_pop_detached(&q).val, 20)
-		testing.expect_value(t, mpsc_pop_detached(&q).val, 30)
+		testing.expect_value(t, actor.mpsc_pop_detached(&q).val, 10)
+		testing.expect_value(t, actor.mpsc_pop_detached(&q).val, 20)
+		testing.expect_value(t, actor.mpsc_pop_detached(&q).val, 30)
 
-		testing.expect(t, mpsc_is_empty(&q))
-		testing.expect(t, mpsc_pop_detached(&q) == nil)
+		testing.expect(t, actor.mpsc_is_empty(&q))
+		testing.expect(t, actor.mpsc_pop_detached(&q) == nil)
 	})
 }
 
 @(test)
 test_02_mpsc_batch_chain_splice :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		q: MPSC_Queue(Test_Node)
-		init(&q)
+		q: actor.MPSC_Queue(Test_Node)
+		actor.init(&q)
 
 		// Pre-link a chain of 4 nodes: 1 -> 2 -> 3 -> 4
 		chain := [4]Test_Node{
@@ -78,43 +79,43 @@ test_02_mpsc_batch_chain_splice :: proc(t: ^testing.T) {
 		}
 
 		// Splice all 4 nodes onto the queue in a single atomic XCHG
-		mpsc_push_chain(&q, &chain[0], &chain[3])
+		actor.mpsc_push_chain(&q, &chain[0], &chain[3])
 
 		for expected := 1; expected <= 4; expected += 1 {
-			popped := mpsc_pop_detached(&q)
+			popped := actor.mpsc_pop_detached(&q)
 			testing.expect(t, popped != nil)
 			testing.expect_value(t, popped.val, expected)
 		}
-		testing.expect(t, mpsc_is_empty(&q))
+		testing.expect(t, actor.mpsc_is_empty(&q))
 	})
 }
 
 @(test)
 test_03_mpsc_dummy_tail_pop :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		q: MPSC_Queue(Test_Node)
-		init(&q)
+		q: actor.MPSC_Queue(Test_Node)
+		actor.init(&q)
 		q.stub.val = -1
 
 		n1 := Test_Node{val = 100}
 		n2 := Test_Node{val = 200}
-		push(&q, &n1)
-		push(&q, &n2)
+		actor.push(&q, &n1)
+		actor.push(&q, &n2)
 
 		// Pop 1: returns `n1` as the message and retires the initial `stub` (-1)
-		msg1, retired1, ok1 := mpsc_pop_dummy(&q)
+		msg1, retired1, ok1 := actor.mpsc_pop_dummy(&q)
 		testing.expect(t, ok1)
 		testing.expect_value(t, msg1.val, 100)
 		testing.expect_value(t, retired1.val, -1)
 
 		// Pop 2: returns `n2` as the message and retires `n1` (100)
-		msg2, retired2, ok2 := mpsc_pop_dummy(&q)
+		msg2, retired2, ok2 := actor.mpsc_pop_dummy(&q)
 		testing.expect(t, ok2)
 		testing.expect_value(t, msg2.val, 200)
 		testing.expect_value(t, retired2.val, 100)
 
 		// Queue is now empty (`n2` remains as the new dummy tail sentinel)
-		_, _, ok3 := mpsc_pop_dummy(&q)
+		_, _, ok3 := actor.mpsc_pop_dummy(&q)
 		testing.expect(t, !ok3)
 	})
 }
@@ -122,20 +123,20 @@ test_03_mpsc_dummy_tail_pop :: proc(t: ^testing.T) {
 @(test)
 test_04_runq_shard_stealing :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		shard: RunQ_Shard(Test_Node)
-		init(&shard)
+		shard: actor.RunQ_Shard(Test_Node)
+		actor.init(&shard)
 
 		// Empty shard returns nil on fast lock-free path
-		testing.expect(t, shard_pop_or_steal(&shard) == nil)
+		testing.expect(t, actor.shard_pop_or_steal(&shard) == nil)
 
 		n1 := Test_Node{val = 7}
 		n2 := Test_Node{val = 8}
-		push(&shard, &n1)
-		push(&shard, &n2)
+		actor.push(&shard, &n1)
+		actor.push(&shard, &n2)
 
-		testing.expect_value(t, shard_pop_or_steal(&shard).val, 7)
-		testing.expect_value(t, shard_pop_or_steal(&shard).val, 8)
-		testing.expect(t, shard_pop_or_steal(&shard) == nil)
+		testing.expect_value(t, actor.shard_pop_or_steal(&shard).val, 7)
+		testing.expect_value(t, actor.shard_pop_or_steal(&shard).val, 8)
+		testing.expect(t, actor.shard_pop_or_steal(&shard) == nil)
 	})
 }
 
@@ -146,57 +147,57 @@ test_04_runq_shard_stealing :: proc(t: ^testing.T) {
 @(test)
 test_05_spsc_lane_ring_wraparound :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		lane := new(SPSC_Lane(int, 4))
+		lane := new(actor.SPSC_Lane(int, 4))
 		defer free(lane)
 
 		// 1. Fill the 4-slot ring buffer to capacity
-		testing.expect(t, spsc_try_push(lane, 10))
-		testing.expect(t, spsc_try_push(lane, 20))
-		testing.expect(t, spsc_try_push(lane, 30))
-		testing.expect(t, spsc_try_push(lane, 40))
-		testing.expect(t, !spsc_try_push(lane, 999)) // Full!
+		testing.expect(t, actor.spsc_try_push(lane, 10))
+		testing.expect(t, actor.spsc_try_push(lane, 20))
+		testing.expect(t, actor.spsc_try_push(lane, 30))
+		testing.expect(t, actor.spsc_try_push(lane, 40))
+		testing.expect(t, !actor.spsc_try_push(lane, 999)) // Full!
 
 		// 2. Pop 2 items (`10` and `20`) to free 2 slots
-		v1, ok1 := spsc_try_pop(lane)
-		v2, ok2 := spsc_try_pop(lane)
+		v1, ok1 := actor.spsc_try_pop(lane)
+		v2, ok2 := actor.spsc_try_pop(lane)
 		testing.expect(t, ok1 && ok2)
 		testing.expect_value(t, v1, 10)
 		testing.expect_value(t, v2, 20)
 
 		// 3. Push 2 more items (`50` and `60`) across the ring wrap-around boundary
-		spsc_push_spin(lane, 50)
-		spsc_push_spin(lane, 60)
+		actor.spsc_push_spin(lane, 50)
+		actor.spsc_push_spin(lane, 60)
 
 		// 4. Consume the remaining 4 items (`30, 40, 50, 60`) in a single batch
 		sum := 0
-		count := spsc_consume_batch(lane, 10, &sum, proc(total: ^int, item: ^int) {
+		count := actor.spsc_consume_batch(lane, 10, &sum, proc(total: ^int, item: ^int) {
 			total^ += item^
 		})
 		testing.expect_value(t, count, 4)
 		testing.expect_value(t, sum, 30 + 40 + 50 + 60)
 
 		// 5. Lane is now empty
-		_, ok_empty := spsc_try_pop(lane)
+		_, ok_empty := actor.spsc_try_pop(lane)
 		testing.expect(t, !ok_empty)
-		testing.expect_value(t, spsc_consume_batch(lane, 10, &sum, proc(total: ^int, item: ^int) {}), 0)
+		testing.expect_value(t, actor.spsc_consume_batch(lane, 10, &sum, proc(total: ^int, item: ^int) {}), 0)
 	})
 }
 
 @(test)
 test_06_sharded_spsc_mailbox :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		mbox: Sharded_SPSC_Mailbox(int, 16)
-		init(&mbox, num_producers = 3)
-		defer destroy(&mbox)
+		mbox: actor.Sharded_SPSC_Mailbox(int, 16)
+		actor.init(&mbox, num_producers = 3)
+		defer actor.destroy(&mbox)
 
 		// Producer 0 pushes 1, Producer 1 pushes 10, Producer 2 pushes 100
-		push(&mbox, 0, 1)
-		push(&mbox, 0, 1)
-		push(&mbox, 1, 10)
-		push(&mbox, 2, 100)
+		actor.push(&mbox, 0, 1)
+		actor.push(&mbox, 0, 1)
+		actor.push(&mbox, 1, 10)
+		actor.push(&mbox, 2, 100)
 
 		total := 0
-		consumed := sharded_spsc_consume(&mbox, 8, &total, proc(acc: ^int, msg: ^int) {
+		consumed := actor.sharded_spsc_consume(&mbox, 8, &total, proc(acc: ^int, msg: ^int) {
 			acc^ += msg^
 		})
 		testing.expect_value(t, consumed, 4)
@@ -211,37 +212,37 @@ test_06_sharded_spsc_mailbox :: proc(t: ^testing.T) {
 @(test)
 test_07_envelope_pool_and_batch_collector :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		pools := make([]Envelope_Pool(int), 2)
-		init(&pools[0], pool_id = 0, slab_capacity = 4)
-		init(&pools[1], pool_id = 1, slab_capacity = 4)
+		pools := make([]actor.Envelope_Pool(int), 2)
+		actor.init(&pools[0], pool_id = 0, slab_capacity = 4)
+		actor.init(&pools[1], pool_id = 1, slab_capacity = 4)
 		defer {
-			destroy(&pools[0])
-			destroy(&pools[1])
+			actor.destroy(&pools[0])
+			actor.destroy(&pools[1])
 			delete(pools)
 		}
 
 		// 1. Exhaust all 4 slab slots in Pool 0 & Pool 1 and collect them
-		collector: Batch_Return_Collector(int)
+		collector: actor.Batch_Return_Collector(int)
 		for i := 0; i < 4; i += 1 {
-			e0 := pool_acquire(&pools[0])
-			e1 := pool_acquire(&pools[1])
-			collector_add(&collector, e0)
-			collector_add(&collector, e1)
+			e0 := actor.pool_acquire(&pools[0])
+			e1 := actor.pool_acquire(&pools[1])
+			actor.collector_add(&collector, e0)
+			actor.collector_add(&collector, e1)
 		}
 
 		// 2. Test heap fallback when `spin_if_exhausted = false` and slab is empty
-		heap_env := pool_acquire(&pools[0], spin_if_exhausted = false)
-		testing.expect(t, (heap_env.flags & ENVELOPE_FLAG_HEAP) != 0)
+		heap_env := actor.pool_acquire(&pools[0], spin_if_exhausted = false)
+		testing.expect(t, (heap_env.flags & actor.ENVELOPE_FLAG_HEAP) != 0)
 		free(heap_env, pools[0].allocator)
 
 		// 3. Flush Pool 0 as local (`current_wid = 0`) and Pool 1 as remote (`remote_returns`)
-		collector_flush(&collector, pools, current_wid = 0)
+		actor.collector_flush(&collector, pools, current_wid = 0)
 		testing.expect(t, pools[0].local_free != nil)
 
 		// 4. Re-acquire 4 envelopes from Pool 0 (from `local_free`) and Pool 1 (from `remote_returns`)
 		batch_vals := [4]int{10, 20, 30, 40}
-		first0, last0 := pool_acquire_chain(&pools[0], batch_vals[:])
-		first1, last1 := pool_acquire_chain(&pools[1], batch_vals[:])
+		first0, last0 := actor.pool_acquire_chain(&pools[0], batch_vals[:])
+		first1, last1 := actor.pool_acquire_chain(&pools[1], batch_vals[:])
 		testing.expect_value(t, first0.msg, 10)
 		testing.expect_value(t, last0.msg, 40)
 		testing.expect_value(t, first1.msg, 10)
@@ -252,14 +253,14 @@ test_07_envelope_pool_and_batch_collector :: proc(t: ^testing.T) {
 @(test)
 test_08_watermark_slab_fifo_and_chain :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		wm: Producer_Watermark
-		slab: Watermark_Slab(int, 8)
-		init(&slab, prod_id = 0)
-		defer destroy(&slab)
+		wm: actor.Producer_Watermark
+		slab: actor.Watermark_Slab(int, 8)
+		actor.init(&slab, prod_id = 0)
+		defer actor.destroy(&slab)
 
 		// Acquire 6 slots (out of 8) one-by-one
 		for i := 0; i < 6; i += 1 {
-			slot := watermark_slab_acquire(&slab, &wm)
+			slot := actor.watermark_slab_acquire(&slab, &wm)
 			slot.msg = i
 		}
 
@@ -267,7 +268,7 @@ test_08_watermark_slab_fifo_and_chain :: proc(t: ^testing.T) {
 		intrinsics.atomic_add_explicit(&wm.retired_count, 6, .Release)
 
 		// Acquire a pre-linked chain of 4 slots across the wrap-around boundary
-		first, last := watermark_slab_acquire_chain(&slab, &wm, 4, 99)
+		first, last := actor.watermark_slab_acquire_chain(&slab, &wm, 4, 99)
 		testing.expect_value(t, first.msg, 99)
 		testing.expect_value(t, last.msg, 99)
 	})
@@ -284,7 +285,7 @@ Counter_State :: struct {
 }
 
 @(private = "file")
-counter_receive :: proc(ctx: ^Context, self: ^Actor(Counter_State, i64), msg: ^i64) {
+counter_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(Counter_State, i64), msg: ^i64) {
 	self.state.total += msg^
 	self.state.messages += 1
 }
@@ -292,29 +293,29 @@ counter_receive :: proc(ctx: ^Context, self: ^Actor(Counter_State, i64), msg: ^i
 @(test)
 test_09_actor_basic_counter :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		sched: Scheduler
-		init(&sched, Scheduler_Config{num_workers = 2})
-		defer destroy(&sched)
+		sched: actor.Scheduler
+		actor.init(&sched, actor.Scheduler_Config{num_workers = 2})
+		defer actor.destroy(&sched)
 
-		pools := make([]Envelope_Pool(i64), 1)
-		init(&pools[0], 0, 32)
+		pools := make([]actor.Envelope_Pool(i64), 1)
+		actor.init(&pools[0], 0, 32)
 		defer {
-			destroy(&pools[0])
+			actor.destroy(&pools[0])
 			delete(pools)
 		}
 
-		counter := spawn(Counter_State{}, counter_receive, pools)
-		defer destroy(counter)
+		counter := actor.spawn(Counter_State{}, counter_receive, pools)
+		defer actor.destroy(counter)
 
-		scheduler_start(&sched)
+		actor.scheduler_start(&sched)
 
 		// Send numbers 1..10 to `counter`
 		for i: i64 = 1; i <= 10; i += 1 {
-			send(&sched, &pools[0], counter, i)
+			actor.send(&sched, &pools[0], counter, i)
 		}
 
-		scheduler_wait_messages(&sched, 10)
-		scheduler_wait_idle(&sched)
+		actor.scheduler_wait_messages(&sched, 10)
+		actor.scheduler_wait_idle(&sched)
 
 		testing.expect_value(t, counter.state.messages, 10)
 		testing.expect_value(t, counter.state.total, 55)
@@ -324,30 +325,30 @@ test_09_actor_basic_counter :: proc(t: ^testing.T) {
 @(test)
 test_10_actor_batch_chain_send :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		sched: Scheduler
-		init(&sched, Scheduler_Config{num_workers = 1})
-		defer destroy(&sched)
+		sched: actor.Scheduler
+		actor.init(&sched, actor.Scheduler_Config{num_workers = 1})
+		defer actor.destroy(&sched)
 
-		pools := make([]Envelope_Pool(i64), 1)
-		init(&pools[0], 0, 32)
+		pools := make([]actor.Envelope_Pool(i64), 1)
+		actor.init(&pools[0], 0, 32)
 		defer {
-			destroy(&pools[0])
+			actor.destroy(&pools[0])
 			delete(pools)
 		}
 
-		counter := spawn(Counter_State{}, counter_receive, pools)
-		defer destroy(counter)
+		counter := actor.spawn(Counter_State{}, counter_receive, pools)
+		defer actor.destroy(counter)
 
-		scheduler_start(&sched)
+		actor.scheduler_start(&sched)
 
 		// Send 4 batches of 5 messages each (20 messages total) via `send_batch_from_pool`
 		batch := [5]i64{2, 4, 6, 8, 10} // Sum = 30 per batch
 		for b := 0; b < 4; b += 1 {
-			send(&sched, &pools[0], counter, batch[:])
+			actor.send(&sched, &pools[0], counter, batch[:])
 		}
 
-		scheduler_wait_messages(&sched, 20)
-		scheduler_wait_idle(&sched)
+		actor.scheduler_wait_messages(&sched, 20)
+		actor.scheduler_wait_idle(&sched)
 
 		testing.expect_value(t, counter.state.messages, 20)
 		testing.expect_value(t, counter.state.total, 120)
@@ -357,7 +358,7 @@ test_10_actor_batch_chain_send :: proc(t: ^testing.T) {
 @(private = "file")
 Double_Request :: struct {
 	number:   i64,
-	reply_to: ^Actor(Counter_State, i64),
+	reply_to: ^actor.Actor(Counter_State, i64),
 }
 
 @(private = "file")
@@ -368,63 +369,63 @@ Doubler_State :: struct {
 @(test)
 test_11_actor_heterogeneous_pipeline_with_futex_parking :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		sched: Scheduler
-		init(&sched, Scheduler_Config{
+		sched: actor.Scheduler
+		actor.init(&sched, actor.Scheduler_Config{
 			num_workers    = 2,
 			enable_parking = true, // Exercise adaptive 2-phase Futex sleep/wake
 		})
-		defer destroy(&sched)
+		defer actor.destroy(&sched)
 
-		req_pools   := make([]Envelope_Pool(Double_Request), 2)
-		reply_pools := make([]Envelope_Pool(i64), 2)
+		req_pools   := make([]actor.Envelope_Pool(Double_Request), 2)
+		reply_pools := make([]actor.Envelope_Pool(i64), 2)
 		for w := 0; w < 2; w += 1 {
-			init(&req_pools[w], u16(w), 32)
-			init(&reply_pools[w], u16(w), 32)
+			actor.init(&req_pools[w], u16(w), 32)
+			actor.init(&reply_pools[w], u16(w), 32)
 		}
 		defer {
 			for w := 0; w < 2; w += 1 {
-				destroy(&req_pools[w])
-				destroy(&reply_pools[w])
+				actor.destroy(&req_pools[w])
+				actor.destroy(&reply_pools[w])
 			}
 			delete(req_pools)
 			delete(reply_pools)
 		}
 
 		// Actor 1: Doubles incoming numbers and sends the result to `msg.reply_to`
-		doubler := spawn(
+		doubler := actor.spawn(
 			Doubler_State{},
-			proc(ctx: ^Context, self: ^Actor(Doubler_State, Double_Request), msg: ^Double_Request) {
+			proc(ctx: ^actor.Context, self: ^actor.Actor(Doubler_State, Double_Request), msg: ^Double_Request) {
 				self.state.requests_handled += 1
-				send(ctx, msg.reply_to, msg.number * 2)
+				actor.send(ctx, msg.reply_to, msg.number * 2)
 			},
 			req_pools,
 		)
-		defer destroy(doubler)
+		defer actor.destroy(doubler)
 
 		// Actor 2: Sums the doubled replies and decrements `sched.pending_tokens`
-		aggregator := spawn(
+		aggregator := actor.spawn(
 			Counter_State{},
-			proc(ctx: ^Context, self: ^Actor(Counter_State, i64), msg: ^i64) {
+			proc(ctx: ^actor.Context, self: ^actor.Actor(Counter_State, i64), msg: ^i64) {
 				self.state.total += msg^
 				self.state.messages += 1
-				complete_token(ctx, 1)
+				actor.complete_token(ctx, 1)
 			},
 			reply_pools,
 		)
-		defer destroy(aggregator)
+		defer actor.destroy(aggregator)
 
 		sched.pending_tokens = 20
-		scheduler_start(&sched)
+		actor.scheduler_start(&sched)
 
 		for i: i64 = 1; i <= 20; i += 1 {
-			send(&sched, &req_pools[0], doubler, Double_Request{
+			actor.send(&sched, &req_pools[0], doubler, Double_Request{
 				number   = i,
 				reply_to = aggregator,
 			})
 		}
 
-		scheduler_wait_tokens(&sched)
-		scheduler_wait_idle(&sched)
+		actor.scheduler_wait_tokens(&sched)
+		actor.scheduler_wait_idle(&sched)
 
 		testing.expect_value(t, doubler.state.requests_handled, 20)
 		testing.expect_value(t, aggregator.state.messages, 20)
@@ -435,7 +436,7 @@ test_11_actor_heterogeneous_pipeline_with_futex_parking :: proc(t: ^testing.T) {
 
 @(private = "file")
 Stage_State :: struct {
-	next_stage: ^Actor(Stage_State, i64),
+	next_stage: ^actor.Actor(Stage_State, i64),
 	sum:        i64,
 	count:      int,
 }
@@ -443,52 +444,52 @@ Stage_State :: struct {
 @(test)
 test_12_actor_zero_copy_forward_returns_to_pool :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		sched: Scheduler
-		init(&sched, Scheduler_Config{
+		sched: actor.Scheduler
+		actor.init(&sched, actor.Scheduler_Config{
 			num_workers = 2,
 			batch_quota = 4,
 		})
-		defer destroy(&sched)
+		defer actor.destroy(&sched)
 
 		// Allocate a tiny 4-slot pool to prove that envelopes forwarded through
 		// Stage 1 -> Stage 2 -> Sink are properly recycled back to the pool by Sink!
-		pools := make([]Envelope_Pool(i64), 1)
-		init(&pools[0], 0, slab_capacity = 4)
+		pools := make([]actor.Envelope_Pool(i64), 1)
+		actor.init(&pools[0], 0, slab_capacity = 4)
 		defer {
-			destroy(&pools[0])
+			actor.destroy(&pools[0])
 			delete(pools)
 		}
 
-		stage_receive :: proc(ctx: ^Context, self: ^Actor(Stage_State, i64), msg: ^i64) {
+		stage_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(Stage_State, i64), msg: ^i64) {
 			self.state.count += 1
 			if self.state.next_stage != nil {
 				// Forward the exact same Envelope(i64) in-place (`iso`) with +10 added
-				forward(ctx, self.state.next_stage, msg^ + 10)
+				actor.forward(ctx, self.state.next_stage, msg^ + 10)
 			} else {
 				// Final sink stage: does NOT forward, so `step_proc` recycles the envelope!
 				self.state.sum += msg^
-				complete_token(ctx, 1)
+				actor.complete_token(ctx, 1)
 			}
 		}
 
-		sink   := spawn(Stage_State{next_stage = nil},    stage_receive, pools)
-		stage2 := spawn(Stage_State{next_stage = sink},   stage_receive, pools)
-		stage1 := spawn(Stage_State{next_stage = stage2}, stage_receive, pools)
-		defer destroy(sink)
-		defer destroy(stage2)
-		defer destroy(stage1)
+		sink   := actor.spawn(Stage_State{next_stage = nil},    stage_receive, pools)
+		stage2 := actor.spawn(Stage_State{next_stage = sink},   stage_receive, pools)
+		stage1 := actor.spawn(Stage_State{next_stage = stage2}, stage_receive, pools)
+		defer actor.destroy(sink)
+		defer actor.destroy(stage2)
+		defer actor.destroy(stage1)
 
 		// Send 32 messages through a 4-slot pool (requires 8x full pool recycling!)
 		num_msgs :: 32
 		sched.pending_tokens = num_msgs
-		scheduler_start(&sched)
+		actor.scheduler_start(&sched)
 
 		for i := 0; i < num_msgs; i += 1 {
-			send(&sched, &pools[0], stage1, 5)
+			actor.send(&sched, &pools[0], stage1, 5)
 		}
 
-		scheduler_wait_tokens(&sched)
-		scheduler_wait_idle(&sched)
+		actor.scheduler_wait_tokens(&sched)
+		actor.scheduler_wait_idle(&sched)
 
 		// Each message starts at 5, adds +10 at Stage 1, +10 at Stage 2 -> arrives at Sink as 25
 		testing.expect_value(t, stage1.state.count, num_msgs)
@@ -509,25 +510,25 @@ test_13_scoped_scheduler_and_auto_pooled_ambient_api :: proc(t: ^testing.T) {
 		final_msgs:  int = 0
 		{
 			// 1-line RAII scheduler scope (`@(deferred_out = scheduler_scope_end)`)
-			_ = scoped_scheduler(num_workers = 2)
+			_ = actor.scoped_scheduler(num_workers = 2)
 
 			// Spawn actor with 2-arg `(state: ^State, msg: ^Msg)` handler — no manual pool or defer destroy!
-			counter := spawn(Counter_State{}, proc(state: ^Counter_State, msg: ^i64) {
+			counter := actor.spawn(Counter_State{}, proc(state: ^Counter_State, msg: ^i64) {
 				state.total += msg^
 				state.messages += 1
 			})
 
 			// Ambient single-message sends (`actor.send(target, msg)`)
 			for i: i64 = 1; i <= 10; i += 1 {
-				send(counter, i)
+				actor.send(counter, i)
 			}
 
 			// Ambient batch slice splice (`actor.send(target, batch[:])`)
 			batch := [4]i64{10, 20, 30, 40}
-			send(counter, batch[:])
+			actor.send(counter, batch[:])
 
-			wait_messages(14)
-			wait_idle()
+			actor.wait_messages(14)
+			actor.wait_idle()
 
 			final_total = counter.state.total
 			final_msgs  = counter.state.messages
@@ -548,7 +549,7 @@ Calc_Mul :: struct {
 }
 @(private = "file")
 Calc_Report :: struct {
-	reply_to: PID(i64), // Decoupled from the sink actor's private `$State`!
+	reply_to: actor.PID(i64), // Decoupled from the sink actor's private `$State`!
 }
 @(private = "file")
 Calc_Msg :: union {
@@ -562,34 +563,34 @@ test_14_pid_handle_and_tagged_union_value_behaviors :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
 		reported_val: i64 = 0
 		{
-			sched := scoped_scheduler(num_workers = 2)
+			sched := actor.scoped_scheduler(num_workers = 2)
 			sched.pending_tokens = 1
 
 			// Sink actor accepts `i64`
-			sink := spawn(Counter_State{}, proc(state: ^Counter_State, val: i64) {
+			sink := actor.spawn(Counter_State{}, proc(state: ^Counter_State, val: i64) {
 				state.total = val
-				complete_token() // Ambient 0-arg `complete_token()`!
+				actor.complete_token() // Ambient 0-arg `complete_token()`!
 			})
 
 			// Calculator actor with multi-behavior tagged `union` (`Calc_Msg` by value)
-			calc := spawn(Counter_State{}, proc(state: ^Counter_State, msg: Calc_Msg) {
+			calc := actor.spawn(Counter_State{}, proc(state: ^Counter_State, msg: Calc_Msg) {
 				switch m in msg {
 				case Calc_Add:
 					state.total += m.amount
 				case Calc_Mul:
 					state.total *= m.factor
 				case Calc_Report:
-					send(m.reply_to, state.total) // Ambient send to `PID(i64)`!
+					actor.send(m.reply_to, state.total) // Ambient send to `PID(i64)`!
 				}
 			})
 
-			calc_pid := pid(calc)
-			send(calc_pid, Calc_Msg(Calc_Add{amount = 7}))
-			send(calc_pid, Calc_Msg(Calc_Mul{factor = 6}))
-			send(calc_pid, Calc_Msg(Calc_Report{reply_to = pid(sink)}))
+			calc_pid := actor.pid(calc)
+			actor.send(calc_pid, Calc_Msg(Calc_Add{amount = 7}))
+			actor.send(calc_pid, Calc_Msg(Calc_Mul{factor = 6}))
+			actor.send(calc_pid, Calc_Msg(Calc_Report{reply_to = actor.pid(sink)}))
 
-			wait_tokens()
-			wait_idle()
+			actor.wait_tokens()
+			actor.wait_idle()
 			reported_val = sink.state.total
 		}
 		testing.expect_value(t, reported_val, 42)
@@ -598,7 +599,7 @@ test_14_pid_handle_and_tagged_union_value_behaviors :: proc(t: ^testing.T) {
 
 @(private = "file")
 Hop_Stage :: struct {
-	next_pid: PID(i64),
+	next_pid: actor.PID(i64),
 	sum:      i64,
 }
 
@@ -607,30 +608,30 @@ test_15_ambient_zero_copy_forward_and_unchanged_forward :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
 		final_sum: i64 = 0
 		{
-			sched := scoped_scheduler(num_workers = 2)
+			sched := actor.scoped_scheduler(num_workers = 2)
 			sched.pending_tokens = 10
 
 			on_hop :: proc(state: ^Hop_Stage, msg: ^i64) {
 				if state.next_pid.ref != nil {
 					// Mutate `msg^` in place and forward the envelope via 1-arg `forward(next_pid)`
 					msg^ += 5
-					forward(state.next_pid)
+					actor.forward(state.next_pid)
 				} else {
 					state.sum += msg^
-					complete_token()
+					actor.complete_token()
 				}
 			}
 
-			sink   := spawn(Hop_Stage{}, on_hop)
-			stage2 := spawn(Hop_Stage{next_pid = pid(sink)}, on_hop)
-			stage1 := spawn(Hop_Stage{next_pid = pid(stage2)}, on_hop)
+			sink   := actor.spawn(Hop_Stage{}, on_hop)
+			stage2 := actor.spawn(Hop_Stage{next_pid = actor.pid(sink)}, on_hop)
+			stage1 := actor.spawn(Hop_Stage{next_pid = actor.pid(stage2)}, on_hop)
 
 			for i := 0; i < 10; i += 1 {
-				send(stage1, i64(10))
+				actor.send(stage1, i64(10))
 			}
 
-			wait_tokens()
-			wait_idle()
+			actor.wait_tokens()
+			actor.wait_idle()
 			final_sum = sink.state.sum
 		}
 		// 10 messages * (10 + 5 + 5) = 200
@@ -649,21 +650,21 @@ test_16_compile_time_structural_typing_spawn_self :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
 		result: i64 = 0
 		{
-			_ = scoped_scheduler(num_workers = 2)
+			_ = actor.scoped_scheduler(num_workers = 2)
 
 			// Spawn a struct that embeds its own `receive` behavior using `base:intrinsics`!
-			a := spawn_self(Self_Contained_Actor{
+			a := actor.spawn_self(Self_Contained_Actor{
 				accum = 100,
 				receive = proc(self: ^Self_Contained_Actor, msg: i64) {
 					self.accum += msg
 				},
 			})
 
-			send(a, i64(23))
-			send(a, i64(19))
+			actor.send(a, i64(23))
+			actor.send(a, i64(19))
 
-			wait_messages(2)
-			wait_idle()
+			actor.wait_messages(2)
+			actor.wait_idle()
 			result = a.state.accum
 		}
 		testing.expect_value(t, result, 142)
@@ -697,32 +698,32 @@ test_17_actor_call_and_envelope_reply :: proc(t: ^testing.T) {
 		async_total: i64 = 0
 		{
 			// Use a 1-worker scheduler so we also verify cooperative worker-thread stepping!
-			_ = scoped_scheduler(num_workers = 1)
+			_ = actor.scoped_scheduler(num_workers = 1)
 
-			ledger := spawn(Ledger_State{total = 10}, proc(s: ^Ledger_State, m: Ledger_Msg) {
+			ledger := actor.spawn(Ledger_State{total = 10}, proc(s: ^Ledger_State, m: Ledger_Msg) {
 				switch v in m {
 				case Ledger_Add:
 					s.total += v.x
 				case Ledger_Get_Total:
 					// Reply address lives in the Envelope header, NOT inside `Ledger_Get_Total`!
-					reply(s.total)
+					actor.reply(s.total)
 				}
 			})
 
-			send(ledger, Ledger_Msg(Ledger_Add{x = 25}))
-			send(ledger, Ledger_Msg(Ledger_Add{x = 7}))
+			actor.send(ledger, Ledger_Msg(Ledger_Add{x = 25}))
+			actor.send(ledger, Ledger_Msg(Ledger_Add{x = 7}))
 
 			// 1. Synchronous `call` from main thread
-			sync_total = call(ledger, Ledger_Msg(Ledger_Get_Total{}), i64)
+			sync_total = actor.call(ledger, Ledger_Msg(Ledger_Get_Total{}), i64)
 
 			// 2. Asynchronous `send(target, msg, reply_to)` forwarding reply to another actor
-			receiver := spawn(i64(0), proc(state: ^i64, val: i64) {
+			receiver := actor.spawn(i64(0), proc(state: ^i64, val: i64) {
 				state^ = val
 			})
-			send(ledger, Ledger_Msg(Ledger_Get_Total{}), pid(receiver))
+			actor.send(ledger, Ledger_Msg(Ledger_Get_Total{}), actor.pid(receiver))
 
-			wait_messages(5)
-			wait_idle()
+			actor.wait_messages(5)
+			actor.wait_idle()
 			async_total = receiver.state
 		}
 
@@ -740,7 +741,7 @@ test_18_actor_to_actor_cooperative_call_and_reply_overloads :: proc(t: ^testing.
 	with_leak_check(t, proc(t: ^testing.T) {
 		// Single worker thread (`num_workers = 1`): nested `call` inside a handler
 		// on Worker 0 must cooperatively step `math_worker` without deadlocking.
-		rt := runtime_scenario(t, scoped_scheduler(num_workers = 1))
+		rt := runtime_scenario(t, actor.scoped_scheduler(num_workers = 1))
 
 		math_worker  := given_square_reply_worker(&rt)
 		orchestrator := given_square_orchestrator(&rt)
@@ -748,7 +749,7 @@ test_18_actor_to_actor_cooperative_call_and_reply_overloads :: proc(t: ^testing.
 
 		// 1. Cooperative actor-to-actor synchronous `call`: (9 * 9) + 10 = 91 (3 messages)
 		upon_orchestrating_square(orchestrator,
-			worker = pid(math_worker),
+			worker = actor.pid(math_worker),
 			sink   = sink,
 			input  = 9,
 			addend = 10,
@@ -775,17 +776,17 @@ test_18_actor_to_actor_cooperative_call_and_reply_overloads :: proc(t: ^testing.
 @(test)
 test_19_batch_send_pid_and_early_actor_destroy :: proc(t: ^testing.T) {
 	with_leak_check(t, proc(t: ^testing.T) {
-		rt := runtime_scenario(t, scoped_scheduler(num_workers = 2))
+		rt := runtime_scenario(t, actor.scoped_scheduler(num_workers = 2))
 
 		acc       := given_accumulator(initial = i64(0))
 		forwarder := given_batch_and_value_forwarder(
-			target     = pid(acc),
+			target     = actor.pid(acc),
 			batch      = {100, 200},
 			multiplier = 10,
 		)
 
 		// 1. Ambient batch send to `PID(i64)` (`send_ambient_batch_pid`): 10 + 20 + 30 = 60 (3 messages)
-		upon_sending_batch_to_pid(pid(acc), 10, 20, 30)
+		upon_sending_batch_to_pid(actor.pid(acc), 10, 20, 30)
 		then_actor_state_is(&rt, acc, 60, messages = 3)
 
 		// 2. Worker-context batch send to `PID(i64)` (`send_ctx_batch_pid`) +
@@ -810,34 +811,34 @@ Compute_Square :: struct {
 
 @(private = "file")
 Orchestrator_Run :: struct {
-	worker_pid: PID(Compute_Square),
-	sink_actor: ^Actor(i64, i64),
+	worker_pid: actor.PID(Compute_Square),
+	sink_actor: ^actor.Actor(i64, i64),
 	input:      i64,
 	addend:     i64,
 }
 
 @(private = "file")
 Forwarder_State :: struct {
-	target_pid: PID(i64),
+	target_pid: actor.PID(i64),
 	batch:      [2]i64,
 	multiplier: i64,
 }
 
 // Exercises 3-arg `(ctx: ^Context, state: ^State, msg: ^Msg)` overload (`spawn_sched_state_auto`):
 @(private = "file")
-given_square_reply_worker :: proc(rt: ^Runtime_Spec) -> ^Actor(i64, Compute_Square) {
-	return spawn(rt.sched, i64(0), proc(ctx: ^Context, calls: ^i64, req: ^Compute_Square) {
+given_square_reply_worker :: proc(rt: ^Runtime_Spec) -> ^actor.Actor(i64, Compute_Square) {
+	return actor.spawn(rt.sched, i64(0), proc(ctx: ^actor.Context, calls: ^i64, req: ^Compute_Square) {
 		calls^ += 1
-		reply(ctx, req.x * req.x)
+		actor.reply(ctx, req.x * req.x)
 	})
 }
 
 @(private = "file")
-given_square_orchestrator :: proc(rt: ^Runtime_Spec) -> ^Actor(i64, Orchestrator_Run) {
-	return spawn(rt.sched, i64(0), proc(state: ^i64, cmd: Orchestrator_Run) {
-		sq := call(cmd.worker_pid, Compute_Square{x = cmd.input}, i64)
+given_square_orchestrator :: proc(rt: ^Runtime_Spec) -> ^actor.Actor(i64, Orchestrator_Run) {
+	return actor.spawn(rt.sched, i64(0), proc(state: ^i64, cmd: Orchestrator_Run) {
+		sq := actor.call(cmd.worker_pid, Compute_Square{x = cmd.input}, i64)
 		state^ = sq + cmd.addend
-		send(cmd.sink_actor, state^)
+		actor.send(cmd.sink_actor, state^)
 	})
 }
 
@@ -845,31 +846,31 @@ given_square_orchestrator :: proc(rt: ^Runtime_Spec) -> ^Actor(i64, Orchestrator
 // exercises the exact same `i64 -> PID(i64)` envelope forwarding path:
 @(private = "file")
 given_batch_and_value_forwarder :: proc(
-	target:     PID(i64),
+	target:     actor.PID(i64),
 	batch:      [2]i64,
 	multiplier: i64,
-) -> ^Actor(Forwarder_State, i64) {
+) -> ^actor.Actor(Forwarder_State, i64) {
 	init_state := Forwarder_State{
 		target_pid = target,
 		batch      = batch,
 		multiplier = multiplier,
 	}
-	return spawn(init_state, proc(s: ^Forwarder_State, x: ^i64) {
+	return actor.spawn(init_state, proc(s: ^Forwarder_State, x: ^i64) {
 		b := s.batch
-		send(s.target_pid, b[:])
-		forward(s.target_pid, x^ * s.multiplier)
+		actor.send(s.target_pid, b[:])
+		actor.forward(s.target_pid, x^ * s.multiplier)
 	})
 }
 
 @(private = "file")
 upon_orchestrating_square :: proc(
-	orchestrator: ^Actor(i64, Orchestrator_Run),
-	worker:       PID(Compute_Square),
-	sink:         ^Actor(i64, i64),
+	orchestrator: ^actor.Actor(i64, Orchestrator_Run),
+	worker:       actor.PID(Compute_Square),
+	sink:         ^actor.Actor(i64, i64),
 	input:        i64,
 	addend:       i64,
 ) {
-	send(orchestrator, Orchestrator_Run{
+	actor.send(orchestrator, Orchestrator_Run{
 		worker_pid = worker,
 		sink_actor = sink,
 		input      = input,
@@ -890,50 +891,50 @@ Addressing_Mode :: enum {
 @(private = "file")
 Runtime_Spec :: struct {
 	t:          ^testing.T,
-	sched:      ^Scheduler,
+	sched:      ^actor.Scheduler,
 	total_msgs: i64,
 }
 
 @(private = "file")
-runtime_scenario :: proc(t: ^testing.T, sched: ^Scheduler) -> Runtime_Spec {
+runtime_scenario :: proc(t: ^testing.T, sched: ^actor.Scheduler) -> Runtime_Spec {
 	return Runtime_Spec{t = t, sched = sched}
 }
 
 // Reusable test probe actor that records the latest message of type `T`:
 @(private = "file")
-given_probe :: proc(rt: ^Runtime_Spec, $T: typeid) -> ^Actor(T, T) {
-	return spawn(rt.sched, T{}, proc(state: ^T, val: T) {
+given_probe :: proc(rt: ^Runtime_Spec, $T: typeid) -> ^actor.Actor(T, T) {
+	return actor.spawn(rt.sched, T{}, proc(state: ^T, val: T) {
 		state^ = val
 	})
 }
 
 // Exercises ambient scheduler `spawn(initial_state, handler)` overload:
 @(private = "file")
-given_accumulator :: proc(initial: $T) -> ^Actor(T, T) {
-	return spawn(initial, proc(total: ^T, x: T) {
+given_accumulator :: proc(initial: $T) -> ^actor.Actor(T, T) {
+	return actor.spawn(initial, proc(total: ^T, x: T) {
 		total^ += x
 	})
 }
 
 @(private = "file")
-upon_sending_batch_to_pid :: proc(target_pid: PID($T), items: ..T) {
-	send(target_pid, items)
+upon_sending_batch_to_pid :: proc(target_pid: actor.PID($T), items: ..T) {
+	actor.send(target_pid, items)
 }
 
 @(private = "file")
-upon_sending :: proc(target: ^Actor($S, $M), msg: M) {
-	send(target, msg)
+upon_sending :: proc(target: ^actor.Actor($S, $M), msg: M) {
+	actor.send(target, msg)
 }
 
 @(private = "file")
-upon_destroying_early :: proc(target: ^Actor($S, $M)) {
-	destroy(target)
+upon_destroying_early :: proc(target: ^actor.Actor($S, $M)) {
+	actor.destroy(target)
 }
 
 @(private = "file")
 then_async_reply_resolves :: proc(
 	rt:       ^Runtime_Spec,
-	worker:   ^Actor($S, $Req),
+	worker:   ^actor.Actor($S, $Req),
 	req:      Req,
 	expected: $Resp,
 	via:      Addressing_Mode,
@@ -942,9 +943,9 @@ then_async_reply_resolves :: proc(
 	probe := given_probe(rt, Resp)
 	switch via {
 	case .Actor_Handle:
-		send(worker, req, probe)
+		actor.send(worker, req, probe)
 	case .PID:
-		send(pid(worker), req, probe)
+		actor.send(actor.pid(worker), req, probe)
 	}
 	then_actor_state_is(rt, probe, expected, messages = messages)
 }
@@ -952,14 +953,14 @@ then_async_reply_resolves :: proc(
 @(private = "file")
 then_actor_state_is :: proc(
 	rt:       ^Runtime_Spec,
-	target:   ^Actor($S, $M),
+	target:   ^actor.Actor($S, $M),
 	expected: S,
 	messages: i64 = 0,
 ) {
 	if messages > 0 {
 		rt.total_msgs += messages
-		wait_messages(rt.total_msgs)
+		actor.wait_messages(rt.total_msgs)
 	}
-	wait_idle()
+	actor.wait_idle()
 	testing.expect_value(rt.t, target.state, expected)
 }
