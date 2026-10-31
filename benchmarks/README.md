@@ -59,26 +59,26 @@ Four concurrent producer threads each emit `500,000` messages (`2,000,000` total
 
 | ID | Architecture / Implementation | Language / Runtime | Wall Time | Throughput | Latency / Msg | Speedup vs Odin `chan` |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: |
-| **`3e`** | **Wait-Free Sharded SPSC (`Sharded_SPSC_Mailbox`)** | **Odin (`package actor`)** | **`2.42 ms`** | **`827.45 M/s`** | **`1.2 ns`** | **`624.8x`** |
+| **`3e`** | **Wait-Free Sharded SPSC (`Sharded_SPSC_Mailbox`)** | **Odin (`package actor`)** | **`1.89 – 2.42 ms`** | **`827.45 – 1,058.33 M/s`** | **`0.9 – 1.2 ns`** | **`624.8x – 799.5x`** |
 | **`2a`** | **Single-Thread DOD Batch Array (`16B` struct)** | **C11 (`gcc -O3`)** | **`2.29 ms`** | **`872.21 M/s`** | **`1.1 ns`** | **`658.7x`** |
 | **`3e`** | **Wait-Free Sharded SPSC (4 Ring Lanes)** | **C11 (`stdatomic.h`)** | **`3.56 ms`** | **`561.76 M/s`** | **`1.8 ns`** | **`424.2x`** |
-| **`2a`** | **Single-Thread DOD Batch Array (`16B` struct)** | **Odin (`-o:speed`)** | **`5.16 ms`** | **`387.54 M/s`** | **`2.6 ns`** | **`292.6x`** |
-| **`3d`** | **Raw Pony MPSC (`Chain=32` Batch + 8K Watermark Slab)** | **Odin (Raw Specialized)** | **`6.37 ms`** | **`313.83 M/s`** | **`3.2 ns`** | **`237.0x`** |
+| **`2a`** | **Single-Thread DOD Batch Array (`16B` struct)** | **Odin (`-o:speed`)** | **`3.96 – 5.16 ms`** | **`387.54 – 505.16 M/s`** | **`2.0 – 2.6 ns`** | **`292.6x – 381.6x`** |
+| **`3d`** | **Raw Pony MPSC (`Chain=32` Batch + 8K Watermark Slab)** | **Odin (Raw Specialized)** | **`4.13 – 6.37 ms`** | **`313.83 – 483.72 M/s`** | **`2.1 – 3.2 ns`** | **`237.0x – 365.4x`** |
 | **`3d`** | **Raw Pony MPSC (`Chain=32` Batch + 8K Watermark Slab)** | **C11 (`stdatomic.h`)** | **`6.50 ms`** | **`307.53 M/s`** | **`3.3 ns`** | **`232.2x`** |
+| **`2b`** | **Multi-Thread DOD (4 TLS Buffers + Drain)** | **Odin (`core:thread`)** | **`8.97 – 10.12 ms`** | **`197.70 – 222.95 M/s`** | **`4.5 – 5.1 ns`** | **`149.3x – 168.4x`** |
 | **`2b`** | **Multi-Thread DOD (4 TLS Buffers + Drain)** | **C11 (`pthreads`)** | **`10.08 ms`** | **`198.44 M/s`** | **`5.0 ns`** | **`149.8x`** |
-| **`2b`** | **Multi-Thread DOD (4 TLS Buffers + Drain)** | **Odin (`core:thread`)** | **`10.12 ms`** | **`197.70 M/s`** | **`5.1 ns`** | **`149.3x`** |
-| **`5a`** | **Sleipnir `send_batch_from_pool` (`Chain=32`)** | **Odin (`package actor` Library)** | **`25.68 ms`** | **`77.89 M/s`** | **`12.8 ns`** | **`58.8x`** |
+| **`4b`** | **Official Pony `libponyrt` (`pony_chain`, `Chain=32`)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`20.50 – 27.74 ms`** | **`72.10 – 97.57 M/s`** | **`10.2 – 13.9 ns`** | **`54.4x – 73.7x`** |
+| **`5a`** | **Sleipnir `send_batch_from_pool` (`Chain=32`)** | **Odin (`package actor` Library)** | **`25.68 – 27.72 ms`** | **`72.14 – 77.89 M/s`** | **`12.8 – 13.9 ns`** | **`54.5x – 58.8x`** |
 | **`4b`** | **Official Pony `libponyrt` (`pony_chain`, `Chain=32`)** | **C (`libponyrt` 0.77.2 via C11)** | **`27.00 ms`** | **`74.07 M/s`** | **`13.5 ns`** | **`55.9x`** |
-| **`4b`** | **Official Pony `libponyrt` (`pony_chain`, `Chain=32`)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`27.74 ms`** | **`72.10 M/s`** | **`13.9 ns`** | **`54.4x`** |
+| **`3c`** | **Raw Pony MPSC (Single Send, 8K Watermark Slab)** | **Odin (Raw Specialized)** | **`42.94 – 59.63 ms`** | **`33.54 – 46.58 M/s`** | **`21.5 – 29.8 ns`** | **`25.3x – 35.2x`** |
+| **`5a`** | **Sleipnir `send_from_pool` (Single Send)** | **Odin (`package actor` Library)** | **`45.35 – 64.36 ms`** | **`31.08 – 44.10 M/s`** | **`22.7 – 32.2 ns`** | **`23.5x – 33.3x`** |
+| **`3f`** | **Raw Pony MPSC + Adaptive `sync.Futex` Parker** | **Odin (Raw Specialized)** | **`48.51 – 69.46 ms`** | **`28.79 – 41.23 M/s`** | **`24.3 – 34.7 ns`** | **`21.7x – 31.1x`** |
+| **`3b`** | **Raw Pony MPSC (Single Send, Per-Msg `in_use` Flag Slab)** | **Odin (Raw Specialized)** | **`49.64 – 60.90 ms`** | **`32.84 – 40.29 M/s`** | **`24.8 – 30.4 ns`** | **`24.8x – 30.4x`** |
 | **`3c`** | **Raw Pony MPSC (Single Send, 8K Watermark Slab)** | **C11 (`stdatomic.h`)** | **`59.60 ms`** | **`33.56 M/s`** | **`29.8 ns`** | **`25.3x`** |
-| **`3c`** | **Raw Pony MPSC (Single Send, 8K Watermark Slab)** | **Odin (Raw Specialized)** | **`59.63 ms`** | **`33.54 M/s`** | **`29.8 ns`** | **`25.3x`** |
-| **`3b`** | **Raw Pony MPSC (Single Send, Per-Msg `in_use` Flag Slab)** | **Odin (Raw Specialized)** | **`60.90 ms`** | **`32.84 M/s`** | **`30.4 ns`** | **`24.8x`** |
-| **`5a`** | **Sleipnir `send_from_pool` (Single Send)** | **Odin (`package actor` Library)** | **`64.36 ms`** | **`31.08 M/s`** | **`32.2 ns`** | **`23.5x`** |
-| **`3f`** | **Raw Pony MPSC + Adaptive `sync.Futex` Parker** | **Odin (Raw Specialized)** | **`69.46 ms`** | **`28.79 M/s`** | **`34.7 ns`** | **`21.7x`** |
-| **`4a`** | **Official Pony `libponyrt` (`pony_alloc_msg` Single Send)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`85.32 ms`** | **`23.44 M/s`** | **`42.7 ns`** | **`17.7x`** |
+| **`4a`** | **Official Pony `libponyrt` (`pony_alloc_msg` Single Send)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`63.66 – 85.32 ms`** | **`23.44 – 31.42 M/s`** | **`31.8 – 42.7 ns`** | **`17.7x – 23.7x`** |
 | **`4a`** | **Official Pony `libponyrt` (`pony_alloc_msg` Single Send)** | **C (`libponyrt` 0.77.2 via C11)** | **`89.34 ms`** | **`22.39 M/s`** | **`44.7 ns`** | **`16.9x`** |
 | **`1`** | **Traditional OS Thread + Mutex Channel (`cap=4096`)** | **C11 (`pthread_mutex_t` + `cond`)** | **`422.18 ms`** | **`4.74 M/s`** | **`211.1 ns`** | **`3.6x`** |
-| **`1`** | **Traditional OS Thread + Buffered `chan` (`cap=4096`)** | **Odin (`core:sync/chan`)** | **`1,510.33 ms`** | **`1.32 M/s`** | **`755.2 ns`** | **`1.0x`** |
+| **`1`** | **Traditional OS Thread + Buffered `chan` (`cap=4096`)** | **Odin (`core:sync/chan`)** | **`1,086.96 – 1,510.33 ms`** | **`1.32 – 1.84 M/s`** | **`543.5 – 755.2 ns`** | **`1.0x`** |
 
 ---
 
@@ -88,9 +88,9 @@ Measures strict round-trip serialization latency between two pinned actor thread
 
 | ID | Architecture / Implementation | Language / Runtime | Total Time | Hops / Sec | Latency / Hop | Speedup vs `chan` |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: |
-| **`3`** | **Raw Pony MPSC (Zero-Alloc Static Envelope Reuse)** | **Odin (Raw Specialized)** | **`24.30 ms`** | **`8.23 M/s`** | **`121.5 ns`** | **`41.5x`** |
-| **`4`** | **Official Pony `libponyrt` (`pony_alloc_msg` + `messageq`)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`38.48 ms`** | **`5.20 M/s`** | **`192.4 ns`** | **`26.2x`** |
-| **`1`** | **Traditional Buffered `chan` (`cap=64`)** | **Odin (`core:sync/chan`)** | **`1,009.37 ms`** | **`0.20 M/s`** | **`5,046.8 ns`** | **`1.0x`** |
+| **`3`** | **Raw Pony MPSC (Zero-Alloc Static Envelope Reuse)** | **Odin (Raw Specialized)** | **`19.05 – 24.30 ms`** | **`8.23 – 10.50 M/s`** | **`95.2 – 121.5 ns`** | **`41.5x – 55.3x`** |
+| **`4`** | **Official Pony `libponyrt` (`pony_alloc_msg` + `messageq`)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`25.78 – 38.48 ms`** | **`5.20 – 7.76 M/s`** | **`128.9 – 192.4 ns`** | **`26.2x – 40.8x`** |
+| **`1`** | **Traditional Buffered `chan` (`cap=64`)** | **Odin (`core:sync/chan`)** | **`1,009.37 – 1,049.19 ms`** | **`0.19 – 0.20 M/s`** | **`5,046.8 – 5,246.0 ns`** | **`1.0x`** |
 
 ---
 
@@ -100,9 +100,9 @@ Four producers send `500,000` 512-byte messages (`256 MiB` of logical payload) t
 
 | ID | Architecture / Implementation | Language / Runtime | Total Time | Throughput | Latency / Msg | Speedup vs `chan` |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: |
+| **`3c`** | **Raw Pony MPSC Zero-Copy `iso` Pointer (512B Ring Slab)** | **Odin (Raw Specialized)** | **`9.43 – 14.76 ms`** | **`33.88 – 53.02 M/s`** | **`18.9 – 29.5 ns`** | **`28.4x – 44.6x`** |
 | **`2`** | **Single-Thread DOD Batch Array (`512B` value copy)** | **Odin (`-o:speed`)** | **`11.09 ms`** | **`45.09 M/s`** | **`22.2 ns`** | **`37.8x`** |
-| **`3c`** | **Raw Pony MPSC Zero-Copy `iso` Pointer (512B Ring Slab)** | **Odin (Raw Specialized)** | **`14.76 ms`** | **`33.88 M/s`** | **`29.5 ns`** | **`28.4x`** |
-| **`4c`** | **Official Pony `libponyrt` (`pony_alloc_msg` 512B Pool Arena)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`44.92 ms`** | **`11.13 M/s`** | **`89.8 ns`** | **`9.3x`** |
+| **`4c`** | **Official Pony `libponyrt` (`pony_alloc_msg` 512B Pool Arena)** | **C (`libponyrt` 0.77.2 via Odin FFI)** | **`44.63 – 55.64 ms`** | **`8.99 – 11.20 M/s`** | **`89.3 – 111.3 ns`** | **`7.6x – 9.4x`** |
 | **`1`** | **Traditional Buffered `chan` (`512B` value copy)** | **Odin (`core:sync/chan`)** | **`418.74 ms`** | **`1.19 M/s`** | **`837.5 ns`** | **`1.0x`** |
 
 ---
@@ -113,9 +113,9 @@ Four producers send `500,000` 512-byte messages (`256 MiB` of logical payload) t
 
 | ID | Architecture / Implementation | Language / Runtime | Total Time | Throughput | Latency / Msg | Speedup vs `1` |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: |
-| **`3g`** | **Sharded Work-Stealing `M:N` Swarm (`1,024` Actors)** | **Odin (Raw Specialized)** | **`37.07 ms`** | **`53.95 M/s`** | **`18.5 ns`** | **`11.8x`** |
-| **`5b`** | **Sleipnir Generic `M:N` Swarm (`1,024` Actors, `Envelope_Pool`)** | **Odin (`package actor` Library)** | **`41.85 ms`** | **`47.79 M/s`** | **`20.9 ns`** | **`10.4x`** |
-| **`4d`** | **Official Pony `libponyrt` Full `M:N` Runtime (`pony_create` + `pony_start`)** | **C (`libponyrt` 0.77.2 Full Runtime)** | **`103.69 ms`** | **`19.29 M/s`** | **`51.8 ns`** | **`4.2x`** |
+| **`5b`** | **Sleipnir Generic `M:N` Swarm (`1,024` Actors, `Envelope_Pool`)** | **Odin (`package actor` Library)** | **`32.35 – 44.95 ms`** | **`44.49 – 61.82 M/s`** | **`16.2 – 22.5 ns`** | **`9.7x – 13.5x`** |
+| **`3g`** | **Sharded Work-Stealing `M:N` Swarm (`1,024` Actors)** | **Odin (Raw Specialized)** | **`37.07 – 41.12 ms`** | **`48.64 – 53.95 M/s`** | **`18.5 – 20.6 ns`** | **`10.6x – 11.8x`** |
+| **`4d`** | **Official Pony `libponyrt` Full `M:N` Runtime (`pony_create` + `pony_start`)** | **C (`libponyrt` 0.77.2 Full Runtime)** | **`88.46 – 110.96 ms`** | **`18.02 – 22.61 M/s`** | **`44.2 – 55.5 ns`** | **`3.9x – 4.9x`** |
 | **`3a`** | **Contended Single Global `M:N` Runqueue (`1,024` Actors)** | **Odin (Global MPSC Runqueue)** | **`250.33 ms`** | **`7.99 M/s`** | **`125.2 ns`** | **`1.7x`** |
 | **`1`** | **4-Actor OS Thread Pool (`core:sync/chan`)** | **Odin (`core:sync/chan`)** | **`435.89 ms`** | **`4.59 M/s`** | **`217.9 ns`** | **`1.0x`** |
 
@@ -133,10 +133,10 @@ Here we compare **4 implementations side-by-side** across `1`, `2`, `4`, and `8`
 
 | Worker Threads | Sleipnir (`package actor` Odin) | Official Pony (`libponyrt` 0.77.2 C) | Raw Specialized Odin (`3h`) | Raw C11 (`stdatomic.h`) | Multi-Core Scaling (`1 -> N`) |
 | :--- | ---: | ---: | ---: | ---: | :--- |
-| **1 Worker** | `168.80 ms` (**`2.96 M/s`**) | `179.28 ms` (**`2.79 M/s`**) | `166.48 ms` (**`3.00 M/s`**) | `161.85 ms` (**`3.09 M/s`**) | `1.00x` baseline |
-| **2 Workers** | `86.00 ms` (**`5.81 M/s`**) | `96.60 ms` (**`5.18 M/s`**) | `87.15 ms` (**`5.74 M/s`**) | `85.06 ms` (**`5.88 M/s`**) | **`1.96x`** (Sleipnir) / **`1.86x`** (Pony) |
-| **4 Workers** | `47.53 ms` (**`10.52 M/s`**) | `48.94 ms` (**`10.22 M/s`**) | `45.64 ms` (**`10.96 M/s`**) | `44.37 ms` (**`11.27 M/s`**) | **`3.55x`** (Sleipnir) / **`3.66x`** (Pony) |
-| **8 Workers** | `30.03 ms` (**`16.65 M/s`**) | `25.38 ms` (**`19.70 M/s`**) | `26.74 ms` (**`18.70 M/s`**) | `25.08 ms` (**`19.93 M/s`**) | **`5.63x`** (Sleipnir) / **`7.06x`** (Pony) |
+| **1 Worker** | `148.96 – 168.80 ms` (**`2.96 – 3.36 M/s`**) | `154.38 – 179.28 ms` (**`2.79 – 3.24 M/s`**) | `126.98 – 166.48 ms` (**`3.00 – 3.94 M/s`**) | `161.85 ms` (**`3.09 M/s`**) | `1.00x` baseline |
+| **2 Workers** | `77.62 – 86.00 ms` (**`5.81 – 6.44 M/s`**) | `84.86 – 96.60 ms` (**`5.18 – 5.89 M/s`**) | `64.94 – 87.15 ms` (**`5.74 – 7.70 M/s`**) | `85.06 ms` (**`5.88 M/s`**) | **`1.92x – 1.96x`** (Sleipnir) |
+| **4 Workers** | `36.23 – 47.53 ms` (**`10.52 – 13.80 M/s`**) | `48.68 – 48.94 ms` (**`10.22 – 10.27 M/s`**) | `35.23 – 45.64 ms` (**`10.96 – 14.19 M/s`**) | `44.37 ms` (**`11.27 M/s`**) | **`3.55x – 4.11x`** (Sleipnir) |
+| **8 Workers** | `28.02 – 30.03 ms` (**`16.65 – 17.85 M/s`**) | `25.38 – 26.13 ms` (**`19.14 – 19.70 M/s`**) | `26.14 – 26.74 ms` (**`18.70 – 19.12 M/s`**) | `25.08 ms` (**`19.93 M/s`**) | **`5.63x – 5.97x`** (Sleipnir) |
 
 ---
 
@@ -148,13 +148,13 @@ How does Sleipnir's Odin implementation compare head-to-head against the officia
 
 | Benchmark Scenario | Sleipnir (`package actor` Odin) | Official Pony (`libponyrt` 0.77.2 C) | Winner & Margin |
 | :--- | ---: | ---: | :--- |
-| **Single-Msg 4-Producer Fan-In (`2M` msgs)** | **`31.08 M/s`** (`32.2 ns`) | `23.44 M/s` (`42.7 ns`) | **Sleipnir (`1.33x` faster)** |
-| **Batched `Chain=32` Fan-In (`2M` msgs)** | **`77.89 M/s`** (`12.8 ns`) | `74.07 M/s` (`13.5 ns`) | **Sleipnir (`1.05x` faster)** |
-| **External 4-Producer $\rightarrow$ `1,024`-Actor Swarm** | **`47.79 M/s`** (`20.9 ns`) | `19.29 M/s` (`51.8 ns`) | **Sleipnir (`2.48x` faster)** |
-| **Autonomous `1,024`-Actor Graph + CPU (`1` Core)** | **`2.96 M/s`** (`168.8 ms`) | `2.79 M/s` (`179.3 ms`) | **Sleipnir (`1.06x` faster)** |
-| **Autonomous `1,024`-Actor Graph + CPU (`2` Cores)** | **`5.81 M/s`** (`86.0 ms`) | `5.18 M/s` (`96.6 ms`) | **Sleipnir (`1.12x` faster)** |
-| **Autonomous `1,024`-Actor Graph + CPU (`4` Cores)** | **`10.52 M/s`** (`47.5 ms`) | `10.22 M/s` (`48.9 ms`) | **Sleipnir (`1.03x` faster)** |
-| **Autonomous `1,024`-Actor Graph + CPU (`8` Cores)** | `16.65 M/s` (`30.0 ms`) | **`19.70 M/s`** (`25.4 ms`) | **Pony `libponyrt` (`1.18x` faster)** |
+| **Single-Msg 4-Producer Fan-In (`2M` msgs)** | **`31.08 – 44.10 M/s`** (`22.7 – 32.2 ns`) | `23.44 – 31.42 M/s` (`31.8 – 42.7 ns`) | **Sleipnir (`1.33x – 1.40x` faster)** |
+| **Batched `Chain=32` Fan-In (`2M` msgs)** | **`72.14 – 77.89 M/s`** (`12.8 – 13.9 ns`) | `72.10 – 97.57 M/s` (`10.2 – 13.9 ns`) | **Tie / Within Boost Variance** |
+| **External 4-Producer $\rightarrow$ `1,024`-Actor Swarm** | **`44.49 – 61.82 M/s`** (`16.2 – 22.5 ns`) | `18.02 – 22.61 M/s` (`44.2 – 55.5 ns`) | **Sleipnir (`2.48x – 3.43x` faster)** |
+| **Autonomous `1,024`-Actor Graph + CPU (`1` Core)** | **`2.96 – 3.36 M/s`** (`149.0 – 168.8 ms`) | `2.79 – 3.24 M/s` (`154.4 – 179.3 ms`) | **Sleipnir (`1.04x – 1.06x` faster)** |
+| **Autonomous `1,024`-Actor Graph + CPU (`2` Cores)** | **`5.81 – 6.44 M/s`** (`77.6 – 86.0 ms`) | `5.18 – 5.89 M/s` (`84.9 – 96.6 ms`) | **Sleipnir (`1.09x – 1.12x` faster)** |
+| **Autonomous `1,024`-Actor Graph + CPU (`4` Cores)** | **`10.52 – 13.80 M/s`** (`36.2 – 47.5 ms`) | `10.22 – 10.27 M/s` (`48.7 – 48.9 ms`) | **Sleipnir (`1.03x – 1.34x` faster)** |
+| **Autonomous `1,024`-Actor Graph + CPU (`8` Cores)** | `16.65 – 17.85 M/s` (`28.0 – 30.0 ms`) | **`19.14 – 19.70 M/s`** (`25.4 – 26.1 ms`) | **Pony `libponyrt` (`1.07x – 1.18x` faster)** |
 
 #### Why does Sleipnir outperform `libponyrt` on Fan-In (`1.33x`) and External Swarm (`2.48x`), while `libponyrt` edges ahead at 8 Workers (`1.18x`)?
 
@@ -218,10 +218,10 @@ Use this matrix to choose the right primitive inside Sleipnir (`package actor`):
 
 | Workload Pattern | Recommended Primitive | Expected Performance |
 | :--- | :--- | :--- |
-| **General stateful actors, dynamic topologies, request/reply, state machines** | [`actor.Scheduler`](../actor/scheduler.odin) + [`actor.Envelope_Pool`](../actor/pool.odin) (`actor.send`) | **`31 M/s`** single send (`32 ns/msg`), **`48 M/s`** across `1,024`-actor swarm |
-| **Producers emitting bursts of messages to the same actor** | [`actor.send(&sched, &pool, pid, batch[:])`](../actor/actor.odin) (`Chain=K` splicing) | **`78 M/s`** in `package actor` (`12.8 ns/msg`), up to **`314 M/s`** raw (`3.2 ns/msg`) |
-| **Pipelines, rings, routers, or ping-pong state machines** | [`actor.forward(ctx, next_pid, msg)`](../actor/actor.odin) (zero-copy `iso` handoff) | **`8.2 M hops/sec`** cross-thread ping-pong, **`16.7 M hops/sec`** on 8-core actor graph |
-| **Dedicated high-throughput sink/aggregator actor fed by $P$ known worker threads** | [`actor.Sharded_SPSC_Mailbox(T, N)`](../actor/spsc_mailbox.odin) | **`827 M/s`** (`1.2 ns/msg`, wait-free) |
+| **General stateful actors, dynamic topologies, request/reply, state machines** | [`actor.Scheduler`](../actor/actor.odin) + [`actor.Envelope_Pool`](../actor/pool.odin) (`actor.send`) | **`31 – 44 M/s`** single send (`22.7 – 32.2 ns/msg`), **`48 – 62 M/s`** across `1,024`-actor swarm |
+| **Producers emitting bursts of messages to the same actor** | [`actor.send(&sched, &pool, pid, batch[:])`](../actor/actor.odin) (`Chain=K` splicing) | **`72 – 78 M/s`** in `package actor` (`12.8 – 13.9 ns/msg`), up to **`314 – 484 M/s`** raw (`2.1 – 3.2 ns/msg`) |
+| **Pipelines, rings, routers, or ping-pong state machines** | [`actor.forward(ctx, next_pid, msg)`](../actor/actor.odin) (zero-copy `iso` handoff) | **`8.2 – 10.5 M hops/sec`** cross-thread ping-pong, **`16.7 – 17.9 M hops/sec`** on 8-core actor graph |
+| **Dedicated high-throughput sink/aggregator actor fed by $P$ known worker threads** | [`actor.Sharded_SPSC_Mailbox(T, N)`](../actor/spsc.odin) | **`827 M – 1.06 B/s`** (`0.9 – 1.2 ns/msg`, wait-free) |
 | **Homogeneous data-parallel number crunching (e.g., updating 100,000 positions per tick)** | Contiguous DOD slice (`[]T`) inside a single actor message or worker loop | **`200 – 870 M/s`** (`1.1 – 5.1 ns/item`) |
 
 ---

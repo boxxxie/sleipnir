@@ -9,7 +9,7 @@ Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N`
 
 - **Zero Garbage Collector:** Deterministic memory management via automatic per-message `Envelope_Pool(Msg)` slabs or custom `mem.Allocator`.
 - **Zero-Ceremony Ergonomics:** Single-line RAII `actor.scoped_scheduler` (`@(deferred_out)`), ambient thread-local context, envelope-header `actor.call` / `actor.reply`, and optional `@(actor)` AST metaprogramming (`account->deposit(250)`, `account->get_balance()`). See the [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md).
-- **Performance:** **31–78M msgs/sec** on 4-producer MPSC fan-in, **827M msgs/sec** (`1.2 ns/msg`) on wait-free sharded SPSC, and **16.65M hops/sec** across 1,024 autonomous actors on 8 cores—matching or outperforming the official Pony C runtime (`libponyrt` 0.77.2) and raw C11 (`stdatomic.h`). See the full [**Benchmark Report & Cross-Runtime Comparison (`benchmarks/README.md`)**](benchmarks/README.md).
+- **Performance:** **31–44M msgs/sec** on single-message 4-producer MPSC fan-in (**64–78M msgs/sec** with `Chain=32` batching), **827M–1.06B msgs/sec** (`0.9–1.2 ns/msg`) on wait-free sharded SPSC, **48–62M msgs/sec** across a 1,024-actor `M:N` swarm, and **16.65–17.85M hops/sec** across 1,024 autonomous actors on 8 cores—matching or outperforming the official Pony C runtime (`libponyrt` 0.77.2) and raw C11 (`stdatomic.h`). See the full [**Benchmark Report & Cross-Runtime Comparison (`benchmarks/README.md`)**](benchmarks/README.md).
 
 ---
 
@@ -147,7 +147,7 @@ player_receive :: proc(self: ^Table_State, msg: ^Ball_Msg) {
 
 ---
 
-### 5. Wait-Free `Sharded_SPSC_Mailbox` (`827M msgs/sec`)
+### 5. Wait-Free `Sharded_SPSC_Mailbox` (`827M–1.06B msgs/sec`)
 
 When an actor receives from a known set of $P$ producer threads (`0 ..< num_producers`), [`actor.Sharded_SPSC_Mailbox`](actor/spsc.odin) gives each producer its own cache-line-isolated Single-Producer Single-Consumer ring buffer—**zero `LOCK XCHG` or `LOCK CMPXCHG` instructions on the data path**:
 
@@ -291,7 +291,7 @@ odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:spe
 | [`actor.Scheduler`](actor/actor.odin) | Work-stealing `M:N` actor scheduler with per-worker shards and adaptive `sync.Futex` parking. |
 | [`actor.Actor(State, Msg)`](actor/actor.odin) / [`actor.PID(Msg)`](actor/actor.odin) | Concrete typed actor and state-erased `PID(Msg)` address handle (`actor.pid(a)`). |
 | [`actor.Envelope_Pool(Msg)`](actor/pool.odin) | `snmalloc`-inspired batched envelope recycling pool (auto-managed per `Msg` or explicit). |
-| [`actor.Sharded_SPSC_Mailbox(T, N)`](actor/spsc.odin) | Wait-free cache-line-isolated SPSC ring lanes (`1.2 ns/msg`, zero atomic RMW instructions). |
+| [`actor.Sharded_SPSC_Mailbox(T, N)`](actor/spsc.odin) | Wait-free cache-line-isolated SPSC ring lanes (`0.9–1.2 ns/msg`, zero atomic RMW instructions). |
 | [`actor.spawn`](actor/actor.odin) / [`actor.spawn_self`](actor/actor.odin) | Spawns an actor with 2-arg `(^State, ^Msg)`, 2-arg value `(^State, Msg)`, 3-arg `(^Context, ...)`, or embedded `receive` struct field. |
 | [`actor.send`](actor/doc.odin) | Sends a single `Msg`, batched `[]Msg` (`Chain=K`), or request with `reply_to` (`actor.send(target, msg, reply_to)`). |
 | [`actor.call`](actor/actor.odin) / [`actor.reply`](actor/actor.odin) | Envelope-header request/reply (`res := actor.call(target, msg, Res)` and `actor.reply(val)` inside handlers) with zero `reply_to` pollution in `Msg`. |
