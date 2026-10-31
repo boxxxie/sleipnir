@@ -77,10 +77,18 @@ Actor_Base :: struct #align(64) {
 
 // Execution context passed into an actor's `receive` callback (and bound to `_tls_active_ctx`).
 Context :: struct {
-	sched:       ^Scheduler,
-	worker_id:   int,
-	current_env: rawptr, // Pointer to the active `^Envelope(Msg)` being processed
-	forwarded:   bool,   // Set to `true` when `forward` transfers ownership of `current_env`
+	sched:              ^Scheduler,
+	worker_id:          int,
+	current_env:        rawptr, // Pointer to the active `^Envelope(Msg)` being processed
+	current_reply_slot: rawptr, // Optional `^Call_Slot(Res)` or `^Actor_Ref(Res)` for `actor.reply`
+	current_flags:      u16,    // Active envelope's `flags` (`ENVELOPE_FLAG_*`)
+	forwarded:          bool,   // Set to `true` when `forward` transfers ownership of `current_env`
+}
+
+// Stack-allocated reply slot used by synchronous `actor.call`.
+Call_Slot :: struct($Res: typeid) {
+	result: Res,
+	ready:  sync.Futex, // 0 = waiting, 1 = reply ready
 }
 
 // Message-typed actor endpoint (type-erased over private `$State`).
@@ -889,8 +897,10 @@ actor_generic_step_proc :: proc(
 			env := mpsc_pop_detached(&self.mailbox)
 			if env == nil do break
 
-			ctx.current_env = env
-			ctx.forwarded   = false
+			ctx.current_env        = env
+			ctx.current_reply_slot = env.reply_slot
+			ctx.current_flags      = env.flags
+			ctx.forwarded          = false
 			when Mode == STEP_MODE_ACTOR {
 				self.receive(ctx, self, &env.msg)
 			} else when Mode == STEP_MODE_STATE {
@@ -1376,3 +1386,195 @@ forward :: proc {
 	forward_unchanged_ambient,
 	forward_unchanged_ambient_pid,
 }
+
+// -----------------------------------------------------------------------------
+// Request / Reply (`actor.call`, `actor.reply`, & Envelope-Level `reply_to`)
+// -----------------------------------------------------------------------------
+
+// Send a message to `target` with `reply_to` attached in the envelope header
+// (so `Msg` does not need a `reply_to` field!). When `target` calls `actor.reply(val)`,
+// `val` is automatically delivered to `reply_to`'s mailbox.
+send_with_reply_actor_pid :: #force_inline proc(
+	target: ^Actor($State, $Msg),
+	msg: Msg,
+	reply_to: PID($Res),
+) {
+	s := resolve_target_scheduler(nil, &target.ref)
+	assert(s != nil, "No active Scheduler found for actor.send(target, msg, reply_to)")
+	env, hint := acquire_auto_envelope(s, &target.ref, -1)
+	env.flags |= ENVELOPE_FLAG_REPLY_PID
+	env.reply_slot = reply_to.ref
+	env.msg = msg
+	send_envelope(s, target, env, hint)
+}
+
+send_with_reply_pid_pid :: #force_inline proc(
+	target: PID($Msg),
+	msg: Msg,
+	reply_to: PID($Res),
+) {
+	s := resolve_target_scheduler(nil, target.ref)
+	assert(s != nil, "No active Scheduler found for actor.send(pid, msg, reply_to)")
+	env, hint := acquire_auto_envelope(s, target.ref, -1)
+	env.flags |= ENVELOPE_FLAG_REPLY_PID
+	env.reply_slot = reply_to.ref
+	env.msg = msg
+	send_envelope_pid(s, target, env, hint)
+}
+
+send_with_reply_actor_actor :: #force_inline proc(
+	target: ^Actor($State, $Msg),
+	msg: Msg,
+	reply_to: ^Actor($Reply_State, $Res),
+) {
+	send_with_reply_actor_pid(target, msg, pid(reply_to))
+}
+
+send_with_reply_pid_actor :: #force_inline proc(
+	target: PID($Msg),
+	msg: Msg,
+	reply_to: ^Actor($Reply_State, $Res),
+) {
+	send_with_reply_pid_pid(target, msg, pid(reply_to))
+}
+
+// Reply to the sender of the currently executing message (`actor.call` or `send(..., reply_to)`).
+reply_ctx :: #force_inline proc(ctx: ^Context, val: $Res) {
+	slot_ptr := ctx.current_reply_slot
+	if slot_ptr == nil do return
+	flags := ctx.current_flags
+	if (flags & ENVELOPE_FLAG_CALL) != 0 {
+		slot := cast(^Call_Slot(Res))slot_ptr
+		slot.result = val
+		intrinsics.atomic_store_explicit((^u32)(&slot.ready), 1, .Release)
+		sync.futex_signal(&slot.ready)
+	} else if (flags & ENVELOPE_FLAG_REPLY_PID) != 0 {
+		target_ref := cast(^Actor_Ref(Res))slot_ptr
+		send_ctx_pid(ctx, PID(Res){ref = target_ref}, val)
+	}
+}
+
+reply_ambient :: #force_inline proc(val: $Res) {
+	ctx := current_context()
+	assert(ctx != nil, "actor.reply can only be called inside an actor handler")
+	reply_ctx(ctx, val)
+}
+
+reply :: proc {
+	reply_ctx,
+	reply_ambient,
+}
+
+// Cooperatively execute one runnable actor turn while a worker thread is waiting inside `actor.call`.
+@(private)
+scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> bool {
+	wid := caller_ctx.worker_id
+	num_shards := s.num_shards
+	a := shard_pop_or_steal(&s.shards[wid % num_shards])
+	if a == nil && num_shards > 1 {
+		for i := 1; i < num_shards; i += 1 {
+			peer := (wid + i) % num_shards
+			a = shard_pop_or_steal(&s.shards[peer])
+			if a != nil do break
+		}
+	}
+	if a == nil do return false
+
+	saved := caller_ctx^
+	processed, has_more := a.step_proc(a, caller_ctx, s.batch_quota)
+	caller_ctx^ = saved
+
+	if has_more {
+		shard_push(&s.shards[wid % num_shards], a)
+	} else {
+		intrinsics.atomic_store_explicit(&a.scheduled, 0, .Seq_Cst)
+		intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Acq_Rel)
+		_, still_has_more := a.step_proc(a, caller_ctx, 0)
+		if still_has_more {
+			scheduler_schedule_actor(s, a, wid)
+		}
+	}
+	if processed > 0 {
+		intrinsics.atomic_add_explicit(&s.total_processed, i64(processed), .Release)
+	}
+	return true
+}
+
+// Synchronous request/reply (`GenServer.call` / Akka `ask`): sends `msg` to `target`,
+// waits for `target` to call `actor.reply(res)` (cooperatively stepping actors if called
+// from a worker thread), and returns `res` of type `$Res`.
+@(require_results)
+call_sched_pid :: proc(
+	s: ^Scheduler,
+	target: PID($Msg),
+	msg: Msg,
+	$Res: typeid,
+) -> Res {
+	slot: Call_Slot(Res)
+	env, hint := acquire_auto_envelope(s, target.ref, -1)
+	env.flags |= ENVELOPE_FLAG_CALL
+	env.reply_slot = &slot
+	env.msg = msg
+	send_envelope_pid(s, target, env, hint)
+
+	caller_ctx := _tls_active_ctx
+	spin := 0
+	for intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) == 0 {
+		if caller_ctx != nil && caller_ctx.sched == s {
+			if !scheduler_step_one_cooperative(s, caller_ctx) {
+				intrinsics.cpu_relax()
+			}
+		} else {
+			if spin < DEFAULT_FUTEX_SPIN_LIMIT {
+				spin += 1
+				intrinsics.cpu_relax()
+			} else {
+				if intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) == 0 {
+					sync.futex_wait(&slot.ready, 0)
+				}
+				spin = 0
+			}
+		}
+	}
+	return slot.result
+}
+
+@(require_results)
+call_sched_actor :: proc(
+	s: ^Scheduler,
+	target: ^Actor($State, $Msg),
+	msg: Msg,
+	$Res: typeid,
+) -> Res {
+	return call_sched_pid(s, pid(target), msg, Res)
+}
+
+@(require_results)
+call_ambient_pid :: proc(
+	target: PID($Msg),
+	msg: Msg,
+	$Res: typeid,
+) -> Res {
+	s := resolve_target_scheduler(nil, target.ref)
+	assert(s != nil, "No active Scheduler found for actor.call(pid, msg, Res)")
+	return call_sched_pid(s, target, msg, Res)
+}
+
+@(require_results)
+call_ambient_actor :: proc(
+	target: ^Actor($State, $Msg),
+	msg: Msg,
+	$Res: typeid,
+) -> Res {
+	s := resolve_target_scheduler(nil, &target.ref)
+	assert(s != nil, "No active Scheduler found for actor.call(target, msg, Res)")
+	return call_sched_pid(s, pid(target), msg, Res)
+}
+
+call :: proc {
+	call_sched_pid,
+	call_sched_actor,
+	call_ambient_pid,
+	call_ambient_actor,
+}
+

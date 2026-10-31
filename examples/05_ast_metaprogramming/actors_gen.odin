@@ -13,32 +13,83 @@ Audit_Logger_Msg_record_snapshot :: struct {
 	tx_count: int,
 }
 
+Audit_Logger_Msg_get_entries_logged :: struct {}
+
 Audit_Logger_Msg_reset :: struct {}
 
 Audit_Logger_Msg :: union {
 	Audit_Logger_Msg_record_snapshot,
+	Audit_Logger_Msg_get_entries_logged,
 	Audit_Logger_Msg_reset,
 }
 
-Audit_Logger_Actor :: actor.Actor(Audit_Logger, Audit_Logger_Msg)
-Audit_Logger_PID   :: actor.PID(Audit_Logger_Msg)
+Audit_Logger_VTable :: struct {
+	record_snapshot: proc(target: Audit_Logger_Actor, owner: string, balance: i64, tx_count: int),
+	get_entries_logged: proc(target: Audit_Logger_Actor) -> int,
+	reset: proc(target: Audit_Logger_Actor),
+}
+
+Audit_Logger_Actor :: struct {
+	using raw:    ^actor.Actor(Audit_Logger, Audit_Logger_Msg),
+	using vtable: ^Audit_Logger_VTable,
+}
+
+Audit_Logger_PID :: Audit_Logger_Actor
 
 audit_logger_dispatch :: proc(ctx: ^actor.Context, self: ^Audit_Logger, msg: ^Audit_Logger_Msg) {
 	switch m in msg^ {
 	case Audit_Logger_Msg_record_snapshot:
 		record_snapshot(self, m.owner, m.balance, m.tx_count)
+	case Audit_Logger_Msg_get_entries_logged:
+		res := get_entries_logged(self)
+		actor.reply(ctx, res)
 	case Audit_Logger_Msg_reset:
 		logger_reset(self)
 	}
+}
+
+send_audit_logger_record_snapshot_actor :: #force_inline proc(target: Audit_Logger_Actor, owner: string, balance: i64, tx_count: int) {
+	actor.send(target.raw, Audit_Logger_Msg(Audit_Logger_Msg_record_snapshot{owner = owner, balance = balance, tx_count = tx_count}))
+}
+
+send_audit_logger_record_snapshot_pid :: #force_inline proc(target: actor.PID(Audit_Logger_Msg), owner: string, balance: i64, tx_count: int) {
+	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_record_snapshot{owner = owner, balance = balance, tx_count = tx_count}))
+}
+
+call_audit_logger_get_entries_logged_actor :: #force_inline proc(target: Audit_Logger_Actor) -> int {
+	return actor.call(target.raw, Audit_Logger_Msg(Audit_Logger_Msg_get_entries_logged{}), int)
+}
+
+call_audit_logger_get_entries_logged_pid :: #force_inline proc(target: actor.PID(Audit_Logger_Msg)) -> int {
+	return actor.call(target, Audit_Logger_Msg(Audit_Logger_Msg_get_entries_logged{}), int)
+}
+
+send_audit_logger_get_entries_logged_reply :: #force_inline proc(target: Audit_Logger_Actor, reply_to: actor.PID(int)) {
+	actor.send(target.raw, Audit_Logger_Msg(Audit_Logger_Msg_get_entries_logged{}), reply_to)
+}
+
+send_audit_logger_reset_actor :: #force_inline proc(target: Audit_Logger_Actor) {
+	actor.send(target.raw, Audit_Logger_Msg(Audit_Logger_Msg_reset{}))
+}
+
+send_audit_logger_reset_pid :: #force_inline proc(target: actor.PID(Audit_Logger_Msg)) {
+	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_reset{}))
+}
+
+@(private)
+audit_logger_vtable := Audit_Logger_VTable{
+	record_snapshot = send_audit_logger_record_snapshot_actor,
+	get_entries_logged = call_audit_logger_get_entries_logged_actor,
+	reset = send_audit_logger_reset_actor,
 }
 
 spawn_audit_logger_auto :: proc(
 	initial_state: Audit_Logger = {},
 	id: u32 = 0,
 	allocator := context.allocator,
-) -> ^Audit_Logger_Actor {
+) -> Audit_Logger_Actor {
 	a, _ := actor.spawn(initial_state, audit_logger_dispatch, id, allocator)
-	return a
+	return Audit_Logger_Actor{raw = a, vtable = &audit_logger_vtable}
 }
 
 spawn_audit_logger_sched :: proc(
@@ -46,30 +97,14 @@ spawn_audit_logger_sched :: proc(
 	initial_state: Audit_Logger = {},
 	id: u32 = 0,
 	allocator := context.allocator,
-) -> ^Audit_Logger_Actor {
+) -> Audit_Logger_Actor {
 	a, _ := actor.spawn(s, initial_state, audit_logger_dispatch, id, allocator)
-	return a
+	return Audit_Logger_Actor{raw = a, vtable = &audit_logger_vtable}
 }
 
 spawn_audit_logger :: proc {
 	spawn_audit_logger_auto,
 	spawn_audit_logger_sched,
-}
-
-send_audit_logger_record_snapshot_actor :: #force_inline proc(target: ^Audit_Logger_Actor, owner: string, balance: i64, tx_count: int) {
-	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_record_snapshot{owner = owner, balance = balance, tx_count = tx_count}))
-}
-
-send_audit_logger_record_snapshot_pid :: #force_inline proc(target: Audit_Logger_PID, owner: string, balance: i64, tx_count: int) {
-	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_record_snapshot{owner = owner, balance = balance, tx_count = tx_count}))
-}
-
-send_audit_logger_reset_actor :: #force_inline proc(target: ^Audit_Logger_Actor) {
-	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_reset{}))
-}
-
-send_audit_logger_reset_pid :: #force_inline proc(target: Audit_Logger_PID) {
-	actor.send(target, Audit_Logger_Msg(Audit_Logger_Msg_reset{}))
 }
 
 // =============================================================================
@@ -85,21 +120,36 @@ Bank_Account_Msg_withdraw :: struct {
 	amount: i64,
 }
 
+Bank_Account_Msg_get_balance :: struct {}
+
 Bank_Account_Msg_reset :: struct {}
 
 Bank_Account_Msg_audit_snapshot :: struct {
-	logger: Audit_Logger_PID,
+	logger: Audit_Logger_Actor,
 }
 
 Bank_Account_Msg :: union {
 	Bank_Account_Msg_deposit,
 	Bank_Account_Msg_withdraw,
+	Bank_Account_Msg_get_balance,
 	Bank_Account_Msg_reset,
 	Bank_Account_Msg_audit_snapshot,
 }
 
-Bank_Account_Actor :: actor.Actor(Bank_Account, Bank_Account_Msg)
-Bank_Account_PID   :: actor.PID(Bank_Account_Msg)
+Bank_Account_VTable :: struct {
+	deposit: proc(target: Bank_Account_Actor, amount: i64, memo: string = "deposit"),
+	withdraw: proc(target: Bank_Account_Actor, amount: i64),
+	get_balance: proc(target: Bank_Account_Actor) -> i64,
+	reset: proc(target: Bank_Account_Actor),
+	audit_snapshot: proc(target: Bank_Account_Actor, logger: Audit_Logger_Actor),
+}
+
+Bank_Account_Actor :: struct {
+	using raw:    ^actor.Actor(Bank_Account, Bank_Account_Msg),
+	using vtable: ^Bank_Account_VTable,
+}
+
+Bank_Account_PID :: Bank_Account_Actor
 
 bank_account_dispatch :: proc(ctx: ^actor.Context, self: ^Bank_Account, msg: ^Bank_Account_Msg) {
 	switch m in msg^ {
@@ -107,6 +157,9 @@ bank_account_dispatch :: proc(ctx: ^actor.Context, self: ^Bank_Account, msg: ^Ba
 		deposit(self, m.amount, m.memo)
 	case Bank_Account_Msg_withdraw:
 		withdraw(self, m.amount)
+	case Bank_Account_Msg_get_balance:
+		res := get_balance(self)
+		actor.reply(ctx, res)
 	case Bank_Account_Msg_reset:
 		account_reset(self)
 	case Bank_Account_Msg_audit_snapshot:
@@ -114,13 +167,66 @@ bank_account_dispatch :: proc(ctx: ^actor.Context, self: ^Bank_Account, msg: ^Ba
 	}
 }
 
+send_bank_account_deposit_actor :: #force_inline proc(target: Bank_Account_Actor, amount: i64, memo: string = "deposit") {
+	actor.send(target.raw, Bank_Account_Msg(Bank_Account_Msg_deposit{amount = amount, memo = memo}))
+}
+
+send_bank_account_deposit_pid :: #force_inline proc(target: actor.PID(Bank_Account_Msg), amount: i64, memo: string = "deposit") {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_deposit{amount = amount, memo = memo}))
+}
+
+send_bank_account_withdraw_actor :: #force_inline proc(target: Bank_Account_Actor, amount: i64) {
+	actor.send(target.raw, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
+}
+
+send_bank_account_withdraw_pid :: #force_inline proc(target: actor.PID(Bank_Account_Msg), amount: i64) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
+}
+
+call_bank_account_get_balance_actor :: #force_inline proc(target: Bank_Account_Actor) -> i64 {
+	return actor.call(target.raw, Bank_Account_Msg(Bank_Account_Msg_get_balance{}), i64)
+}
+
+call_bank_account_get_balance_pid :: #force_inline proc(target: actor.PID(Bank_Account_Msg)) -> i64 {
+	return actor.call(target, Bank_Account_Msg(Bank_Account_Msg_get_balance{}), i64)
+}
+
+send_bank_account_get_balance_reply :: #force_inline proc(target: Bank_Account_Actor, reply_to: actor.PID(i64)) {
+	actor.send(target.raw, Bank_Account_Msg(Bank_Account_Msg_get_balance{}), reply_to)
+}
+
+send_bank_account_reset_actor :: #force_inline proc(target: Bank_Account_Actor) {
+	actor.send(target.raw, Bank_Account_Msg(Bank_Account_Msg_reset{}))
+}
+
+send_bank_account_reset_pid :: #force_inline proc(target: actor.PID(Bank_Account_Msg)) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset{}))
+}
+
+send_bank_account_audit_snapshot_actor :: #force_inline proc(target: Bank_Account_Actor, logger: Audit_Logger_Actor) {
+	actor.send(target.raw, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
+}
+
+send_bank_account_audit_snapshot_pid :: #force_inline proc(target: actor.PID(Bank_Account_Msg), logger: Audit_Logger_Actor) {
+	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
+}
+
+@(private)
+bank_account_vtable := Bank_Account_VTable{
+	deposit = send_bank_account_deposit_actor,
+	withdraw = send_bank_account_withdraw_actor,
+	get_balance = call_bank_account_get_balance_actor,
+	reset = send_bank_account_reset_actor,
+	audit_snapshot = send_bank_account_audit_snapshot_actor,
+}
+
 spawn_bank_account_auto :: proc(
 	initial_state: Bank_Account = {},
 	id: u32 = 0,
 	allocator := context.allocator,
-) -> ^Bank_Account_Actor {
+) -> Bank_Account_Actor {
 	a, _ := actor.spawn(initial_state, bank_account_dispatch, id, allocator)
-	return a
+	return Bank_Account_Actor{raw = a, vtable = &bank_account_vtable}
 }
 
 spawn_bank_account_sched :: proc(
@@ -128,9 +234,9 @@ spawn_bank_account_sched :: proc(
 	initial_state: Bank_Account = {},
 	id: u32 = 0,
 	allocator := context.allocator,
-) -> ^Bank_Account_Actor {
+) -> Bank_Account_Actor {
 	a, _ := actor.spawn(s, initial_state, bank_account_dispatch, id, allocator)
-	return a
+	return Bank_Account_Actor{raw = a, vtable = &bank_account_vtable}
 }
 
 spawn_bank_account :: proc {
@@ -138,40 +244,8 @@ spawn_bank_account :: proc {
 	spawn_bank_account_sched,
 }
 
-send_bank_account_deposit_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64, memo: string = "deposit") {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_deposit{amount = amount, memo = memo}))
-}
-
-send_bank_account_deposit_pid :: #force_inline proc(target: Bank_Account_PID, amount: i64, memo: string = "deposit") {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_deposit{amount = amount, memo = memo}))
-}
-
-send_bank_account_withdraw_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
-}
-
-send_bank_account_withdraw_pid :: #force_inline proc(target: Bank_Account_PID, amount: i64) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_withdraw{amount = amount}))
-}
-
-send_bank_account_reset_actor :: #force_inline proc(target: ^Bank_Account_Actor) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset{}))
-}
-
-send_bank_account_reset_pid :: #force_inline proc(target: Bank_Account_PID) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_reset{}))
-}
-
-send_bank_account_audit_snapshot_actor :: #force_inline proc(target: ^Bank_Account_Actor, logger: Audit_Logger_PID) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
-}
-
-send_bank_account_audit_snapshot_pid :: #force_inline proc(target: Bank_Account_PID, logger: Audit_Logger_PID) {
-	actor.send(target, Bank_Account_Msg(Bank_Account_Msg_audit_snapshot{logger = logger}))
-}
-
 // =============================================================================
-// Unified Behavior Overload Groups (`be_<behavior>` & `send_<behavior>`)
+// Unified Behavior Overload Groups (`send_<behavior>` & `call_<behavior>`)
 // =============================================================================
 
 send_record_snapshot :: proc {
@@ -179,7 +253,9 @@ send_record_snapshot :: proc {
 	send_audit_logger_record_snapshot_pid,
 }
 
-be_record_snapshot :: send_record_snapshot
+send_get_entries_logged :: proc {
+	send_audit_logger_get_entries_logged_reply,
+}
 
 send_reset :: proc {
 	send_audit_logger_reset_actor,
@@ -188,40 +264,42 @@ send_reset :: proc {
 	send_bank_account_reset_pid,
 }
 
-be_reset :: send_reset
-
 send_logger_reset :: proc {
 	send_audit_logger_reset_actor,
 	send_audit_logger_reset_pid,
 }
-
-be_logger_reset :: send_logger_reset
 
 send_deposit :: proc {
 	send_bank_account_deposit_actor,
 	send_bank_account_deposit_pid,
 }
 
-be_deposit :: send_deposit
-
 send_withdraw :: proc {
 	send_bank_account_withdraw_actor,
 	send_bank_account_withdraw_pid,
 }
 
-be_withdraw :: send_withdraw
+send_get_balance :: proc {
+	send_bank_account_get_balance_reply,
+}
 
 send_account_reset :: proc {
 	send_bank_account_reset_actor,
 	send_bank_account_reset_pid,
 }
 
-be_account_reset :: send_account_reset
-
 send_audit_snapshot :: proc {
 	send_bank_account_audit_snapshot_actor,
 	send_bank_account_audit_snapshot_pid,
 }
 
-be_audit_snapshot :: send_audit_snapshot
+call_get_entries_logged :: proc {
+	call_audit_logger_get_entries_logged_actor,
+	call_audit_logger_get_entries_logged_pid,
+}
+
+call_get_balance :: proc {
+	call_bank_account_get_balance_actor,
+	call_bank_account_get_balance_pid,
+}
 

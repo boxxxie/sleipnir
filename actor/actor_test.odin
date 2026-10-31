@@ -670,4 +670,66 @@ test_16_compile_time_structural_typing_spawn_self :: proc(t: ^testing.T) {
 	})
 }
 
+// ============================================================================
+// TEST 17: Synchronous `actor.call`, `actor.reply`, and Envelope Reply Routing
+// ============================================================================
+
+@(private = "file")
+Ledger_Add       :: struct { x: i64 }
+@(private = "file")
+Ledger_Get_Total :: struct {}
+
+@(private = "file")
+Ledger_Msg :: union {
+	Ledger_Add,
+	Ledger_Get_Total,
+}
+
+@(private = "file")
+Ledger_State :: struct {
+	total: i64,
+}
+
+@(test)
+test_17_actor_call_and_envelope_reply :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		sync_total:  i64 = 0
+		async_total: i64 = 0
+		{
+			// Use a 1-worker scheduler so we also verify cooperative worker-thread stepping!
+			_ = scoped_scheduler(num_workers = 1)
+
+			ledger := spawn(Ledger_State{total = 10}, proc(s: ^Ledger_State, m: Ledger_Msg) {
+				switch v in m {
+				case Ledger_Add:
+					s.total += v.x
+				case Ledger_Get_Total:
+					// Reply address lives in the Envelope header, NOT inside `Ledger_Get_Total`!
+					reply(s.total)
+				}
+			})
+
+			send(ledger, Ledger_Msg(Ledger_Add{x = 25}))
+			send(ledger, Ledger_Msg(Ledger_Add{x = 7}))
+
+			// 1. Synchronous `call` from main thread
+			sync_total = call(ledger, Ledger_Msg(Ledger_Get_Total{}), i64)
+
+			// 2. Asynchronous `send(target, msg, reply_to)` forwarding reply to another actor
+			receiver := spawn(i64(0), proc(state: ^i64, val: i64) {
+				state^ = val
+			})
+			send(ledger, Ledger_Msg(Ledger_Get_Total{}), pid(receiver))
+
+			wait_messages(5)
+			wait_idle()
+			async_total = receiver.state
+		}
+
+		testing.expect_value(t, sync_total, 42)
+		testing.expect_value(t, async_total, 42)
+	})
+}
+
+
 

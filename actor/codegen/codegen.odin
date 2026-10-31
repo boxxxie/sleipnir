@@ -13,15 +13,22 @@ import "core:strings"
 // =============================================================================
 // Sleipnir AST Metaprogramming Generator (`core:odin/parser` + `core:odin/ast`)
 //
-// Multi-file package support:
-//   1. Two-pass package AST scan: `@(actor)` structs and `@(behavior)` procedures
-//      can be split across any number of `.odin` files in the same package directory.
-//   2. Cross-file import forwarding: Imports (`import "core:time"`, etc.) used in
-//      behavior parameter types across any file are automatically forwarded to
-//      `actors_gen.odin`.
-//   3. Cross-actor behavior overloading: If multiple actors in different files
-//      define behaviors that map to the same `be_<name>` / `send_<name>` group,
-//      all overloads are merged into a single Odin `proc { ... }` group!
+// Features:
+//   1. Minimal Annotation (`@(actor)` only): Any procedure in the package taking
+//      `self: ^Actor_Type` (or `ctx: ^actor.Context, self: ^Actor_Type`) is
+//      automatically registered as a behavior of that `@(actor)` struct (unless
+//      marked `@(private)` or `@(no_behavior)`). `@(behavior)` / `@(behavior="name")`
+//      is also supported for explicit naming.
+//   2. Request/Reply Return Values (`-> T`): Behaviors that return a value `-> T`
+//      automatically generate synchronous `call_<name>(actor) -> T` (`actor->name()`)
+//      and async `send_<name>(actor, ..., reply_to: actor.PID(T))` without needing
+//      a `reply_to` field in the behavior's parameters.
+//   3. Built-in Odin `->` Selector Call Syntax: Generated actor handles embed a
+//      static `vtable` so `account->deposit(250)` and `bal := account->get_balance()`
+//      work alongside `send_deposit(account, 250)` and `call_get_balance(account)`.
+//   4. Multi-File Package Support: Scans all `.odin` files in a package directory,
+//      forwards cross-file `import` declarations, and merges shared behavior names
+//      into unified Odin procedure overload groups.
 // =============================================================================
 
 Behavior_Param :: struct {
@@ -32,9 +39,10 @@ Behavior_Param :: struct {
 
 Behavior_Spec :: struct {
 	proc_name:   string, // Actual Odin procedure name (e.g. `deposit` or `account_reset`)
-	short_name:  string, // Optional short behavior name or `proc_name`
+	short_name:  string, // Exposed method/behavior name (e.g. `deposit` or `reset`)
 	actor_type:  string,
 	takes_ctx:   bool,
+	return_type: string, // Empty string for 1-way `send_` behaviors; non-empty for `call_` behaviors
 	params:      [dynamic]Behavior_Param,
 }
 
@@ -158,7 +166,7 @@ import_local_alias :: proc(imp: ^ast.Import_Decl) -> string {
 }
 
 // Parse a single Odin source buffer and append discovered imports, `@(actor)` structs,
-// and `@(behavior)` procedures into `mod` and `pending_behaviors`.
+// and candidate behavior procedures into `mod` and `pending_behaviors`.
 parse_source_into_spec :: proc(
 	src: string,
 	filename: string,
@@ -227,84 +235,115 @@ parse_source_into_spec :: proc(
 						})
 					}
 				}
-			} else if custom_be_name, is_behavior := get_attribute(d, "behavior"); is_behavior {
-				proc_lit, is_proc := d.values[0].derived.(^ast.Proc_Lit)
-				if !is_proc || proc_lit.type == nil || proc_lit.type.params == nil {
-					continue
-				}
-				fields := proc_lit.type.params.list
-				if len(fields) == 0 do continue
-
-				// Determine whether param 0 is `self: ^Actor` or `(ctx: ^Context, self: ^Actor)`
-				actor_type := ""
-				takes_ctx  := false
-				start_field_idx := 1
-
-				if first_ptr, ok0 := extract_pointer_ident(fields[0].type); ok0 {
-					if first_ptr == "Context" && len(fields) >= 2 {
-						if second_ptr, ok1 := extract_pointer_ident(fields[1].type); ok1 {
-							actor_type = second_ptr
-							takes_ctx  = true
-							start_field_idx = 2
-						}
-					} else {
-						actor_type = first_ptr
-						takes_ctx  = false
-						start_field_idx = 1
-					}
-				}
-
-				if actor_type == "" do continue
-
-				short := custom_be_name if len(custom_be_name) > 0 else ident.name
-				bspec := Behavior_Spec{
-					proc_name  = ident.name,
-					short_name = short,
-					actor_type = actor_type,
-					takes_ctx  = takes_ctx,
-					params     = make([dynamic]Behavior_Param),
-				}
-
-				for f_idx := start_field_idx; f_idx < len(fields); f_idx += 1 {
-					field := fields[f_idx]
-					type_str := node_source(src, field.type)
-					def_str  := node_source(src, field.default_value)
-					for name_expr in field.names {
-						if p_ident, p_ok := name_expr.derived.(^ast.Ident); p_ok {
-							append(&bspec.params, Behavior_Param{
-								name         = p_ident.name,
-								type_expr    = type_str,
-								default_expr = def_str,
-							})
-						}
-					}
-				}
-
-				append(pending_behaviors, bspec)
+				continue
 			}
+
+			// Any top-level procedure taking `self: ^Actor_Type` (unless marked `@(private)`
+			// or `@(no_behavior)`) is a candidate behavior if `Actor_Type` is an `@(actor)` struct!
+			_, is_private     := get_attribute(d, "private")
+			_, is_no_behavior := get_attribute(d, "no_behavior")
+			custom_be_name, has_explicit_be := get_attribute(d, "behavior")
+			if (is_private || is_no_behavior) && !has_explicit_be {
+				continue
+			}
+
+			proc_lit, is_proc := d.values[0].derived.(^ast.Proc_Lit)
+			if !is_proc || proc_lit.type == nil || proc_lit.type.params == nil {
+				continue
+			}
+			fields := proc_lit.type.params.list
+			if len(fields) == 0 do continue
+
+			// Determine whether param 0 is `self: ^Actor` or `(ctx: ^Context, self: ^Actor)`
+			actor_type := ""
+			takes_ctx  := false
+			start_field_idx := 1
+
+			if first_ptr, ok0 := extract_pointer_ident(fields[0].type); ok0 {
+				if first_ptr == "Context" && len(fields) >= 2 {
+					if second_ptr, ok1 := extract_pointer_ident(fields[1].type); ok1 {
+						actor_type = second_ptr
+						takes_ctx  = true
+						start_field_idx = 2
+					}
+				} else {
+					actor_type = first_ptr
+					takes_ctx  = false
+					start_field_idx = 1
+				}
+			}
+
+			if actor_type == "" do continue
+
+			// Check for optional return type (`-> Return_Type`)
+			ret_type := ""
+			if proc_lit.type.results != nil && len(proc_lit.type.results.list) > 0 {
+				res_field := proc_lit.type.results.list[0]
+				if res_field.type != nil {
+					ret_type = node_source(src, res_field.type)
+				} else if len(res_field.names) > 0 {
+					ret_type = node_source(src, res_field.names[0])
+				}
+			}
+
+			short := custom_be_name if len(custom_be_name) > 0 else ident.name
+			bspec := Behavior_Spec{
+				proc_name   = ident.name,
+				short_name  = short,
+				actor_type  = actor_type,
+				takes_ctx   = takes_ctx,
+				return_type = ret_type,
+				params      = make([dynamic]Behavior_Param),
+			}
+
+			for f_idx := start_field_idx; f_idx < len(fields); f_idx += 1 {
+				field := fields[f_idx]
+				type_str := node_source(src, field.type)
+				def_str  := node_source(src, field.default_value)
+				for name_expr in field.names {
+					if p_ident, p_ok := name_expr.derived.(^ast.Ident); p_ok {
+						append(&bspec.params, Behavior_Param{
+							name         = p_ident.name,
+							type_expr    = type_str,
+							default_expr = def_str,
+						})
+					}
+				}
+			}
+
+			append(pending_behaviors, bspec)
 		}
 	}
 
 	return true
 }
 
-// Bind all parsed `@(behavior)` specs to their matching `@(actor)` struct.
+// Bind all candidate behavior procedures to their matching `@(actor)` struct,
+// and free parameter lists of non-actor procedures.
 finalize_module_spec :: proc(mod: ^Module_Spec, pending_behaviors: []Behavior_Spec) {
 	for b in pending_behaviors {
+		matched := false
 		for &a in mod.actors {
 			if a.name == b.actor_type {
 				append(&a.behaviors, b)
+				matched = true
 				break
 			}
+		}
+		if !matched {
+			delete(b.params)
 		}
 	}
 }
 
-// Check if an import alias (e.g. `time.`) is referenced in any behavior parameter type or default.
+// Check if an import alias (e.g. `time.`) is referenced in any behavior parameter, default, or return type.
 is_import_referenced :: proc(mod: ^Module_Spec, alias: string) -> bool {
 	prefix := fmt.tprintf("%s.", alias)
 	for a in mod.actors {
 		for b in a.behaviors {
+			if strings.contains(b.return_type, prefix) {
+				return true
+			}
 			for p in b.params {
 				if strings.contains(p.type_expr, prefix) || strings.contains(p.default_expr, prefix) {
 					return true
@@ -332,12 +371,12 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 	}
 	fmt.sbprintln(&sb)
 
-	// Track shared `be_<short_name>` and `send_<short_name>` overload groups across all actors
 	Group_Entry :: struct {
 		name:  string,
 		procs: [dynamic]string,
 	}
-	overload_groups := make([dynamic]Group_Entry, context.temp_allocator)
+	send_groups := make([dynamic]Group_Entry, context.temp_allocator)
+	call_groups := make([dynamic]Group_Entry, context.temp_allocator)
 
 	add_to_group :: proc(groups: ^[dynamic]Group_Entry, group_name: string, proc_sym: string) {
 		for &g in groups^ {
@@ -375,22 +414,49 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 			}
 		}
 
-		// 2. Tagged union & Actor / PID aliases
+		// 2. Tagged union, VTable (for `->` selector calls), and Actor / PID handles
 		fmt.sbprintf(&sb, "%s_Msg :: union {{\n", a.name)
 		for b in a.behaviors {
 			fmt.sbprintf(&sb, "\t%s_Msg_%s,\n", a.name, b.short_name)
 		}
 		fmt.sbprintln(&sb, "}\n")
 
-		fmt.sbprintf(&sb, "%s_Actor :: actor.Actor(%s, %s_Msg)\n", a.name, a.name, a.name)
-		fmt.sbprintf(&sb, "%s_PID   :: actor.PID(%s_Msg)\n\n", a.name, a.name)
+		fmt.sbprintf(&sb, "%s_VTable :: struct {{\n", a.name)
+		for b in a.behaviors {
+			param_sig_b := strings.builder_make(context.temp_allocator)
+			for p in b.params {
+				if len(p.default_expr) > 0 {
+					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p.name, p.type_expr, p.default_expr)
+				} else {
+					fmt.sbprintf(&param_sig_b, ", %s: %s", p.name, p.type_expr)
+				}
+			}
+			param_sig := strings.to_string(param_sig_b)
+			if len(b.return_type) > 0 {
+				fmt.sbprintf(&sb, "\t%s: proc(target: %s_Actor%s) -> %s,\n", b.short_name, a.name, param_sig, b.return_type)
+			} else {
+				fmt.sbprintf(&sb, "\t%s: proc(target: %s_Actor%s),\n", b.short_name, a.name, param_sig)
+			}
+		}
+		fmt.sbprintln(&sb, "}\n")
+
+		fmt.sbprintf(&sb, "%s_Actor :: struct {{\n", a.name)
+		fmt.sbprintf(&sb, "\tusing raw:    ^actor.Actor(%s, %s_Msg),\n", a.name, a.name)
+		fmt.sbprintf(&sb, "\tusing vtable: ^%s_VTable,\n", a.name)
+		fmt.sbprintln(&sb, "}\n")
+
+		fmt.sbprintf(&sb, "%s_PID :: %s_Actor\n\n", a.name, a.name)
 
 		// 3. Generated `dispatch` procedure
 		fmt.sbprintf(&sb, "%s_dispatch :: proc(ctx: ^actor.Context, self: ^%s, msg: ^%s_Msg) {{\n", snake_actor, a.name, a.name)
 		fmt.sbprintln(&sb, "\tswitch m in msg^ {")
 		for b in a.behaviors {
 			fmt.sbprintf(&sb, "\tcase %s_Msg_%s:\n", a.name, b.short_name)
-			fmt.sbprintf(&sb, "\t\t%s(", b.proc_name)
+			if len(b.return_type) > 0 {
+				fmt.sbprintf(&sb, "\t\tres := %s(", b.proc_name)
+			} else {
+				fmt.sbprintf(&sb, "\t\t%s(", b.proc_name)
+			}
 			if b.takes_ctx {
 				fmt.sbprint(&sb, "ctx, self")
 			} else {
@@ -400,18 +466,107 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 				fmt.sbprintf(&sb, ", m.%s", p.name)
 			}
 			fmt.sbprintln(&sb, ")")
+			if len(b.return_type) > 0 {
+				fmt.sbprintln(&sb, "\t\tactor.reply(ctx, res)")
+			}
 		}
 		fmt.sbprintln(&sb, "\t}")
 		fmt.sbprintln(&sb, "}\n")
 
-		// 4. Generated `spawn_<actor>` constructors
+		// 4. Generated `send_<actor>_<behavior>` and `call_<actor>_<behavior>` procedures
+		for b in a.behaviors {
+			msg_struct_name := fmt.tprintf("%s_Msg_%s", a.name, b.short_name)
+
+			param_sig_b    := strings.builder_make(context.temp_allocator)
+			no_def_sig_b   := strings.builder_make(context.temp_allocator)
+			lit_init_b     := strings.builder_make(context.temp_allocator)
+			for p, idx in b.params {
+				if len(p.default_expr) > 0 {
+					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p.name, p.type_expr, p.default_expr)
+				} else {
+					fmt.sbprintf(&param_sig_b, ", %s: %s", p.name, p.type_expr)
+				}
+				fmt.sbprintf(&no_def_sig_b, ", %s: %s", p.name, p.type_expr)
+				if idx > 0 {
+					fmt.sbprint(&lit_init_b, ", ")
+				}
+				fmt.sbprintf(&lit_init_b, "%s = %s", p.name, p.name)
+			}
+			param_sig  := strings.to_string(param_sig_b)
+			no_def_sig := strings.to_string(no_def_sig_b)
+			lit_init   := strings.to_string(lit_init_b)
+
+			if len(b.return_type) > 0 {
+				// Behavior returns `-> Return_Type`:
+				// 1) `call_<actor>_<behavior>_actor` & `_raw` (synchronous request/reply)
+				call_actor_fn := fmt.tprintf("call_%s_%s_actor", snake_actor, b.short_name)
+				call_pid_fn   := fmt.tprintf("call_%s_%s_pid", snake_actor, b.short_name)
+
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_Actor%s) -> %s {{\n", call_actor_fn, a.name, param_sig, b.return_type)
+				fmt.sbprintf(&sb, "\treturn actor.call(target.raw, %s_Msg(%s{{%s}}), %s)\n", a.name, msg_struct_name, lit_init, b.return_type)
+				fmt.sbprintln(&sb, "}\n")
+
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: actor.PID(%s_Msg)%s) -> %s {{\n", call_pid_fn, a.name, param_sig, b.return_type)
+				fmt.sbprintf(&sb, "\treturn actor.call(target, %s_Msg(%s{{%s}}), %s)\n", a.name, msg_struct_name, lit_init, b.return_type)
+				fmt.sbprintln(&sb, "}\n")
+
+				add_to_group(&call_groups, b.short_name, call_actor_fn)
+				add_to_group(&call_groups, b.short_name, call_pid_fn)
+				if b.proc_name != b.short_name {
+					add_to_group(&call_groups, b.proc_name, call_actor_fn)
+					add_to_group(&call_groups, b.proc_name, call_pid_fn)
+				}
+
+				// 2) `send_<actor>_<behavior>_reply` (async forward of return value to a `reply_to` PID/Actor)
+				send_reply_fn := fmt.tprintf("send_%s_%s_reply", snake_actor, b.short_name)
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_Actor%s, reply_to: actor.PID(%s)) {{\n", send_reply_fn, a.name, no_def_sig, b.return_type)
+				fmt.sbprintf(&sb, "\tactor.send(target.raw, %s_Msg(%s{{%s}}), reply_to)\n", a.name, msg_struct_name, lit_init)
+				fmt.sbprintln(&sb, "}\n")
+
+				add_to_group(&send_groups, b.short_name, send_reply_fn)
+				if b.proc_name != b.short_name {
+					add_to_group(&send_groups, b.proc_name, send_reply_fn)
+				}
+			} else {
+				// 1-way fire-and-forget behavior (`send_<name>`)
+				actor_fn := fmt.tprintf("send_%s_%s_actor", snake_actor, b.short_name)
+				pid_fn   := fmt.tprintf("send_%s_%s_pid", snake_actor, b.short_name)
+
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_Actor%s) {{\n", actor_fn, a.name, param_sig)
+				fmt.sbprintf(&sb, "\tactor.send(target.raw, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
+				fmt.sbprintln(&sb, "}\n")
+
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: actor.PID(%s_Msg)%s) {{\n", pid_fn, a.name, param_sig)
+				fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
+				fmt.sbprintln(&sb, "}\n")
+
+				add_to_group(&send_groups, b.short_name, actor_fn)
+				add_to_group(&send_groups, b.short_name, pid_fn)
+				if b.proc_name != b.short_name {
+					add_to_group(&send_groups, b.proc_name, actor_fn)
+					add_to_group(&send_groups, b.proc_name, pid_fn)
+				}
+			}
+		}
+
+		// 5. Static VTable instance & `spawn_<actor>` constructors
+		fmt.sbprintf(&sb, "@(private)\n%s_vtable := %s_VTable{{\n", snake_actor, a.name)
+		for b in a.behaviors {
+			if len(b.return_type) > 0 {
+				fmt.sbprintf(&sb, "\t%s = call_%s_%s_actor,\n", b.short_name, snake_actor, b.short_name)
+			} else {
+				fmt.sbprintf(&sb, "\t%s = send_%s_%s_actor,\n", b.short_name, snake_actor, b.short_name)
+			}
+		}
+		fmt.sbprintln(&sb, "}\n")
+
 		fmt.sbprintf(&sb, "spawn_%s_auto :: proc(\n", snake_actor)
 		fmt.sbprintf(&sb, "\tinitial_state: %s = {{}},\n", a.name)
 		fmt.sbprintln(&sb, "\tid: u32 = 0,")
 		fmt.sbprintln(&sb, "\tallocator := context.allocator,")
-		fmt.sbprintf(&sb, ") -> ^%s_Actor {{\n", a.name)
+		fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
 		fmt.sbprintf(&sb, "\ta, _ := actor.spawn(initial_state, %s_dispatch, id, allocator)\n", snake_actor)
-		fmt.sbprintln(&sb, "\treturn a")
+		fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 		fmt.sbprintln(&sb, "}\n")
 
 		fmt.sbprintf(&sb, "spawn_%s_sched :: proc(\n", snake_actor)
@@ -419,70 +574,38 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		fmt.sbprintf(&sb, "\tinitial_state: %s = {{}},\n", a.name)
 		fmt.sbprintln(&sb, "\tid: u32 = 0,")
 		fmt.sbprintln(&sb, "\tallocator := context.allocator,")
-		fmt.sbprintf(&sb, ") -> ^%s_Actor {{\n", a.name)
+		fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
 		fmt.sbprintf(&sb, "\ta, _ := actor.spawn(s, initial_state, %s_dispatch, id, allocator)\n", snake_actor)
-		fmt.sbprintln(&sb, "\treturn a")
+		fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 		fmt.sbprintln(&sb, "}\n")
 
 		fmt.sbprintf(&sb, "spawn_%s :: proc {{\n", snake_actor)
 		fmt.sbprintf(&sb, "\tspawn_%s_auto,\n", snake_actor)
 		fmt.sbprintf(&sb, "\tspawn_%s_sched,\n", snake_actor)
 		fmt.sbprintln(&sb, "}\n")
-
-		// 5. Generated actor-scoped send procedures (collision-free across files & actors)
-		for b in a.behaviors {
-			msg_struct_name := fmt.tprintf("%s_Msg_%s", a.name, b.short_name)
-
-			param_sig_b := strings.builder_make(context.temp_allocator)
-			lit_init_b  := strings.builder_make(context.temp_allocator)
-			for p, idx in b.params {
-				if len(p.default_expr) > 0 {
-					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p.name, p.type_expr, p.default_expr)
-				} else {
-					fmt.sbprintf(&param_sig_b, ", %s: %s", p.name, p.type_expr)
-				}
-				if idx > 0 {
-					fmt.sbprint(&lit_init_b, ", ")
-				}
-				fmt.sbprintf(&lit_init_b, "%s = %s", p.name, p.name)
-			}
-			param_sig := strings.to_string(param_sig_b)
-			lit_init  := strings.to_string(lit_init_b)
-
-			actor_fn := fmt.tprintf("send_%s_%s_actor", snake_actor, b.short_name)
-			pid_fn   := fmt.tprintf("send_%s_%s_pid", snake_actor, b.short_name)
-
-			fmt.sbprintf(&sb, "%s :: #force_inline proc(target: ^%s_Actor%s) {{\n", actor_fn, a.name, param_sig)
-			fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
-			fmt.sbprintln(&sb, "}\n")
-
-			fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_PID%s) {{\n", pid_fn, a.name, param_sig)
-			fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
-			fmt.sbprintln(&sb, "}\n")
-
-			add_to_group(&overload_groups, b.short_name, actor_fn)
-			add_to_group(&overload_groups, b.short_name, pid_fn)
-			if b.proc_name != b.short_name {
-				add_to_group(&overload_groups, b.proc_name, actor_fn)
-				add_to_group(&overload_groups, b.proc_name, pid_fn)
-			}
-		}
 	}
 
-	// 6. Emit unified `send_<behavior>` and `be_<behavior>` procedure overload groups
-	if len(overload_groups) > 0 {
+	// 6. Emit unified `send_<behavior>` and `call_<behavior>` procedure overload groups
+	if len(send_groups) > 0 || len(call_groups) > 0 {
 		fmt.sbprintln(&sb, "// =============================================================================")
-		fmt.sbprintln(&sb, "// Unified Behavior Overload Groups (`be_<behavior>` & `send_<behavior>`)")
+		fmt.sbprintln(&sb, "// Unified Behavior Overload Groups (`send_<behavior>` & `call_<behavior>`)")
 		fmt.sbprintln(&sb, "// =============================================================================")
 		fmt.sbprintln(&sb)
 
-		for g in overload_groups {
+		for g in send_groups {
 			fmt.sbprintf(&sb, "send_%s :: proc {{\n", g.name)
 			for fn_name in g.procs {
 				fmt.sbprintf(&sb, "\t%s,\n", fn_name)
 			}
 			fmt.sbprintln(&sb, "}\n")
-			fmt.sbprintf(&sb, "be_%s :: send_%s\n\n", g.name, g.name)
+		}
+
+		for g in call_groups {
+			fmt.sbprintf(&sb, "call_%s :: proc {{\n", g.name)
+			for fn_name in g.procs {
+				fmt.sbprintf(&sb, "\t%s,\n", fn_name)
+			}
+			fmt.sbprintln(&sb, "}\n")
 		}
 	}
 
@@ -515,6 +638,7 @@ generate_from_sources :: proc(
 	for src, idx in sources {
 		fname := filenames[idx] if idx < len(filenames) else "input.odin"
 		if !parse_source_into_spec(src, fname, &mod, &pending) {
+			for b in pending do delete(b.params)
 			return "", false
 		}
 	}
@@ -523,7 +647,7 @@ generate_from_sources :: proc(
 }
 
 // Scan a directory of `.odin` files (skipping `*_gen.odin`), parse all `@(actor)`
-// and `@(behavior)` declarations across all files in the package, and write `<dir>/actors_gen.odin`.
+// and behavior declarations across all files in the package, and write `<dir>/actors_gen.odin`.
 generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.odin") -> (out_path: string, ok: bool) {
 	f, err := os.open(dir_path)
 	if err != nil do return "", false
@@ -533,7 +657,6 @@ generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.
 	if rerr != nil do return "", false
 	defer os.file_info_slice_delete(entries, context.allocator)
 
-	// Sort filenames deterministically
 	filenames := make([dynamic]string)
 	defer delete(filenames)
 	for entry in entries {
@@ -564,9 +687,13 @@ generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.
 	for name in filenames {
 		full, _ := filepath.join({dir_path, name}, context.temp_allocator)
 		data, read_err := os.read_entire_file(full, context.allocator)
-		if read_err != nil do return "", false
+		if read_err != nil {
+			for b in pending do delete(b.params)
+			return "", false
+		}
 		append(&file_buffers, data)
 		if !parse_source_into_spec(string(data), full, &mod, &pending) {
+			for b in pending do delete(b.params)
 			return "", false
 		}
 	}

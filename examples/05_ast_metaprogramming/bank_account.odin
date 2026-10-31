@@ -7,16 +7,21 @@ Bank_Account :: struct {
 	tx_count: int,
 }
 
-@(behavior)
+// 1-way fire-and-forget behavior (`account->deposit(...)` / `send_deposit(account, ...)`)
 deposit :: proc(self: ^Bank_Account, amount: i64, memo: string = "deposit") {
 	self.balance  += amount
 	self.tx_count += 1
 }
 
-@(behavior)
+// 1-way fire-and-forget behavior (`account->withdraw(...)` / `send_withdraw(account, ...)`)
 withdraw :: proc(self: ^Bank_Account, amount: i64) {
 	self.balance  -= amount
 	self.tx_count += 1
+}
+
+// Request/Reply behavior returning `i64` (`account->get_balance()` / `call_get_balance(account)`)
+get_balance :: proc(self: ^Bank_Account) -> i64 {
+	return self.balance
 }
 
 @(behavior="reset")
@@ -25,8 +30,7 @@ account_reset :: proc(self: ^Bank_Account) {
 	self.tx_count = 0
 }
 
-@(behavior)
-audit_snapshot :: proc(self: ^Bank_Account, logger: Audit_Logger_PID) {
-	// Call a Pony-style behavior on `Audit_Logger` (defined in `audit_logger.odin`)!
-	be_record_snapshot(logger, self.owner, self.balance, self.tx_count)
+audit_snapshot :: proc(self: ^Bank_Account, logger: Audit_Logger_Actor) {
+	// Call `Audit_Logger` using `->` method syntax (or `send_record_snapshot(logger, ...)`)
+	logger->record_snapshot(self.owner, self.balance, self.tx_count)
 }

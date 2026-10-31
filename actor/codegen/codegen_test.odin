@@ -5,6 +5,7 @@ import "core:testing"
 
 @(test)
 test_01_ast_codegen_parses_actor_and_behaviors :: proc(t: ^testing.T) {
+	// Notice: `@(behavior)` is completely optional once a struct is marked `@(actor)`!
 	sample_src :: `
 package demo
 
@@ -16,19 +17,16 @@ Bank_Account :: struct {
 	balance: i64,
 }
 
-@(behavior)
 deposit :: proc(self: ^Bank_Account, amount: i64, memo: string = "cash") {
 	self.balance += amount
 }
 
-@(behavior)
 reset_balance :: proc(self: ^Bank_Account) {
 	self.balance = 0
 }
 
-@(behavior)
-query_balance :: proc(ctx: ^actor.Context, self: ^Bank_Account, reply_to: actor.PID(i64)) {
-	actor.send(ctx, reply_to, self.balance)
+get_balance :: proc(self: ^Bank_Account) -> i64 {
+	return self.balance
 }
 `
 
@@ -39,18 +37,23 @@ query_balance :: proc(ctx: ^actor.Context, self: ^Bank_Account, reply_to: actor.
 	testing.expect(t, strings.contains(generated, "package demo"))
 	testing.expect(t, strings.contains(generated, "Bank_Account_Msg_deposit :: struct"))
 	testing.expect(t, strings.contains(generated, "Bank_Account_Msg_reset_balance :: struct {}"))
+	testing.expect(t, strings.contains(generated, "Bank_Account_Msg_get_balance :: struct {}"))
 	testing.expect(t, strings.contains(generated, "Bank_Account_Msg :: union"))
-	testing.expect(t, strings.contains(generated, "Bank_Account_Actor :: actor.Actor(Bank_Account, Bank_Account_Msg)"))
-	testing.expect(t, strings.contains(generated, "Bank_Account_PID   :: actor.PID(Bank_Account_Msg)"))
+	testing.expect(t, strings.contains(generated, "Bank_Account_VTable :: struct"))
+	testing.expect(t, strings.contains(generated, "Bank_Account_Actor :: struct"))
+	testing.expect(t, strings.contains(generated, "Bank_Account_PID :: Bank_Account_Actor"))
 	testing.expect(t, strings.contains(generated, "bank_account_dispatch :: proc(ctx: ^actor.Context, self: ^Bank_Account, msg: ^Bank_Account_Msg)"))
 	testing.expect(t, strings.contains(generated, "deposit(self, m.amount, m.memo)"))
 	testing.expect(t, strings.contains(generated, "reset_balance(self)"))
-	testing.expect(t, strings.contains(generated, "query_balance(ctx, self, m.reply_to)"))
+	testing.expect(t, strings.contains(generated, "res := get_balance(self)"))
+	testing.expect(t, strings.contains(generated, "actor.reply(ctx, res)"))
 	testing.expect(t, strings.contains(generated, "spawn_bank_account :: proc"))
-	testing.expect(t, strings.contains(generated, "send_bank_account_deposit_actor :: #force_inline proc(target: ^Bank_Account_Actor, amount: i64, memo: string = \"cash\")"))
-	testing.expect(t, strings.contains(generated, "be_deposit :: send_deposit"))
-	testing.expect(t, strings.contains(generated, "be_reset_balance :: send_reset_balance"))
-	testing.expect(t, strings.contains(generated, "be_query_balance :: send_query_balance"))
+	testing.expect(t, strings.contains(generated, "send_bank_account_deposit_actor :: #force_inline proc(target: Bank_Account_Actor, amount: i64, memo: string = \"cash\")"))
+	testing.expect(t, strings.contains(generated, "call_bank_account_get_balance_actor :: #force_inline proc(target: Bank_Account_Actor) -> i64"))
+	testing.expect(t, strings.contains(generated, "send_deposit :: proc {"))
+	testing.expect(t, strings.contains(generated, "send_reset_balance :: proc {"))
+	testing.expect(t, strings.contains(generated, "call_get_balance :: proc {"))
+	testing.expect(t, strings.contains(generated, "send_get_balance :: proc {"))
 }
 
 @(test)
@@ -74,7 +77,6 @@ package banking
 
 import "core:time"
 
-@(behavior)
 deposit :: proc(self: ^Bank_Account, amount: i64) {
 	self.balance += amount
 }
@@ -89,7 +91,6 @@ Audit_Timer :: struct {
 	interval: time.Duration,
 }
 
-@(behavior)
 set_interval :: proc(self: ^Audit_Timer, d: time.Duration) {
 	self.interval = d
 }
@@ -109,8 +110,8 @@ timer_reset :: proc(self: ^Audit_Timer) {
 	// 2. `Bank_Account` in File 1 matched `deposit` and `account_reset` from File 2
 	testing.expect(t, strings.contains(generated, "Bank_Account_Msg_deposit :: struct"))
 	testing.expect(t, strings.contains(generated, "Bank_Account_Msg_reset :: struct {}"))
-	// 3. Both actors' `reset` behaviors are merged into a single `send_reset` / `be_reset` overload group!
+	// 3. Both actors' `reset` behaviors are merged into a single `send_reset` overload group!
 	testing.expect(t, strings.contains(generated, "send_bank_account_reset_actor"))
 	testing.expect(t, strings.contains(generated, "send_audit_timer_reset_actor"))
-	testing.expect(t, strings.contains(generated, "be_reset :: send_reset"))
+	testing.expect(t, strings.contains(generated, "send_reset :: proc {"))
 }

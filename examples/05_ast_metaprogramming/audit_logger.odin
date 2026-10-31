@@ -1,6 +1,5 @@
 package main
 
-import "../../actor"
 import "core:fmt"
 
 @(actor)
@@ -9,13 +8,15 @@ Audit_Logger :: struct {
 	last_balance:   i64,
 }
 
-@(behavior)
 record_snapshot :: proc(self: ^Audit_Logger, owner: string, balance: i64, tx_count: int) {
 	self.entries_logged += 1
 	self.last_balance    = balance
 	fmt.printfln("[Audit #%d] Account '%s' balance = $%d (after %d transactions)",
 		self.entries_logged, owner, balance, tx_count)
-	actor.complete_token()
+}
+
+get_entries_logged :: proc(self: ^Audit_Logger) -> int {
+	return self.entries_logged
 }
 
 @(behavior="reset")

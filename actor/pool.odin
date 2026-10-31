@@ -24,13 +24,16 @@ ENVELOPE_FLAG_NONE      :: u16(0)
 ENVELOPE_FLAG_FORWARDED :: u16(1 << 0) // Message was forwarded (`iso`); do not auto-recycle
 ENVELOPE_FLAG_STATIC    :: u16(1 << 1) // Pre-allocated static/stack token; do not recycle to pool
 ENVELOPE_FLAG_HEAP      :: u16(1 << 2) // Fallback heap-allocated node outside the contiguous slab
+ENVELOPE_FLAG_CALL      :: u16(1 << 3) // Synchronous `actor.call` waiting on `reply_slot` (`^Call_Slot(Res)`)
+ENVELOPE_FLAG_REPLY_PID :: u16(1 << 4) // Async `reply_to` `^Actor_Ref(Res)` stored in `reply_slot`
 
 // Intrusive message wrapper linking user payload `$Msg` inside an `MPSC_Queue`.
 Envelope :: struct($Msg: typeid) {
-	next:    ^Envelope(Msg), // Offset 0: Intrusive MPSC link
-	pool_id: u16,            // ID of the owning `Envelope_Pool` (0 .. MAX_POOLS-1)
-	flags:   u16,            // `ENVELOPE_FLAG_*`
-	msg:     Msg,            // User payload
+	next:       ^Envelope(Msg), // Offset 0: Intrusive MPSC link
+	pool_id:    u16,            // ID of the owning `Envelope_Pool` (0 .. MAX_POOLS-1)
+	flags:      u16,            // `ENVELOPE_FLAG_*`
+	reply_slot: rawptr,         // Optional `^Call_Slot(Res)` or `^Actor_Ref(Res)` for `actor.reply`
+	msg:        Msg,            // User payload
 }
 
 // Per-producer / per-worker message envelope pool with a contiguous primary slab

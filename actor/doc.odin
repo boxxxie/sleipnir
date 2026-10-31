@@ -93,4 +93,8 @@ send :: proc {
 	send_ambient_batch_pid,
 	send_ambient_envelope,
 	send_ambient_envelope_pid,
+	send_with_reply_actor_pid,
+	send_with_reply_pid_pid,
+	send_with_reply_actor_actor,
+	send_with_reply_pid_actor,
 }

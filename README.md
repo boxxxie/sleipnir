@@ -62,26 +62,32 @@ main :: proc() {
 
 ---
 
-### 2. Multi-Behavior Actors via Tagged `union` & `PID(Msg)`
+### 2. Multi-Behavior Actors, `actor.call` & `actor.reply`
 
-In Pony, an actor can define multiple `be` behaviors. In Sleipnir, pass a tagged `union` by value (`proc(self: ^State, msg: Msg)`) and use [`actor.PID(Msg)`](actor/actor.odin) (`actor.pid(a)`) to address actors without exposing their private `$State` type:
+Pass a tagged `union` by value (`proc(self: ^State, msg: Msg)`) for multi-behavior actors. Reply routing lives in the **`Envelope` header**, not inside your message structs—so `Get_Balance` needs zero `reply_to` fields and works identically with synchronous [`actor.call`](actor/actor.odin) or asynchronous [`actor.send(target, msg, reply_to)`](actor/actor.odin):
 
 ```odin
-Deposit  :: struct { amount: i64 }
-Withdraw :: struct { amount: i64 }
-Query    :: struct { reply_to: actor.PID(i64) }
+Deposit     :: struct { amount: i64 }
+Withdraw    :: struct { amount: i64 }
+Get_Balance :: struct {} // Clean payload — no `reply_to` needed!
 
-Account_Msg :: union { Deposit, Withdraw, Query }
+Account_Msg :: union { Deposit, Withdraw, Get_Balance }
 
 Bank_Account :: struct { balance: i64 }
 
 account_behavior :: proc(self: ^Bank_Account, msg: Account_Msg) {
     switch m in msg {
-    case Deposit:  self.balance += m.amount
-    case Withdraw: self.balance -= m.amount
-    case Query:    actor.send(m.reply_to, self.balance) // Ambient send inside handler!
+    case Deposit:     self.balance += m.amount
+    case Withdraw:    self.balance -= m.amount
+    case Get_Balance: actor.reply(self.balance) // Routes via the Envelope header!
     }
 }
+
+// 1. Synchronous request/reply (`actor.call`) — no callback actor or token tracking needed:
+balance := actor.call(account, Account_Msg(Get_Balance{}), i64)
+
+// 2. Asynchronous reply forwarding to another actor (`actor.send` with 3rd `reply_to` arg):
+actor.send(account, Account_Msg(Get_Balance{}), printer_pid)
 ```
 
 > See [`examples/04_ergonomic_dsl.odin`](examples/04_ergonomic_dsl.odin) for the complete runnable example (including `actor.spawn_self` compile-time structural typing).
@@ -196,17 +202,18 @@ assert(len(track.allocation_map) == 0) // Zero bytes leaked!
 
 ---
 
-### 7. Optional AST Metaprogramming (`@(actor)` & `@(behavior)`)
+### 7. Optional AST Metaprogramming (`@(actor)`)
 
-If you want Pony-style `be` behaviors without writing message structs, `union` definitions, or `switch` dispatchers by hand, Sleipnir includes an **optional** zero-dependency AST code generator ([`actor/codegen`](actor/codegen/codegen.odin) & [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin)) built on Odin's standard library (`core:odin/parser` + `core:odin/ast`).
+If you want ergonomic actor methods without writing message structs, `union` definitions, or `switch` dispatchers by hand, Sleipnir includes an **optional** zero-dependency AST code generator ([`actor/codegen`](actor/codegen/codegen.odin) & [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin)) built on Odin's standard library (`core:odin/parser` + `core:odin/ast`).
 
 #### What You Write:
 
-Annotate any struct with `@(actor)` and any procedure whose `self` parameter is `^Your_Actor` with `@(behavior)` (across a single file or split across multiple `.odin` files in the same package):
+Mark any struct with `@(actor)`. Any procedure in the package whose `self` parameter is `^Your_Actor` is **automatically discovered as a behavior**—no `@(behavior)` annotation required unless two actors share an overloaded behavior name (`@(behavior="reset")`):
 
 ```odin
 package main
 
+import "core:fmt"
 import "actor"
 
 @(actor)
@@ -216,45 +223,47 @@ Bank_Account :: struct {
     tx_count: int,
 }
 
-@(behavior)
+// 1-way fire-and-forget behaviors (no return value):
 deposit :: proc(self: ^Bank_Account, amount: i64, memo: string = "deposit") {
     self.balance  += amount
     self.tx_count += 1
 }
 
-@(behavior)
 withdraw :: proc(self: ^Bank_Account, amount: i64) {
     self.balance  -= amount
     self.tx_count += 1
 }
 
-// Multiple actors can share a behavior name (e.g. `be_reset`) via `@(behavior="reset")`:
-@(behavior="reset")
-account_reset :: proc(self: ^Bank_Account) {
-    self.balance  = 0
-    self.tx_count = 0
+// Request/reply behavior: just return a value (`-> i64`)!
+get_balance :: proc(self: ^Bank_Account) -> i64 {
+    return self.balance
 }
 
 main :: proc() {
     _ = actor.scoped_scheduler(num_workers = 2)
 
-    // `spawn_bank_account` and `be_*` / `send_*` are generated in `actors_gen.odin`:
     account := spawn_bank_account(Bank_Account{owner = "Sleipnir", balance = 500})
 
-    be_deposit(account, 250)            // Uses default `memo = "deposit"`
-    be_deposit(account, 100, "wire-in") // Explicit `memo`
-    be_withdraw(account, 175)
-    be_reset(account)
+    // Style A: Odin's built-in `->` method call syntax (supports default arguments!)
+    account->deposit(250)            // Asynchronous 1-way send (`memo = "deposit"`)
+    account->deposit(100, "wire-in") // Asynchronous 1-way send
+    account->withdraw(175)           // Asynchronous 1-way send
+    balance := account->get_balance() // Synchronous `actor.call` -> returns 675!
+
+    // Style B: `send_<name>` and `call_<name>` proc groups (also work across multiple actor types)
+    send_deposit(account, 25, "cashback")
+    balance = call_get_balance(account) // Returns 700!
+    fmt.println("Balance:", balance)
 }
 ```
 
 #### What `sleipnir_gen` Generates (`actors_gen.odin`):
 
-Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` files in the target package directory, matches every `@(behavior)` to its `@(actor)` by `self: ^Actor_Type`, forwards any cross-file `import` declarations used in parameter types, and writes `actors_gen.odin` containing:
-- Message structs (`Bank_Account_Msg_deposit`, `Bank_Account_Msg_withdraw`, `Bank_Account_Msg_reset`)
-- Tagged union (`Bank_Account_Msg`) and type aliases (`Bank_Account_Actor`, `Bank_Account_PID`)
+Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` files in the target package directory, matches every `proc(self: ^Actor_Type, ...)` to its `@(actor)` struct, forwards any cross-file `import` declarations used in parameter or return types, and writes `actors_gen.odin` containing:
+- Message structs (`Bank_Account_Msg_deposit`, `Bank_Account_Msg_withdraw`, `Bank_Account_Msg_get_balance`)
+- Tagged union (`Bank_Account_Msg`) and `<Actor>_VTable` + `<Actor>_Actor` handle (`using raw`, `using vtable`) enabling `account->method(...)` syntax
 - `bank_account_dispatch` procedure and `spawn_bank_account` constructor
-- Overloaded `be_<behavior>` and `send_<behavior>` proc groups (accepting both `^Bank_Account_Actor` and `Bank_Account_PID`)
+- Overloaded `send_<behavior>` (1-way async send + 2-way async `reply_to` forwarding) and `call_<behavior>` (synchronous request/reply) proc groups
 
 ```bash
 # 1. Generate `actors_gen.odin` for one or more package directories:
@@ -278,7 +287,8 @@ odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:spe
 | [`actor.Envelope_Pool(Msg)`](actor/pool.odin) | `snmalloc`-inspired batched envelope recycling pool (auto-managed per `Msg` or explicit). |
 | [`actor.Sharded_SPSC_Mailbox(T, N)`](actor/spsc.odin) | Wait-free cache-line-isolated SPSC ring lanes (`1.2 ns/msg`, zero atomic RMW instructions). |
 | [`actor.spawn`](actor/actor.odin) / [`actor.spawn_self`](actor/actor.odin) | Spawns an actor with 2-arg `(^State, ^Msg)`, 2-arg value `(^State, Msg)`, 3-arg `(^Context, ...)`, or embedded `receive` struct field. |
-| [`actor.send`](actor/doc.odin) | Sends a single `Msg` or batched `[]Msg` (`Chain=K`) using ambient context or explicit scheduler/pool. |
+| [`actor.send`](actor/doc.odin) | Sends a single `Msg`, batched `[]Msg` (`Chain=K`), or request with `reply_to` (`actor.send(target, msg, reply_to)`). |
+| [`actor.call`](actor/actor.odin) / [`actor.reply`](actor/actor.odin) | Envelope-header request/reply (`res := actor.call(target, msg, Res)` and `actor.reply(val)` inside handlers) with zero `reply_to` pollution in `Msg`. |
 | [`actor.forward`](actor/actor.odin) | Zero-copy `iso` forwarding of the currently executing message envelope (`actor.forward(pid)` or `actor.forward(pid, new_msg)`). |
 
 ---
