@@ -92,11 +92,28 @@ account_behavior :: proc(self: ^Bank_Account, msg: Account_Msg) {
 // 1. Synchronous request/reply (`actor.call`) — no callback actor or token tracking needed:
 balance := actor.call(account, Account_Msg(Get_Balance{}), i64)
 
-// 2. Asynchronous reply forwarding to another actor (`actor.send` with 3rd `reply_to` arg):
-actor.send(account, Account_Msg(Get_Balance{}), printer_pid)
+// 2. Asynchronous reply forwarding to another actor or PID (`actor.send` with 3rd `reply_to` arg):
+actor.send(account, Account_Msg(Get_Balance{}), printer) // Accepts `^Actor` or `actor.PID(i64)`!
 ```
 
-> See [`examples/04_ergonomic_dsl.odin`](examples/04_ergonomic_dsl.odin) for the complete runnable example (including `actor.spawn_self` compile-time structural typing).
+### 2b. Self-Contained Actors via Compile-Time Structural Typing (`actor.spawn_self`)
+
+Any struct that embeds a `receive: proc(self: ^State, msg: Msg)` field can be spawned directly via [`actor.spawn_self`](actor/actor.odin) (verified at compile time via `base:intrinsics.type_has_field`):
+
+```odin
+Balance_Printer :: struct {
+    last_printed: i64,
+    receive:      proc(self: ^Balance_Printer, balance: i64),
+}
+
+printer := actor.spawn_self(Balance_Printer{
+    receive = proc(self: ^Balance_Printer, balance: i64) {
+        self.last_printed = balance
+    },
+})
+```
+
+> See [`examples/04_ergonomic_dsl.odin`](examples/04_ergonomic_dsl.odin) for the complete runnable example.
 
 ---
 
@@ -256,27 +273,33 @@ main :: proc() {
     account->withdraw(175)           // Asynchronous 1-way send
     balance := account->get_balance() // Synchronous `actor.call` -> returns 675!
 
-    // Style B: `send_<name>` and `call_<name>` proc groups (also work across multiple actor types)
+    // Style B: `send_<name>` and `call_<name>` proc groups (accept `<Actor>_Actor` or `actor.PID`)
     send_deposit(account, 25, "cashback")
     balance = call_get_balance(account) // Returns 700!
     fmt.println("Balance:", balance)
+
+    // Style C: Async reply forwarding (`send_<name>(target, ..., reply_to_pid)`)
+    send_get_balance(account, actor.pid(printer))
 }
 ```
 
+> **Tip:** Need an internal helper procedure taking `self: ^Bank_Account` that shouldn't become a message? Mark it `@(private)` or `@(no_behavior)`. Need two actors in the same package to share a method name like `reset`? Name the procedures `account_reset` and `logger_reset` and mark both `@(behavior="reset")`—`sleipnir_gen` gives both a `->reset()` method and merges them into a unified `send_reset` overload group!
+
 #### What `sleipnir_gen` Generates (`actors_gen.odin`):
 
-Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` files in the target package directory, matches every `proc(self: ^Actor_Type, ...)` to its `@(actor)` struct, forwards any cross-file `import` declarations used in parameter or return types, and writes `actors_gen.odin` containing:
+Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` files in the target package directory, matches every `proc(self: ^Actor_Type, ...)` (or `proc(ctx: ^actor.Context, self: ^Actor_Type, ...)`) to its `@(actor)` struct, forwards any cross-file `import` declarations used in parameter or return types, and writes `actors_gen.odin` containing:
 - Message structs (`Bank_Account_Msg_deposit`, `Bank_Account_Msg_withdraw`, `Bank_Account_Msg_get_balance`)
-- Tagged union (`Bank_Account_Msg`) and `<Actor>_VTable` + `<Actor>_Actor` handle (`using raw`, `using vtable`) enabling `account->method(...)` syntax
-- `bank_account_dispatch` procedure and `spawn_bank_account` constructor
-- Overloaded `send_<behavior>` (1-way async send + 2-way async `reply_to` forwarding) and `call_<behavior>` (synchronous request/reply) proc groups
+- Tagged union (`Bank_Account_Msg`) and `<Actor>_VTable` + `<Actor>_Actor` / `<Actor>_PID` handle (`using raw`, `using vtable`) enabling `account->method(...)` syntax
+- `bank_account_dispatch` procedure and `spawn_bank_account` constructor (supporting both ambient and explicit `^actor.Scheduler`)
+- Overloaded `send_<behavior>` (1-way async send + 2-way async `reply_to` forwarding for both `<Actor>_Actor` and `actor.PID`) and `call_<behavior>` (synchronous request/reply) proc groups
 
 ```bash
 # 1. Generate `actors_gen.odin` for one or more package directories:
 odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
 
-# 2. Compile or run with Odin's `-custom-attribute` flag:
-odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
+# 2. Compile, test, or run with Odin's `-custom-attribute` flag:
+odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior
+odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior -o:speed
 ```
 
 > See the full [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md) and [`examples/05_ast_metaprogramming/`](examples/05_ast_metaprogramming/) ([`audit_logger.odin`](examples/05_ast_metaprogramming/audit_logger.odin), [`bank_account.odin`](examples/05_ast_metaprogramming/bank_account.odin), [`main.odin`](examples/05_ast_metaprogramming/main.odin), and generated [`actors_gen.odin`](examples/05_ast_metaprogramming/actors_gen.odin)) for a complete multi-file reference.
@@ -293,9 +316,11 @@ odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:spe
 | [`actor.Envelope_Pool(Msg)`](actor/pool.odin) | `snmalloc`-inspired batched envelope recycling pool (auto-managed per `Msg` or explicit). |
 | [`actor.Sharded_SPSC_Mailbox(T, N)`](actor/spsc.odin) | Wait-free cache-line-isolated SPSC ring lanes (`0.9–1.2 ns/msg`, zero atomic RMW instructions). |
 | [`actor.spawn`](actor/actor.odin) / [`actor.spawn_self`](actor/actor.odin) | Spawns an actor with 2-arg `(^State, ^Msg)`, 2-arg value `(^State, Msg)`, 3-arg `(^Context, ...)`, or embedded `receive` struct field. |
-| [`actor.send`](actor/doc.odin) | Sends a single `Msg`, batched `[]Msg` (`Chain=K`), or request with `reply_to` (`actor.send(target, msg, reply_to)`). |
-| [`actor.call`](actor/actor.odin) / [`actor.reply`](actor/actor.odin) | Envelope-header request/reply (`res := actor.call(target, msg, Res)` and `actor.reply(val)` inside handlers) with zero `reply_to` pollution in `Msg`. |
-| [`actor.forward`](actor/actor.odin) | Zero-copy `iso` forwarding of the currently executing message envelope (`actor.forward(pid)` or `actor.forward(pid, new_msg)`). |
+| [`actor.send`](actor/doc.odin) | Sends a single `Msg`, batched `[]Msg` (`Chain=K`), or request with `reply_to` (`actor.send(target, msg, reply_to)` where `reply_to` is `^Actor` or `PID`). |
+| [`actor.call`](actor/actor.odin) / [`actor.reply`](actor/actor.odin) | Envelope-header request/reply (`res := actor.call(target, msg, Res)` and `actor.reply(val)` inside handlers) with cooperative worker stepping and zero `reply_to` pollution in `Msg`. |
+| [`actor.forward`](actor/actor.odin) | Zero-copy `iso` forwarding of the currently executing message envelope (`actor.forward(target)` or `actor.forward(target, new_msg)`). |
+| [`actor.wait_idle`](actor/actor.odin) / [`actor.wait_messages`](actor/actor.odin) / [`actor.wait_tokens`](actor/actor.odin) | Ambient or explicit synchronization primitives for draining mailboxes, waiting on message counts, or awaiting `actor.complete_token()`. |
+| [`actor.init`](actor/doc.odin) / [`actor.destroy`](actor/doc.odin) | Unified lifecycle procedure overload groups for `Scheduler`, `Actor`, `Envelope_Pool`, `Watermark_Slab`, and `Sharded_SPSC_Mailbox`. |
 
 ---
 

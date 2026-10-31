@@ -26,7 +26,9 @@ Pony-style M:N Actor runtime and concurrency primitives for Odin.
 4. **Sharded Work-Stealing M:N Scheduler (`Scheduler`, `Actor($State, $Msg)`, & `PID($Msg)`)**:
    Multiplexes thousands of lightweight, strongly-typed `Actor($State, $Msg)` instances
    onto a configurable pool of OS worker threads. Supports heterogeneous actor types on
-   the same scheduler, zero-copy `iso` message forwarding (`actor.forward`), lock-free
+   the same scheduler, zero-copy `iso` message forwarding (`actor.forward`), envelope-header
+   synchronous and asynchronous request/reply (`actor.call` & `actor.reply` with cooperative
+   worker stepping), compile-time structural typing (`actor.spawn_self`), lock-free
    `.Seq_Cst` Dekker wake/unschedule barriers, optional adaptive 2-phase `sync.Futex`
    worker parking (`enable_parking = true`), single-line `scoped_scheduler` (`@(deferred_out)`),
    ambient thread-local context, and automatic per-message-type `Envelope_Pool` management.
