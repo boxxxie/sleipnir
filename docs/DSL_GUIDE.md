@@ -248,3 +248,9 @@ current := actor.call(account, Account_Msg(Get_Balance{}), i64)
 // Option B: Asynchronous reply forwarding (`actor.send` with 3rd `reply_to` argument)
 actor.send(account, Account_Msg(Get_Balance{}), printer_pid)
 ```
+
+---
+
+## Testing Your Actors (4-Layer ATDD Architecture)
+
+For patterns on testing both low-level `package actor` concurrency topologies and `@(actor)` AST metaprogramming behaviors with zero memory leaks, see the [**Sleipnir Testing & 4-Layer ATDD Architecture Guide (`tests/README.md`)**](../tests/README.md) (`odin test ./tests`).

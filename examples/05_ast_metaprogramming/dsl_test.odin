@@ -73,6 +73,7 @@ with_leak_check :: proc(t: ^testing.T, body: proc(t: ^testing.T)) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
+	defer free_all(context.temp_allocator)
 
 	saved_allocator := context.allocator
 	context.allocator = mem.tracking_allocator(&track)
