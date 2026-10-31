@@ -726,10 +726,135 @@ test_17_actor_call_and_envelope_reply :: proc(t: ^testing.T) {
 			async_total = receiver.state
 		}
 
-		testing.expect_value(t, sync_total, 42)
+			testing.expect_value(t, sync_total, 42)
 		testing.expect_value(t, async_total, 42)
 	})
 }
+
+// ============================================================================
+// TEST 18: Actor-to-Actor `actor.call` (Cooperative Worker Stepping) &
+//          All `send(..., reply_to)` / `spawn` Overloads
+// ============================================================================
+
+@(private = "file")
+Compute_Square :: struct {
+	x: i64,
+}
+
+@(private = "file")
+Orchestrator_Run :: struct {
+	worker_pid: PID(Compute_Square),
+	sink_actor: ^Actor(i64, i64),
+	input:      i64,
+}
+
+@(test)
+test_18_actor_to_actor_cooperative_call_and_reply_overloads :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		final_sink_val: i64 = 0
+		direct_actor_reply_val: i64 = 0
+		pid_actor_reply_val: i64 = 0
+		{
+			// Single worker thread (`num_workers = 1`): when `orchestrator` calls `call(worker_pid, ...)`
+			// from inside its handler on Worker 0, `call` MUST cooperatively step `math_worker`
+			// on Worker 0 or it would deadlock!
+			sched := scoped_scheduler(num_workers = 1)
+
+			// Spawn using 3-arg `(ctx: ^Context, state: ^State, msg: ^Msg)` overload (`spawn_sched_state_auto`)
+			math_worker := spawn(sched, i64(0), proc(ctx: ^Context, calls: ^i64, req: ^Compute_Square) {
+				calls^ += 1
+				reply(ctx, req.x * req.x)
+			})
+
+			sink := spawn(sched, i64(0), proc(state: ^i64, val: i64) {
+				state^ = val
+			})
+
+			orchestrator := spawn(sched, i64(0), proc(state: ^i64, cmd: Orchestrator_Run) {
+				// Nested synchronous `actor.call` from inside an actor handler on a 1-worker scheduler!
+				sq := call(cmd.worker_pid, Compute_Square{x = cmd.input}, i64)
+				state^ = sq + 10
+				send(cmd.sink_actor, state^)
+			})
+
+			send(orchestrator, Orchestrator_Run{
+				worker_pid = pid(math_worker),
+				sink_actor = sink,
+				input      = 9,
+			})
+
+			// Wait until `sink` receives `9*9 + 10 = 91`:
+			wait_messages(3)
+			wait_idle()
+			final_sink_val = sink.state
+
+			// Also test `send(actor, msg, reply_to_actor)` and `send(pid, msg, reply_to_actor)` overloads:
+			sink2 := spawn(i64(0), proc(state: ^i64, val: i64) { state^ = val })
+			sink3 := spawn(i64(0), proc(state: ^i64, val: i64) { state^ = val })
+
+			send(math_worker, Compute_Square{x = 7}, sink2)
+			send(pid(math_worker), Compute_Square{x = 11}, sink3)
+
+			wait_messages(7)
+			wait_idle()
+			direct_actor_reply_val = sink2.state
+			pid_actor_reply_val    = sink3.state
+		}
+
+		testing.expect_value(t, final_sink_val, 91)
+		testing.expect_value(t, direct_actor_reply_val, 49)
+		testing.expect_value(t, pid_actor_reply_val, 121)
+	})
+}
+
+// ============================================================================
+// TEST 19: Batch Send to `PID`, Value-Mutating `forward`, & Explicit `destroy`
+//          Inside `scoped_scheduler`
+// ============================================================================
+
+@(test)
+test_19_batch_send_pid_and_early_actor_destroy :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		sum_after_batch: i64 = 0
+		forwarded_val:   i64 = 0
+		{
+			_ = scoped_scheduler(num_workers = 2)
+
+			acc := spawn(i64(0), proc(total: ^i64, x: i64) {
+				total^ += x
+			})
+			acc_pid := pid(acc)
+
+			// 1. Ambient batch send to `PID(i64)` (`send_ambient_batch_pid`)
+			b1 := [3]i64{10, 20, 30}
+			send(acc_pid, b1[:])
+
+			// 2. Worker-context batch send to `PID(i64)` (`send_ctx_batch_pid`) and 2-arg `forward(pid, new_msg)`
+			forwarder := spawn(acc_pid, proc(target_pid: ^PID(i64), x: ^i64) {
+				b2 := [2]i64{100, 200}
+				send(target_pid^, b2[:])
+				// 2-arg ambient `forward(pid, updated_msg)`
+				forward(target_pid^, x^ * 10)
+			})
+			send(forwarder, i64(5))
+
+			wait_messages(6)
+			wait_idle()
+
+			sum_after_batch = acc.state
+			forwarded_val   = acc.state
+
+			// Explicitly destroy `forwarder` BEFORE `scoped_scheduler` exits to verify
+			// `actor_destroy` safely unregisters from `s.owned_actors` without double-free!
+			destroy(forwarder)
+		}
+
+		// 10 + 20 + 30 + 100 + 200 + (5 * 10) = 410
+		testing.expect_value(t, sum_after_batch, 410)
+		testing.expect_value(t, forwarded_val, 410)
+	})
+}
+
 
 
 

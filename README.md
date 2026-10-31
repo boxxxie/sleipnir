@@ -1,5 +1,8 @@
 # Sleipnir (`package actor`)
 
+[![CI](https://github.com/boxxxie/sleipnir/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/sleipnir/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 High-throughput, zero-GC, Pony-style actor runtime for [Odin](https://odin-lang.org/).
 
 Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N` thread scheduler, lock-free `Envelope_Pool` slab recycling, and a wait-free `Sharded_SPSC_Mailbox`—all integrated with Odin's `context.allocator` and ergonomic compile-time polymorphism.
@@ -16,10 +19,13 @@ Import `./actor` into your Odin project and run tests or examples:
 
 ```bash
 odin test ./actor
+odin test ./actor/codegen
+odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior
 odin run examples/01_ping_pong.odin -file -o:speed
 odin run examples/02_heterogeneous_pipeline.odin -file -o:speed
 odin run examples/03_sharded_spsc_mailbox.odin -file -o:speed
 odin run examples/04_ergonomic_dsl.odin -file -o:speed
+odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
 ```
 
 ---

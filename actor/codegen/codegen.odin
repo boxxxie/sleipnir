@@ -519,13 +519,21 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 				// 2) `send_<actor>_<behavior>_reply` (async forward of return value to a `reply_to` PID/Actor)
 				send_reply_fn := fmt.tprintf("send_%s_%s_reply", snake_actor, b.short_name)
+				send_reply_pid_fn := fmt.tprintf("send_%s_%s_reply_pid", snake_actor, b.short_name)
+
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_Actor%s, reply_to: actor.PID(%s)) {{\n", send_reply_fn, a.name, no_def_sig, b.return_type)
 				fmt.sbprintf(&sb, "\tactor.send(target.raw, %s_Msg(%s{{%s}}), reply_to)\n", a.name, msg_struct_name, lit_init)
 				fmt.sbprintln(&sb, "}\n")
 
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: actor.PID(%s_Msg)%s, reply_to: actor.PID(%s)) {{\n", send_reply_pid_fn, a.name, no_def_sig, b.return_type)
+				fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}), reply_to)\n", a.name, msg_struct_name, lit_init)
+				fmt.sbprintln(&sb, "}\n")
+
 				add_to_group(&send_groups, b.short_name, send_reply_fn)
+				add_to_group(&send_groups, b.short_name, send_reply_pid_fn)
 				if b.proc_name != b.short_name {
 					add_to_group(&send_groups, b.proc_name, send_reply_fn)
+					add_to_group(&send_groups, b.proc_name, send_reply_pid_fn)
 				}
 			} else {
 				// 1-way fire-and-forget behavior (`send_<name>`)

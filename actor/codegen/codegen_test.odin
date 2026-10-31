@@ -1,5 +1,6 @@
 package actor_codegen
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -115,3 +116,67 @@ timer_reset :: proc(self: ^Audit_Timer) {
 	testing.expect(t, strings.contains(generated, "send_audit_timer_reset_actor"))
 	testing.expect(t, strings.contains(generated, "send_reset :: proc {"))
 }
+
+@(test)
+test_03_ast_codegen_ctx_behaviors_and_private_no_behavior_exclusions :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	saved := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved
+		testing.expect_value(t, len(track.allocation_map), 0)
+		testing.expect_value(t, len(track.bad_free_array), 0)
+	}
+
+	sample_src :: `
+package worker_pkg
+
+import "../actor"
+
+@(actor)
+Worker_Node :: struct {
+	processed: int,
+}
+
+// 1. Behavior taking explicit (ctx: ^actor.Context, self: ^Worker_Node, ...)
+step_with_ctx :: proc(ctx: ^actor.Context, self: ^Worker_Node, delta: int) -> int {
+	self.processed += delta
+	return self.processed
+}
+
+// 2. Helper marked @(no_behavior) — MUST NOT generate a message struct or dispatch case!
+@(no_behavior)
+internal_helper :: proc(self: ^Worker_Node, x: int) {
+	self.processed += x
+}
+
+// 3. Helper marked @(private) — MUST NOT generate a message struct or dispatch case!
+@(private)
+private_helper :: proc(self: ^Worker_Node) {
+	self.processed = 0
+}
+
+// 4. Procedure for a non-actor struct — MUST be ignored and freed cleanly without leaking!
+Other_Struct :: struct { a: int }
+unrelated_proc :: proc(self: ^Other_Struct, v: int) {}
+`
+
+	generated, ok := generate_from_source(sample_src, "worker.odin")
+	defer delete(generated)
+
+	testing.expect(t, ok)
+	// Explicit `ctx` is passed as first argument in dispatcher:
+	testing.expect(t, strings.contains(generated, "res := step_with_ctx(ctx, self, m.delta)"))
+	testing.expect(t, strings.contains(generated, "actor.reply(ctx, res)"))
+	// Both `_reply` (for `Worker_Node_Actor`) and `_reply_pid` (for `actor.PID`) are generated:
+	testing.expect(t, strings.contains(generated, "send_worker_node_step_with_ctx_reply ::"))
+	testing.expect(t, strings.contains(generated, "send_worker_node_step_with_ctx_reply_pid ::"))
+	// Excluded helpers and non-actor procedures are NOT present:
+	testing.expect(t, !strings.contains(generated, "internal_helper"))
+	testing.expect(t, !strings.contains(generated, "private_helper"))
+	testing.expect(t, !strings.contains(generated, "Other_Struct"))
+	testing.expect(t, !strings.contains(generated, "unrelated_proc"))
+}
+
