@@ -64,7 +64,7 @@ call_audit_logger_get_entries_logged_pid :: #force_inline proc(target: actor.PID
 	return actor.call(target, Audit_Logger_Msg(Audit_Logger_Msg_get_entries_logged{}), int)
 }
 
-send_audit_logger_get_entries_logged_reply :: #force_inline proc(target: Audit_Logger_Actor, reply_to: actor.PID(int)) {
+send_audit_logger_get_entries_logged_reply_actor :: #force_inline proc(target: Audit_Logger_Actor, reply_to: actor.PID(int)) {
 	actor.send(target.raw, Audit_Logger_Msg(Audit_Logger_Msg_get_entries_logged{}), reply_to)
 }
 
@@ -195,7 +195,7 @@ call_bank_account_get_balance_pid :: #force_inline proc(target: actor.PID(Bank_A
 	return actor.call(target, Bank_Account_Msg(Bank_Account_Msg_get_balance{}), i64)
 }
 
-send_bank_account_get_balance_reply :: #force_inline proc(target: Bank_Account_Actor, reply_to: actor.PID(i64)) {
+send_bank_account_get_balance_reply_actor :: #force_inline proc(target: Bank_Account_Actor, reply_to: actor.PID(i64)) {
 	actor.send(target.raw, Bank_Account_Msg(Bank_Account_Msg_get_balance{}), reply_to)
 }
 
@@ -262,7 +262,7 @@ send_record_snapshot :: proc {
 }
 
 send_get_entries_logged :: proc {
-	send_audit_logger_get_entries_logged_reply,
+	send_audit_logger_get_entries_logged_reply_actor,
 	send_audit_logger_get_entries_logged_reply_pid,
 }
 
@@ -289,7 +289,7 @@ send_withdraw :: proc {
 }
 
 send_get_balance :: proc {
-	send_bank_account_get_balance_reply,
+	send_bank_account_get_balance_reply_actor,
 	send_bank_account_get_balance_reply_pid,
 }
 

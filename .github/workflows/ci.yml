@@ -42,6 +42,7 @@ jobs:
         run: |
           odin test ./actor/codegen
           odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
+          git diff --exit-code examples/05_ast_metaprogramming/actors_gen.odin
           odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior
           odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
 

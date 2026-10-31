@@ -89,7 +89,7 @@ get_balance :: proc(self: ^Bank_Account) -> i64 {
 Under the hood, `sleipnir_gen` generates:
 1. A clean zero-field message struct (`Bank_Account_Msg_get_balance :: struct {}`).
 2. Dispatcher code that calls `res := get_balance(self)` and passes `res` to `actor.reply(ctx, res)`, which routes the return value through the **message `Envelope` header** (`reply_slot`).
-3. Both **synchronous** (`account->get_balance()` / `call_get_balance(account) -> i64`) and **asynchronous** (`send_get_balance(account, reply_to_pid)`) callers!
+3. Both **synchronous** (`account->get_balance()` / `call_get_balance(target) -> i64`) and **asynchronous** (`send_get_balance(target, reply_to_pid)`) callers accepting either `Bank_Account_Actor` or `actor.PID(Bank_Account_Msg)`!
 
 ---
 
@@ -123,11 +123,13 @@ send_deposit(account, 250)
 send_deposit(account, 100, "wire-in")
 send_withdraw(account, 175)
 
-// Synchronous request/reply call:
+// Synchronous request/reply call (accepts `Bank_Account_Actor` or `actor.PID(Bank_Account_Msg)`):
 balance := call_get_balance(account)
+balance  = call_get_balance(actor.pid(account.raw))
 
-// Asynchronous request/reply forwarding (sends reply `i64` to `printer_actor` instead of blocking):
+// Asynchronous request/reply forwarding (accepts `Bank_Account_Actor` or `actor.PID(Bank_Account_Msg)`):
 send_get_balance(account, actor.pid(printer_actor))
+send_get_balance(actor.pid(account.raw), actor.pid(printer_actor))
 ```
 
 ---

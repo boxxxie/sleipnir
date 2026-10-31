@@ -726,14 +726,81 @@ test_17_actor_call_and_envelope_reply :: proc(t: ^testing.T) {
 			async_total = receiver.state
 		}
 
-			testing.expect_value(t, sync_total, 42)
+		testing.expect_value(t, sync_total, 42)
 		testing.expect_value(t, async_total, 42)
 	})
 }
 
 // ============================================================================
-// TEST 18: Actor-to-Actor `actor.call` (Cooperative Worker Stepping) &
-//          All `send(..., reply_to)` / `spawn` Overloads
+// Layer 1: Low-Level Runtime Specifications (Tests 18 & 19)
+// ============================================================================
+
+@(test)
+test_18_actor_to_actor_cooperative_call_and_reply_overloads :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// Single worker thread (`num_workers = 1`): nested `call` inside a handler
+		// on Worker 0 must cooperatively step `math_worker` without deadlocking.
+		rt := runtime_scenario(t, scoped_scheduler(num_workers = 1))
+
+		math_worker  := given_square_reply_worker(&rt)
+		orchestrator := given_square_orchestrator(&rt)
+		sink         := given_probe(&rt, i64)
+
+		// 1. Cooperative actor-to-actor synchronous `call`: (9 * 9) + 10 = 91 (3 messages)
+		upon_orchestrating_square(orchestrator,
+			worker = pid(math_worker),
+			sink   = sink,
+			input  = 9,
+			addend = 10,
+		)
+		then_actor_state_is(&rt, sink, 91, messages = 3)
+
+		// 2. Async `send(..., reply_to)` overloads for both Actor handle and PID (2 messages each):
+		then_async_reply_resolves(&rt, math_worker,
+			req      = Compute_Square{x = 7},
+			expected = 49,
+			via      = .Actor_Handle,
+		)
+		then_async_reply_resolves(&rt, math_worker,
+			req      = Compute_Square{x = 11},
+			expected = 121,
+			via      = .PID,
+		)
+
+		// Verify `math_worker` state incremented across all 3 requests:
+		then_actor_state_is(&rt, math_worker, 3)
+	})
+}
+
+@(test)
+test_19_batch_send_pid_and_early_actor_destroy :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		rt := runtime_scenario(t, scoped_scheduler(num_workers = 2))
+
+		acc       := given_accumulator(initial = i64(0))
+		forwarder := given_batch_and_value_forwarder(
+			target     = pid(acc),
+			batch      = {100, 200},
+			multiplier = 10,
+		)
+
+		// 1. Ambient batch send to `PID(i64)` (`send_ambient_batch_pid`): 10 + 20 + 30 = 60 (3 messages)
+		upon_sending_batch_to_pid(pid(acc), 10, 20, 30)
+		then_actor_state_is(&rt, acc, 60, messages = 3)
+
+		// 2. Worker-context batch send to `PID(i64)` (`send_ctx_batch_pid`) +
+		//    2-arg ambient `forward(pid, updated_msg)`: 60 + 100 + 200 + (5 * 10) = 410 (4 messages)
+		upon_sending(forwarder, i64(5))
+		then_actor_state_is(&rt, acc, 410, messages = 4)
+
+		// 3. Explicit early destruction before `scoped_scheduler` exits must
+		//    unregister from `s.owned_actors` without double-free on scope exit:
+		upon_destroying_early(forwarder)
+	})
+}
+
+// ============================================================================
+// Layer 2: Scenario-Specific Fixtures (Tests 18 & 19)
 // ============================================================================
 
 @(private = "file")
@@ -746,115 +813,153 @@ Orchestrator_Run :: struct {
 	worker_pid: PID(Compute_Square),
 	sink_actor: ^Actor(i64, i64),
 	input:      i64,
+	addend:     i64,
 }
 
-@(test)
-test_18_actor_to_actor_cooperative_call_and_reply_overloads :: proc(t: ^testing.T) {
-	with_leak_check(t, proc(t: ^testing.T) {
-		final_sink_val: i64 = 0
-		direct_actor_reply_val: i64 = 0
-		pid_actor_reply_val: i64 = 0
-		{
-			// Single worker thread (`num_workers = 1`): when `orchestrator` calls `call(worker_pid, ...)`
-			// from inside its handler on Worker 0, `call` MUST cooperatively step `math_worker`
-			// on Worker 0 or it would deadlock!
-			sched := scoped_scheduler(num_workers = 1)
+@(private = "file")
+Forwarder_State :: struct {
+	target_pid: PID(i64),
+	batch:      [2]i64,
+	multiplier: i64,
+}
 
-			// Spawn using 3-arg `(ctx: ^Context, state: ^State, msg: ^Msg)` overload (`spawn_sched_state_auto`)
-			math_worker := spawn(sched, i64(0), proc(ctx: ^Context, calls: ^i64, req: ^Compute_Square) {
-				calls^ += 1
-				reply(ctx, req.x * req.x)
-			})
+// Exercises 3-arg `(ctx: ^Context, state: ^State, msg: ^Msg)` overload (`spawn_sched_state_auto`):
+@(private = "file")
+given_square_reply_worker :: proc(rt: ^Runtime_Spec) -> ^Actor(i64, Compute_Square) {
+	return spawn(rt.sched, i64(0), proc(ctx: ^Context, calls: ^i64, req: ^Compute_Square) {
+		calls^ += 1
+		reply(ctx, req.x * req.x)
+	})
+}
 
-			sink := spawn(sched, i64(0), proc(state: ^i64, val: i64) {
-				state^ = val
-			})
+@(private = "file")
+given_square_orchestrator :: proc(rt: ^Runtime_Spec) -> ^Actor(i64, Orchestrator_Run) {
+	return spawn(rt.sched, i64(0), proc(state: ^i64, cmd: Orchestrator_Run) {
+		sq := call(cmd.worker_pid, Compute_Square{x = cmd.input}, i64)
+		state^ = sq + cmd.addend
+		send(cmd.sink_actor, state^)
+	})
+}
 
-			orchestrator := spawn(sched, i64(0), proc(state: ^i64, cmd: Orchestrator_Run) {
-				// Nested synchronous `actor.call` from inside an actor handler on a 1-worker scheduler!
-				sq := call(cmd.worker_pid, Compute_Square{x = cmd.input}, i64)
-				state^ = sq + 10
-				send(cmd.sink_actor, state^)
-			})
+// Preserves `i64` as the incoming message type so `forward(s.target_pid, ...)`
+// exercises the exact same `i64 -> PID(i64)` envelope forwarding path:
+@(private = "file")
+given_batch_and_value_forwarder :: proc(
+	target:     PID(i64),
+	batch:      [2]i64,
+	multiplier: i64,
+) -> ^Actor(Forwarder_State, i64) {
+	init_state := Forwarder_State{
+		target_pid = target,
+		batch      = batch,
+		multiplier = multiplier,
+	}
+	return spawn(init_state, proc(s: ^Forwarder_State, x: ^i64) {
+		b := s.batch
+		send(s.target_pid, b[:])
+		forward(s.target_pid, x^ * s.multiplier)
+	})
+}
 
-			send(orchestrator, Orchestrator_Run{
-				worker_pid = pid(math_worker),
-				sink_actor = sink,
-				input      = 9,
-			})
-
-			// Wait until `sink` receives `9*9 + 10 = 91`:
-			wait_messages(3)
-			wait_idle()
-			final_sink_val = sink.state
-
-			// Also test `send(actor, msg, reply_to_actor)` and `send(pid, msg, reply_to_actor)` overloads:
-			sink2 := spawn(i64(0), proc(state: ^i64, val: i64) { state^ = val })
-			sink3 := spawn(i64(0), proc(state: ^i64, val: i64) { state^ = val })
-
-			send(math_worker, Compute_Square{x = 7}, sink2)
-			send(pid(math_worker), Compute_Square{x = 11}, sink3)
-
-			wait_messages(7)
-			wait_idle()
-			direct_actor_reply_val = sink2.state
-			pid_actor_reply_val    = sink3.state
-		}
-
-		testing.expect_value(t, final_sink_val, 91)
-		testing.expect_value(t, direct_actor_reply_val, 49)
-		testing.expect_value(t, pid_actor_reply_val, 121)
+@(private = "file")
+upon_orchestrating_square :: proc(
+	orchestrator: ^Actor(i64, Orchestrator_Run),
+	worker:       PID(Compute_Square),
+	sink:         ^Actor(i64, i64),
+	input:        i64,
+	addend:       i64,
+) {
+	send(orchestrator, Orchestrator_Run{
+		worker_pid = worker,
+		sink_actor = sink,
+		input      = input,
+		addend     = addend,
 	})
 }
 
 // ============================================================================
-// TEST 19: Batch Send to `PID`, Value-Mutating `forward`, & Explicit `destroy`
-//          Inside `scoped_scheduler`
+// Layer 3: Reusable Suite-Wide Concurrency Protocol Driver
 // ============================================================================
 
-@(test)
-test_19_batch_send_pid_and_early_actor_destroy :: proc(t: ^testing.T) {
-	with_leak_check(t, proc(t: ^testing.T) {
-		sum_after_batch: i64 = 0
-		forwarded_val:   i64 = 0
-		{
-			_ = scoped_scheduler(num_workers = 2)
+@(private = "file")
+Addressing_Mode :: enum {
+	Actor_Handle,
+	PID,
+}
 
-			acc := spawn(i64(0), proc(total: ^i64, x: i64) {
-				total^ += x
-			})
-			acc_pid := pid(acc)
+@(private = "file")
+Runtime_Spec :: struct {
+	t:          ^testing.T,
+	sched:      ^Scheduler,
+	total_msgs: i64,
+}
 
-			// 1. Ambient batch send to `PID(i64)` (`send_ambient_batch_pid`)
-			b1 := [3]i64{10, 20, 30}
-			send(acc_pid, b1[:])
+@(private = "file")
+runtime_scenario :: proc(t: ^testing.T, sched: ^Scheduler) -> Runtime_Spec {
+	return Runtime_Spec{t = t, sched = sched}
+}
 
-			// 2. Worker-context batch send to `PID(i64)` (`send_ctx_batch_pid`) and 2-arg `forward(pid, new_msg)`
-			forwarder := spawn(acc_pid, proc(target_pid: ^PID(i64), x: ^i64) {
-				b2 := [2]i64{100, 200}
-				send(target_pid^, b2[:])
-				// 2-arg ambient `forward(pid, updated_msg)`
-				forward(target_pid^, x^ * 10)
-			})
-			send(forwarder, i64(5))
-
-			wait_messages(6)
-			wait_idle()
-
-			sum_after_batch = acc.state
-			forwarded_val   = acc.state
-
-			// Explicitly destroy `forwarder` BEFORE `scoped_scheduler` exits to verify
-			// `actor_destroy` safely unregisters from `s.owned_actors` without double-free!
-			destroy(forwarder)
-		}
-
-		// 10 + 20 + 30 + 100 + 200 + (5 * 10) = 410
-		testing.expect_value(t, sum_after_batch, 410)
-		testing.expect_value(t, forwarded_val, 410)
+// Reusable test probe actor that records the latest message of type `T`:
+@(private = "file")
+given_probe :: proc(rt: ^Runtime_Spec, $T: typeid) -> ^Actor(T, T) {
+	return spawn(rt.sched, T{}, proc(state: ^T, val: T) {
+		state^ = val
 	})
 }
 
+// Exercises ambient scheduler `spawn(initial_state, handler)` overload:
+@(private = "file")
+given_accumulator :: proc(initial: $T) -> ^Actor(T, T) {
+	return spawn(initial, proc(total: ^T, x: T) {
+		total^ += x
+	})
+}
 
+@(private = "file")
+upon_sending_batch_to_pid :: proc(target_pid: PID($T), items: ..T) {
+	send(target_pid, items)
+}
 
+@(private = "file")
+upon_sending :: proc(target: ^Actor($S, $M), msg: M) {
+	send(target, msg)
+}
 
+@(private = "file")
+upon_destroying_early :: proc(target: ^Actor($S, $M)) {
+	destroy(target)
+}
+
+@(private = "file")
+then_async_reply_resolves :: proc(
+	rt:       ^Runtime_Spec,
+	worker:   ^Actor($S, $Req),
+	req:      Req,
+	expected: $Resp,
+	via:      Addressing_Mode,
+	messages: i64 = 2,
+) {
+	probe := given_probe(rt, Resp)
+	switch via {
+	case .Actor_Handle:
+		send(worker, req, probe)
+	case .PID:
+		send(pid(worker), req, probe)
+	}
+	then_actor_state_is(rt, probe, expected, messages = messages)
+}
+
+@(private = "file")
+then_actor_state_is :: proc(
+	rt:       ^Runtime_Spec,
+	target:   ^Actor($S, $M),
+	expected: S,
+	messages: i64 = 0,
+) {
+	if messages > 0 {
+		rt.total_msgs += messages
+		wait_messages(rt.total_msgs)
+	}
+	wait_idle()
+	testing.expect_value(rt.t, target.state, expected)
+}

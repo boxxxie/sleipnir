@@ -20,8 +20,9 @@ import "core:strings"
 //      marked `@(private)` or `@(no_behavior)`). `@(behavior)` / `@(behavior="name")`
 //      is also supported for explicit naming.
 //   2. Request/Reply Return Values (`-> T`): Behaviors that return a value `-> T`
-//      automatically generate synchronous `call_<name>(actor) -> T` (`actor->name()`)
-//      and async `send_<name>(actor, ..., reply_to: actor.PID(T))` without needing
+//      automatically generate synchronous `call_<name>(target) -> T` (`actor->name()`)
+//      and async `send_<name>(target, ..., reply_to: actor.PID(T))` (where `target`
+//      can be either `<Actor>_Actor` or `actor.PID(<Actor>_Msg)`) without needing
 //      a `reply_to` field in the behavior's parameters.
 //   3. Built-in Odin `->` Selector Call Syntax: Generated actor handles embed a
 //      static `vtable` so `account->deposit(250)` and `bal := account->get_balance()`
@@ -390,6 +391,15 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		append(groups, Group_Entry{name = group_name, procs = procs})
 	}
 
+	add_pair_to_group :: proc(groups: ^[dynamic]Group_Entry, b: Behavior_Spec, fn_a, fn_b: string) {
+		add_to_group(groups, b.short_name, fn_a)
+		add_to_group(groups, b.short_name, fn_b)
+		if b.proc_name != b.short_name {
+			add_to_group(groups, b.proc_name, fn_a)
+			add_to_group(groups, b.proc_name, fn_b)
+		}
+	}
+
 	for a in mod.actors {
 		if len(a.behaviors) == 0 do continue
 		snake_actor := to_snake_case(a.name)
@@ -510,18 +520,13 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 				fmt.sbprintf(&sb, "\treturn actor.call(target, %s_Msg(%s{{%s}}), %s)\n", a.name, msg_struct_name, lit_init, b.return_type)
 				fmt.sbprintln(&sb, "}\n")
 
-				add_to_group(&call_groups, b.short_name, call_actor_fn)
-				add_to_group(&call_groups, b.short_name, call_pid_fn)
-				if b.proc_name != b.short_name {
-					add_to_group(&call_groups, b.proc_name, call_actor_fn)
-					add_to_group(&call_groups, b.proc_name, call_pid_fn)
-				}
+				add_pair_to_group(&call_groups, b, call_actor_fn, call_pid_fn)
 
-				// 2) `send_<actor>_<behavior>_reply` (async forward of return value to a `reply_to` PID/Actor)
-				send_reply_fn := fmt.tprintf("send_%s_%s_reply", snake_actor, b.short_name)
-				send_reply_pid_fn := fmt.tprintf("send_%s_%s_reply_pid", snake_actor, b.short_name)
+				// 2) `send_<actor>_<behavior>_reply_actor` & `_reply_pid` (async forward of return value to a `reply_to` PID)
+				send_reply_actor_fn := fmt.tprintf("send_%s_%s_reply_actor", snake_actor, b.short_name)
+				send_reply_pid_fn   := fmt.tprintf("send_%s_%s_reply_pid", snake_actor, b.short_name)
 
-				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_Actor%s, reply_to: actor.PID(%s)) {{\n", send_reply_fn, a.name, no_def_sig, b.return_type)
+				fmt.sbprintf(&sb, "%s :: #force_inline proc(target: %s_Actor%s, reply_to: actor.PID(%s)) {{\n", send_reply_actor_fn, a.name, no_def_sig, b.return_type)
 				fmt.sbprintf(&sb, "\tactor.send(target.raw, %s_Msg(%s{{%s}}), reply_to)\n", a.name, msg_struct_name, lit_init)
 				fmt.sbprintln(&sb, "}\n")
 
@@ -529,12 +534,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 				fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}), reply_to)\n", a.name, msg_struct_name, lit_init)
 				fmt.sbprintln(&sb, "}\n")
 
-				add_to_group(&send_groups, b.short_name, send_reply_fn)
-				add_to_group(&send_groups, b.short_name, send_reply_pid_fn)
-				if b.proc_name != b.short_name {
-					add_to_group(&send_groups, b.proc_name, send_reply_fn)
-					add_to_group(&send_groups, b.proc_name, send_reply_pid_fn)
-				}
+				add_pair_to_group(&send_groups, b, send_reply_actor_fn, send_reply_pid_fn)
 			} else {
 				// 1-way fire-and-forget behavior (`send_<name>`)
 				actor_fn := fmt.tprintf("send_%s_%s_actor", snake_actor, b.short_name)
@@ -548,12 +548,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 				fmt.sbprintf(&sb, "\tactor.send(target, %s_Msg(%s{{%s}}))\n", a.name, msg_struct_name, lit_init)
 				fmt.sbprintln(&sb, "}\n")
 
-				add_to_group(&send_groups, b.short_name, actor_fn)
-				add_to_group(&send_groups, b.short_name, pid_fn)
-				if b.proc_name != b.short_name {
-					add_to_group(&send_groups, b.proc_name, actor_fn)
-					add_to_group(&send_groups, b.proc_name, pid_fn)
-				}
+				add_pair_to_group(&send_groups, b, actor_fn, pid_fn)
 			}
 		}
 
