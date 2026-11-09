@@ -541,13 +541,23 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 		// 3. Reschedule or unschedule with `.Seq_Cst` Dekker barrier to prevent lost wakeups
 		if has_more {
 			shard_push(&s.shards[wid % num_shards], a)
+			if s.enable_parking && intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
+				intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
+				sync.futex_signal(&s.wake_futex)
+			}
 		} else {
 			intrinsics.atomic_store_explicit(&a.scheduled, 0, .Seq_Cst)
-			intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Acq_Rel)
 			// Re-check if a message arrived just before `scheduled = 0` became visible
+			// BEFORE decrementing `active_actors` so `scheduler_wait_idle` never observes a false 0!
 			_, still_has_more := a.step_proc(a, &ctx, 0)
-			if still_has_more {
-				scheduler_schedule_actor(s, a, wid)
+			if still_has_more && intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
+				shard_push(&s.shards[wid % num_shards], a)
+				if s.enable_parking && intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
+					intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
+					sync.futex_signal(&s.wake_futex)
+				}
+			} else {
+				intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Acq_Rel)
 			}
 		}
 

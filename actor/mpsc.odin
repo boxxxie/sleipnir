@@ -136,8 +136,7 @@ shard_push :: #force_inline proc(s: ^RunQ_Shard($T), item: ^T) {
 
 shard_pop_or_steal :: proc(s: ^RunQ_Shard($T)) -> ^T {
 	// Fast lock-free check before acquiring ticket lock
-	if intrinsics.atomic_load_explicit(&s.tail, .Relaxed) == &s.stub &&
-	   intrinsics.atomic_load_explicit(&s.stub.next, .Relaxed) == nil {
+	if mpsc_is_empty(&s.q) {
 		return nil
 	}
 	sync.ticket_mutex_lock(&s.pop_lock)
