@@ -1,0 +1,8 @@
+{
+  "track_id": "otp_extended_testing_suite_20261115",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-11-15T18:50:00Z",
+  "updated_at": "2026-11-15T20:26:00Z",
+  "description": "OTP ATDD Test Harness, Scenario DSL & Reference Spec Suite: Layer 1-4 Red-First Specifications, Protocol Driver & Upstream Edge Cases (spec_01-spec_28, prop_18, prop_29, test_04-test_06)"
+}

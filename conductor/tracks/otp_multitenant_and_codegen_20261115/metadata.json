@@ -1,0 +1,8 @@
+{
+  "track_id": "otp_multitenant_and_codegen_20261115",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-11-15T18:30:00Z",
+  "updated_at": "2026-11-15T19:00:00Z",
+  "description": "Multi-Tenant Sharded Partitioned_Supervisor / Dynamic_Supervisor, Concurrent Registry($Key) with Duplicate Guard & Auto-Unenroll, @(supervise)/@(reinit) AST Codegen + Diagnostics, prop_29 Linearizability, and 06_otp_supervision Demo (Turns spec_17, spec_22, spec_25, spec_27, test_04-test_06, prop_29 Green)"
+}
