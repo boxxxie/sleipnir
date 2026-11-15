@@ -52,6 +52,8 @@ init :: proc {
 	mpsc_init,
 	shard_init,
 	sharded_spsc_init,
+	registry_init,
+	partitioned_supervisor_init,
 }
 
 // Destroy and free resources owned by a scheduler, actor, pool, or mailbox.
@@ -61,6 +63,8 @@ destroy :: proc {
 	pool_destroy,
 	watermark_slab_destroy,
 	sharded_spsc_destroy,
+	registry_destroy,
+	partitioned_supervisor_destroy,
 }
 
 // Push a single message or node onto a queue or SPSC lane.

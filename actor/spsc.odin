@@ -74,6 +74,9 @@ spsc_consume_batch :: #force_inline proc(
 	state: ^$S,
 	handler: proc(state: ^S, msg: ^T),
 ) -> int {
+	if max_batch <= 0 {
+		return 0
+	}
 	mask :: u64(N - 1)
 	r := intrinsics.atomic_load_explicit(&lane.read_idx, .Relaxed)
 	w := lane.cached_write_idx

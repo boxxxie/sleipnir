@@ -7,7 +7,13 @@ import "core:sync"
 // 1. Intrusive Lock-Free MPSC Queue (Pony / Vyukov Hybrid)
 //
 // Any struct `T` pushed into `MPSC_Queue(T)` must have a field `next: ^T`
-// ( typically at offset 0 via `using` or direct field definition).
+// (typically at offset 0 via `using` or direct field definition).
+//
+// MOVE-SAFETY INVARIANT:
+// `mpsc_init` stores interior pointers (`q.head = &q.stub`, `q.tail = &q.stub`).
+// Once initialized, an `MPSC_Queue` (and any struct embedding one, such as `Actor`,
+// `RunQ_Shard`, or `Envelope_Pool`) is NON-MOVABLE: never copy/move it by value
+// or store it directly inside a resizing `[dynamic]T`.
 //
 // Provides two pop modes:
 //   - `mpsc_pop_detached`: Re-inserts the embedded `stub` sentinel when the last
@@ -28,8 +34,14 @@ MPSC_Queue :: struct($T: typeid) #align(64) {
 
 mpsc_init :: proc(q: ^MPSC_Queue($T)) {
 	q.stub.next = nil
+	when intrinsics.type_has_field(T, "pool_id") {
+		q.stub.pool_id = POOL_ID_NONE
+	}
+	when intrinsics.type_has_field(T, "flags") {
+		q.stub.flags = ENVELOPE_FLAG_STATIC
+	}
 	q.head = &q.stub
-	q.tail = &q.stub
+	intrinsics.atomic_store_explicit(&q.tail, &q.stub, .Relaxed)
 }
 
 // Push a single node onto the tail of the MPSC queue (1 atomic XCHG + 1 Release store).
@@ -66,20 +78,20 @@ mpsc_is_empty :: #force_inline proc(q: ^MPSC_Queue($T)) -> bool {
 // Detached Vyukov MPSC pop: returns a completely detached `^T` that is no longer
 // referenced by `q.tail`. Safe for multi-actor `iso` forwarding and pool recycling.
 mpsc_pop_detached :: #force_inline proc(q: ^MPSC_Queue($T)) -> ^T {
-	tail := q.tail
+	tail := intrinsics.atomic_load_explicit(&q.tail, .Relaxed)
 	next := intrinsics.atomic_load_explicit(&tail.next, .Acquire)
 
 	if tail == &q.stub {
 		if next == nil {
 			return nil
 		}
-		q.tail = next
+		intrinsics.atomic_store_explicit(&q.tail, next, .Relaxed)
 		tail = next
 		next = intrinsics.atomic_load_explicit(&tail.next, .Acquire)
 	}
 
 	if next != nil {
-		q.tail = next
+		intrinsics.atomic_store_explicit(&q.tail, next, .Relaxed)
 		return tail
 	}
 
@@ -99,7 +111,7 @@ mpsc_pop_detached :: #force_inline proc(q: ^MPSC_Queue($T)) -> ^T {
 		intrinsics.cpu_relax()
 		next = intrinsics.atomic_load_explicit(&tail.next, .Acquire)
 	}
-	q.tail = next
+	intrinsics.atomic_store_explicit(&q.tail, next, .Relaxed)
 	return tail
 }
 
@@ -108,12 +120,12 @@ mpsc_pop_detached :: #force_inline proc(q: ^MPSC_Queue($T)) -> ^T {
 // Note: `new_tail_node` remains in `q.tail` as the sentinel until the NEXT message
 // is popped, whereas `previous_dummy_tail_node` is now completely retired!
 mpsc_pop_dummy :: #force_inline proc(q: ^MPSC_Queue($T)) -> (msg: ^T, retired_stub: ^T, ok: bool) {
-	tail := q.tail
+	tail := intrinsics.atomic_load_explicit(&q.tail, .Relaxed)
 	next := intrinsics.atomic_load_explicit(&tail.next, .Acquire)
 	if next == nil {
 		return nil, nil, false
 	}
-	q.tail = next
+	intrinsics.atomic_store_explicit(&q.tail, next, .Relaxed)
 	return next, tail, true
 }
 

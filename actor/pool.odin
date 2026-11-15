@@ -18,7 +18,8 @@ import "core:mem"
 //    (zero-copy `iso` ownership transfer).
 // =============================================================================
 
-MAX_POOLS :: 32
+MAX_POOLS    :: 64
+POOL_ID_NONE :: u16(0xFFFF)
 
 ENVELOPE_FLAG_NONE      :: u16(0)
 ENVELOPE_FLAG_FORWARDED :: u16(1 << 0) // Message was forwarded (`iso`); do not auto-recycle
@@ -71,6 +72,9 @@ pool_init :: proc(
 	p.slab_idx = 0
 	if slab_capacity > 0 {
 		p.slab = make([]Envelope(Msg), slab_capacity, allocator) or_return
+	} else {
+		p.slab = nil
+		p.heap_fallback = true
 	}
 	mpsc_init(&p.remote_returns)
 	return .None
@@ -86,7 +90,9 @@ pool_destroy :: proc(p: ^Envelope_Pool($Msg)) {
 
 // Allocate an envelope from the thread-local pool.
 // Fast path: 1) pop from `local_free`, 2) bump-allocate from `slab`,
-// 3) harvest returned messages from `remote_returns`, or 4) spin if bounded slab is full.
+// 3) harvest returned messages from `remote_returns`, or 4) spin if bounded slab is full
+// (falling back to heap allocation if `heap_fallback` is true, `spin_if_exhausted` is false,
+// or called from inside a scheduler worker thread to avoid starving consumer actors).
 @(require_results)
 pool_acquire :: #force_inline proc(p: ^Envelope_Pool($Msg), spin_if_exhausted: bool = true) -> ^Envelope(Msg) {
 	// 1. Check thread-local freelist (zero atomics)
@@ -96,6 +102,7 @@ pool_acquire :: #force_inline proc(p: ^Envelope_Pool($Msg), spin_if_exhausted: b
 		env.next = nil
 		env.pool_id = p.pool_id
 		env.flags = ENVELOPE_FLAG_NONE
+		env.reply_slot = nil
 		return env
 	}
 
@@ -106,6 +113,7 @@ pool_acquire :: #force_inline proc(p: ^Envelope_Pool($Msg), spin_if_exhausted: b
 		env.next = nil
 		env.pool_id = p.pool_id
 		env.flags = ENVELOPE_FLAG_NONE
+		env.reply_slot = nil
 		return env
 	}
 
@@ -116,21 +124,23 @@ pool_acquire :: #force_inline proc(p: ^Envelope_Pool($Msg), spin_if_exhausted: b
 			// Drain up to 64 more into `local_free` to amortize queue checks
 			for i := 0; i < 64; i += 1 {
 				extra := mpsc_pop_detached(&p.remote_returns)
-				if extra == nil do break
+				if extra == nil { break }
 				extra.next = p.local_free
 				p.local_free = extra
 			}
 			env.next = nil
 			env.pool_id = p.pool_id
 			env.flags = ENVELOPE_FLAG_NONE
+			env.reply_slot = nil
 			return env
 		}
 
-		if !spin_if_exhausted || p.heap_fallback {
+		if !spin_if_exhausted || p.heap_fallback || _tls_active_ctx != nil {
 			env_heap := new(Envelope(Msg), p.allocator)
 			env_heap.next = nil
 			env_heap.pool_id = p.pool_id
 			env_heap.flags = ENVELOPE_FLAG_HEAP
+			env_heap.reply_slot = nil
 			return env_heap
 		}
 		intrinsics.cpu_relax()
@@ -140,6 +150,8 @@ pool_acquire :: #force_inline proc(p: ^Envelope_Pool($Msg), spin_if_exhausted: b
 // Acquire and pre-link a chain of `len(msgs)` envelopes from `p`, populating each
 // envelope with the corresponding element of `msgs`. Returns `(first, last)` ready
 // for `mpsc_push_chain` / `send_envelope_chain`.
+// When `heap_fallback == false` and `spin_if_exhausted == true`, callers must ensure
+// `len(msgs) <= len(p.slab)` (larger batches automatically fall back to heap to prevent spin deadlock).
 @(require_results)
 pool_acquire_chain :: #force_inline proc(
 	p: ^Envelope_Pool($Msg),
@@ -147,11 +159,12 @@ pool_acquire_chain :: #force_inline proc(
 	spin_if_exhausted: bool = true,
 ) -> (first: ^Envelope(Msg), last: ^Envelope(Msg)) {
 	assert(len(msgs) > 0, "msgs slice must be non-empty")
-	first = pool_acquire(p, spin_if_exhausted)
+	can_spin := spin_if_exhausted && len(msgs) <= len(p.slab)
+	first = pool_acquire(p, can_spin)
 	first.msg = msgs[0]
 	prev := first
 	for i := 1; i < len(msgs); i += 1 {
-		cur := pool_acquire(p, spin_if_exhausted)
+		cur := pool_acquire(p, can_spin)
 		cur.msg = msgs[i]
 		intrinsics.atomic_store_explicit(&prev.next, cur, .Relaxed)
 		prev = cur
@@ -169,7 +182,7 @@ Batch_Return_Collector :: struct($Msg: typeid) {
 // Add a retired envelope to the thread-local collector bucket for its `pool_id`.
 collector_add :: #force_inline proc(c: ^Batch_Return_Collector($Msg), env: ^Envelope(Msg)) {
 	pid := env.pool_id
-	if pid >= MAX_POOLS do return
+	if pid >= MAX_POOLS { return }
 	env.next = nil
 	if c.first[pid] == nil {
 		c.first[pid] = env
@@ -190,7 +203,7 @@ collector_flush :: #force_inline proc(
 	num_pools := len(pools)
 	for p := 0; p < num_pools; p += 1 {
 		first := c.first[p]
-		if first == nil do continue
+		if first == nil { continue }
 		last := c.last[p]
 		if p == current_wid {
 			last.next = pools[p].local_free
@@ -266,7 +279,10 @@ watermark_slab_acquire :: #force_inline proc(
 	}
 	slot := &s.slots[s.cursor & mask]
 	s.cursor += 1
+	slot.next = nil
 	slot.pool_id = s.prod_id
+	slot.flags = ENVELOPE_FLAG_NONE
+	slot.reply_slot = nil
 	return slot
 }
 
@@ -279,6 +295,10 @@ watermark_slab_acquire_chain :: #force_inline proc(
 	k: int,
 	init_msg: Msg,
 ) -> (first: ^Envelope(Msg), last: ^Envelope(Msg)) {
+	if k <= 0 {
+		return nil, nil
+	}
+	assert(k < N - 2, "watermark_slab_acquire_chain: k must be < N - 2")
 	mask :: u64(N - 1)
 	for (s.cursor + u64(k)) - s.cached_retired >= u64(N - 2) {
 		s.cached_retired = intrinsics.atomic_load_explicit(&wm.retired_count, .Acquire)
@@ -288,14 +308,20 @@ watermark_slab_acquire_chain :: #force_inline proc(
 	}
 	first = &s.slots[s.cursor & mask]
 	prev := first
+	first.next = nil
 	first.pool_id = s.prod_id
+	first.flags = ENVELOPE_FLAG_NONE
+	first.reply_slot = nil
 	first.msg = init_msg
 	s.cursor += 1
 
 	for i := 1; i < k; i += 1 {
 		cur := &s.slots[s.cursor & mask]
 		s.cursor += 1
+		cur.next = nil
 		cur.pool_id = s.prod_id
+		cur.flags = ENVELOPE_FLAG_NONE
+		cur.reply_slot = nil
 		cur.msg = init_msg
 		intrinsics.atomic_store_explicit(&prev.next, cur, .Relaxed)
 		prev = cur
