@@ -34,7 +34,7 @@ Audit_Logger_Actor :: struct {
 	using vtable: ^Audit_Logger_VTable,
 }
 
-Audit_Logger_PID :: Audit_Logger_Actor
+Audit_Logger_PID :: actor.PID(Audit_Logger_Msg)
 
 audit_logger_dispatch :: proc(ctx: ^actor.Context, self: ^Audit_Logger, msg: ^Audit_Logger_Msg) {
 	switch m in msg^ {
@@ -153,7 +153,7 @@ Bank_Account_Actor :: struct {
 	using vtable: ^Bank_Account_VTable,
 }
 
-Bank_Account_PID :: Bank_Account_Actor
+Bank_Account_PID :: actor.PID(Bank_Account_Msg)
 
 bank_account_dispatch :: proc(ctx: ^actor.Context, self: ^Bank_Account, msg: ^Bank_Account_Msg) {
 	switch m in msg^ {

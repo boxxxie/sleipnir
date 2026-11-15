@@ -69,7 +69,6 @@ run_heterogeneous_demo :: proc() {
 		num_workers    = 2,
 		enable_parking = true, // 0% idle CPU when waiting
 	})
-	defer actor.scheduler_stop_and_destroy(&sched)
 
 	// Create per-worker pools for both message types
 	add_pools := make([]actor.Envelope_Pool(Add_Msg), 2)
@@ -88,10 +87,10 @@ run_heterogeneous_demo :: proc() {
 	}
 
 	aggregator := actor.spawn(Aggregator_State{}, aggregator_receive, rep_pools, id = 99)
-	defer free(aggregator)
 
 	counters := make([]actor.Actor(Counter_State, Add_Msg), 4)
 	defer delete(counters)
+	defer actor.scheduler_stop_and_destroy(&sched)
 	for i := 0; i < 4; i += 1 {
 		actor.actor_init(&counters[i], Counter_State{}, counter_receive, add_pools, id = u32(i))
 	}
@@ -168,7 +167,6 @@ bench_library_a2a :: proc(num_workers: int) -> (time.Duration, u64) {
 		batch_quota    = 64,
 		enable_parking = false,
 	})
-	defer actor.scheduler_stop_and_destroy(&sched)
 
 	actors := make([]actor.Actor(Swarm_State, Token_Msg), NUM_SWARM_ACTORS)
 	defer delete(actors)
@@ -184,6 +182,7 @@ bench_library_a2a :: proc(num_workers: int) -> (time.Duration, u64) {
 
 	tokens := make([]actor.Envelope(Token_Msg), A2A_INIT_TOKENS)
 	defer delete(tokens)
+	defer actor.scheduler_stop_and_destroy(&sched)
 
 	base_hops := A2A_TOTAL_HOPS / A2A_INIT_TOKENS
 	extra     := A2A_TOTAL_HOPS % A2A_INIT_TOKENS
@@ -249,7 +248,6 @@ bench_library_pooled_swarm :: proc(total_msgs: int, num_producers: int, num_work
 		batch_quota    = 100,
 		enable_parking = false,
 	})
-	defer actor.scheduler_stop_and_destroy(&sched)
 	sched.target_messages = i64(total_msgs)
 
 	pools := make([]actor.Envelope_Pool(i64), num_producers)
@@ -276,6 +274,7 @@ bench_library_pooled_swarm :: proc(total_msgs: int, num_producers: int, num_work
 	pctxs     := make([]Pooled_Prod_Ctx, num_producers)
 	defer delete(producers)
 	defer delete(pctxs)
+	defer actor.scheduler_stop_and_destroy(&sched)
 
 	msgs_per_prod := total_msgs / num_producers
 	start := time.tick_now()

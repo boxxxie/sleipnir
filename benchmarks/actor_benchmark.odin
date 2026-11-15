@@ -960,7 +960,7 @@ shard_push :: #force_inline proc(q: ^RunQ_Shard, a: ^Pony_Odin_Actor) {
 }
 
 shard_pop_or_steal :: proc(q: ^RunQ_Shard) -> ^Pony_Odin_Actor {
-	if q.tail == &q.stub && intrinsics.atomic_load_explicit(&q.stub.sched_next, .Relaxed) == nil {
+	if q.tail == &q.stub && intrinsics.atomic_load_explicit(&q.stub.sched_next, .Acquire) == nil {
 		return nil
 	}
 	sync.ticket_mutex_lock(&q.pop_lock)
@@ -1012,7 +1012,7 @@ ws_worker_proc :: proc(t: ^thread.Thread) {
 	for intrinsics.atomic_load_explicit(&s.total_processed, .Relaxed) < s.target_msgs {
 		a: ^Pony_Odin_Actor = nil
 		for i := 0; i < NUM_PRODUCERS; i += 1 {
-			idx := (wid * 2 + i) & (NUM_PRODUCERS - 1)
+			idx := (wid + i) & (NUM_PRODUCERS - 1)
 			a = shard_pop_or_steal(&s.shards[idx])
 			if a != nil do break
 		}
@@ -1032,10 +1032,10 @@ ws_worker_proc :: proc(t: ^thread.Thread) {
 			intrinsics.atomic_add_explicit(&s.total_processed, processed, .Relaxed)
 		}
 
-		intrinsics.atomic_store_explicit(&a.scheduled, 0, .Release)
-		if intrinsics.atomic_load_explicit(&a.mailbox.tail.next, .Acquire) != nil {
+		intrinsics.atomic_store_explicit(&a.scheduled, 0, .Seq_Cst)
+		if intrinsics.atomic_load_explicit(&a.mailbox.tail.next, .Seq_Cst) != nil {
 			if intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
-				shard_push(&s.shards[wid * 2], a)
+				shard_push(&s.shards[wid], a)
 			}
 		}
 	}
@@ -1254,7 +1254,7 @@ a2a_shard_push :: #force_inline proc(q: ^A2A_Shard, a: ^A2A_Actor) {
 }
 
 a2a_shard_pop :: proc(q: ^A2A_Shard) -> ^A2A_Actor {
-	if q.tail == &q.stub && intrinsics.atomic_load_explicit(&q.stub.sched_next, .Relaxed) == nil {
+	if q.tail == &q.stub && intrinsics.atomic_load_explicit(&q.stub.sched_next, .Acquire) == nil {
 		return nil
 	}
 	sync.ticket_mutex_lock(&q.pop_lock)
@@ -1466,7 +1466,6 @@ bench_library_fan_in :: proc(total_msgs: int, num_producers: int, use_chain: boo
 		batch_quota    = PONY_BATCH_QUOTA,
 		enable_parking = false,
 	})
-	defer actor.scheduler_stop_and_destroy(&sched)
 	sched.target_messages = i64(total_msgs)
 
 	pools := make([]actor.Envelope_Pool(i64), num_producers)
@@ -1481,7 +1480,6 @@ bench_library_fan_in :: proc(total_msgs: int, num_producers: int, use_chain: boo
 	}
 
 	target := actor.spawn(Lib_FanIn_State{}, lib_fanin_receive, pools)
-	defer actor.destroy(target)
 
 	var_wg: sync.Wait_Group
 	sync.wait_group_add(&var_wg, num_producers)
@@ -1490,6 +1488,7 @@ bench_library_fan_in :: proc(total_msgs: int, num_producers: int, use_chain: boo
 	pctxs     := make([]Lib_FanIn_Prod_Ctx, num_producers)
 	defer delete(producers)
 	defer delete(pctxs)
+	defer actor.scheduler_stop_and_destroy(&sched)
 
 	msgs_per_prod := total_msgs / num_producers
 	start := time.tick_now()
@@ -1545,7 +1544,6 @@ bench_library_swarm :: proc(total_msgs: int, num_producers: int, num_actors: int
 		batch_quota    = PONY_BATCH_QUOTA,
 		enable_parking = false,
 	})
-	defer actor.scheduler_stop_and_destroy(&sched)
 	sched.target_messages = i64(total_msgs)
 
 	pools := make([]actor.Envelope_Pool(i64), num_producers)
@@ -1572,6 +1570,7 @@ bench_library_swarm :: proc(total_msgs: int, num_producers: int, num_actors: int
 	pctxs     := make([]Lib_Swarm_Prod_Ctx, num_producers)
 	defer delete(producers)
 	defer delete(pctxs)
+	defer actor.scheduler_stop_and_destroy(&sched)
 
 	msgs_per_prod := total_msgs / num_producers
 	start := time.tick_now()
@@ -1640,7 +1639,6 @@ bench_library_a2a :: proc(total_hops: int, num_workers: int) -> (time.Duration, 
 		batch_quota    = 64,
 		enable_parking = false,
 	})
-	defer actor.scheduler_stop_and_destroy(&sched)
 
 	actors := make([]actor.Actor(Lib_A2A_State, Lib_A2A_Token_Msg), NUM_SWARM_ACTORS)
 	defer delete(actors)
@@ -1656,6 +1654,7 @@ bench_library_a2a :: proc(total_hops: int, num_workers: int) -> (time.Duration, 
 
 	tokens := make([]actor.Envelope(Lib_A2A_Token_Msg), A2A_INIT_TOKENS)
 	defer delete(tokens)
+	defer actor.scheduler_stop_and_destroy(&sched)
 
 	base_hops := total_hops / A2A_INIT_TOKENS
 	extra     := total_hops % A2A_INIT_TOKENS

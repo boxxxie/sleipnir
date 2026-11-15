@@ -189,7 +189,7 @@ main :: proc() {
 
     // Single consumer drains up to 64 events per lane across all producer lanes
     total := 0.0
-    drained := actor.sharded_spsc_consume(&mbox, max_per_lane = 64, ctx = &total,
+    drained := actor.sharded_spsc_consume(&mbox, quota_per_lane = 64, state = &total,
         handler = proc(total: ^f64, ev: ^Sensor_Event) {
             total^ += ev.reading
         },
