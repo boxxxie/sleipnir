@@ -1,6 +1,8 @@
 package sleipnir_tests
 
 import "base:intrinsics"
+import "base:runtime"
+import "core:c/libc"
 import "core:mem"
 import "core:testing"
 import "../actor"
@@ -800,6 +802,116 @@ test_19_batch_send_pid_and_early_actor_destroy :: proc(t: ^testing.T) {
 	})
 }
 
+// =============================================================================
+// 6. Runtime Concurrency & Safety Hardening Tests (Track 1)
+// =============================================================================
+
+@(test)
+test_20_mpsc_spsc_and_pool_hardening_invariants :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. `spsc_consume_batch` must return 0 cleanly when `max_batch <= 0` without u64 wraparound
+		lane := new(actor.SPSC_Lane(int, 8))
+		defer free(lane)
+		testing.expect(t, actor.spsc_try_push(lane, 11))
+		testing.expect(t, actor.spsc_try_push(lane, 22))
+		sum := 0
+		handler := proc(acc: ^int, item: ^int) { acc^ += item^ }
+		testing.expect_value(t, actor.spsc_consume_batch(lane, 0, &sum, handler), 0)
+		testing.expect_value(t, actor.spsc_consume_batch(lane, -5, &sum, handler), 0)
+		testing.expect_value(t, sum, 0)
+		testing.expect_value(t, actor.spsc_consume_batch(lane, 8, &sum, handler), 2)
+		testing.expect_value(t, sum, 33)
+
+		// 2. `mpsc_init` must initialize `stub.pool_id = POOL_ID_NONE` (0xFFFF) and `ENVELOPE_FLAG_STATIC`
+		q: actor.MPSC_Queue(actor.Envelope(int))
+		actor.mpsc_init(&q)
+		testing.expect_value(t, q.stub.pool_id, actor.POOL_ID_NONE)
+		testing.expect(t, (q.stub.flags & actor.ENVELOPE_FLAG_STATIC) != 0)
+
+		slab: actor.Watermark_Slab(int, 8)
+		wm0: actor.Producer_Watermark
+		actor.init(&slab, prod_id = 0)
+		defer actor.destroy(&slab)
+
+		wm_env := actor.watermark_slab_acquire(&slab, &wm0)
+		wm_env.msg = 77
+		actor.mpsc_push(&q, wm_env)
+		popped_msg, retired_stub, pop_ok := actor.mpsc_pop_dummy(&q)
+		testing.expect(t, pop_ok)
+		testing.expect_value(t, popped_msg.msg, 77)
+		testing.expect_value(t, retired_stub.pool_id, actor.POOL_ID_NONE)
+
+		// 3. Recycled envelopes from `pool_acquire`, `watermark_slab_acquire`, and
+		//    `watermark_slab_acquire_chain` must clear `reply_slot` and `flags`
+		pools := make([]actor.Envelope_Pool(int), 2)
+		actor.init(&pools[0], pool_id = 0, slab_capacity = 2)
+		actor.init(&pools[1], pool_id = 1, slab_capacity = 2)
+		defer {
+			actor.destroy(&pools[0])
+			actor.destroy(&pools[1])
+			delete(pools)
+		}
+
+		e_local := actor.pool_acquire(&pools[0])
+		e_local.reply_slot = rawptr(uintptr(0xDEADBEEF))
+		e_local.flags = actor.ENVELOPE_FLAG_CALL
+
+		e_remote := actor.pool_acquire(&pools[1])
+		e_remote.reply_slot = rawptr(uintptr(0xCAFEBABE))
+		e_remote.flags = actor.ENVELOPE_FLAG_REPLY_PID
+
+		collector: actor.Batch_Return_Collector(int)
+		actor.collector_add(&collector, e_local)
+		actor.collector_add(&collector, e_remote)
+		actor.collector_flush(&collector, pools, current_wid = 0)
+
+		// Re-acquire from `local_free` (pool 0) and `remote_returns` (pool 1)
+		re_local := actor.pool_acquire(&pools[0])
+		testing.expect(t, re_local.reply_slot == nil)
+		testing.expect_value(t, re_local.flags, actor.ENVELOPE_FLAG_NONE)
+
+		re_remote := actor.pool_acquire(&pools[1])
+		testing.expect(t, re_remote.reply_slot == nil)
+		testing.expect_value(t, re_remote.flags, actor.ENVELOPE_FLAG_NONE)
+
+		// Re-acquire after dirtying `Watermark_Slab` slots across ring wraparound
+		wm: actor.Producer_Watermark
+		wm_slab: actor.Watermark_Slab(int, 8)
+		actor.init(&wm_slab, prod_id = 0)
+		defer actor.destroy(&wm_slab)
+
+		for i := 0; i < 6; i += 1 {
+			s_env := actor.watermark_slab_acquire(&wm_slab, &wm)
+			s_env.reply_slot = rawptr(uintptr(0xBEEF))
+			s_env.flags = actor.ENVELOPE_FLAG_CALL
+		}
+		intrinsics.atomic_add_explicit(&wm.retired_count, 6, .Release)
+		wrapped_single := actor.watermark_slab_acquire(&wm_slab, &wm)
+		testing.expect(t, wrapped_single.reply_slot == nil)
+		testing.expect_value(t, wrapped_single.flags, actor.ENVELOPE_FLAG_NONE)
+
+		intrinsics.atomic_add_explicit(&wm.retired_count, 2, .Release)
+		c_first, c_last := actor.watermark_slab_acquire_chain(&wm_slab, &wm, 4, 123)
+		for cur := c_first; cur != nil; cur = cur.next {
+			testing.expect(t, cur.reply_slot == nil)
+			testing.expect_value(t, cur.flags, actor.ENVELOPE_FLAG_NONE)
+			if cur == c_last { break }
+		}
+
+		// 4. `pool_init` with `slab_capacity <= 0` forces `heap_fallback` instead of deadlocking
+		zero_pool: actor.Envelope_Pool(int)
+		actor.init(&zero_pool, pool_id = 0, slab_capacity = 0, heap_fallback = false)
+		defer actor.destroy(&zero_pool)
+		testing.expect(t, zero_pool.heap_fallback)
+		if zero_pool.heap_fallback {
+			zero_env := actor.pool_acquire(&zero_pool)
+			testing.expect(t, (zero_env.flags & actor.ENVELOPE_FLAG_HEAP) != 0)
+			testing.expect(t, zero_env.reply_slot == nil)
+			free(zero_env, zero_pool.allocator)
+		}
+	})
+}
+
 // ============================================================================
 // Layer 2: Scenario-Specific Fixtures (Tests 18 & 19)
 // ============================================================================
@@ -963,4 +1075,422 @@ then_actor_state_is :: proc(
 	}
 	actor.wait_idle()
 	testing.expect_value(rt.t, target.state, expected)
+}
+
+// =============================================================================
+// 6. Phase 2 Runtime Hardening Tests (Tests 21 - 23)
+// =============================================================================
+
+@(private = "file")
+test21_custom_logger_proc :: proc(
+	data:     rawptr,
+	level:    runtime.Logger_Level,
+	text:     string,
+	options:  runtime.Logger_Options,
+	location := #caller_location,
+) {
+}
+
+@(private = "file")
+Counting_Temp_State :: struct {
+	backing:        runtime.Allocator,
+	alloc_count:    int,
+	free_all_count: int,
+}
+
+@(private = "file")
+counting_temp_alloc_proc :: proc(
+	allocator_data: rawptr,
+	mode:           runtime.Allocator_Mode,
+	size, alignment: int,
+	old_memory:     rawptr,
+	old_size:       int,
+	location:       runtime.Source_Code_Location = #caller_location,
+) -> ([]byte, runtime.Allocator_Error) {
+	st := cast(^Counting_Temp_State)allocator_data
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed:
+		intrinsics.atomic_add_explicit(&st.alloc_count, 1, .Relaxed)
+	case .Free_All:
+		intrinsics.atomic_add_explicit(&st.free_all_count, 1, .Release)
+	}
+	return st.backing.procedure(st.backing.data, mode, size, alignment, old_memory, old_size, location)
+}
+
+@(test)
+test_21_worker_context_inheritance_and_temp_allocator_discipline :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. Non-worker thread with non-nil `context.user_ptr` must still get `current_context() == nil`.
+		saved_user_ptr := context.user_ptr
+		context.user_ptr = rawptr(uintptr(0xCAFEBABE))
+		testing.expect(t, actor.current_context() == nil)
+		context.user_ptr = saved_user_ptr
+
+		// 2. Worker threads inherit caller's `logger`, `user_index`, and allocator (`Tracking_Allocator`).
+		saved_logger := context.logger
+		saved_user_index := context.user_index
+		context.logger = runtime.Logger{procedure = test21_custom_logger_proc}
+		context.user_index = 42
+
+		inner_track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&inner_track, context.allocator)
+		defer mem.tracking_allocator_destroy(&inner_track)
+		saved_alloc := context.allocator
+		context.allocator = mem.tracking_allocator(&inner_track)
+
+		sched: actor.Scheduler
+		err := actor.init(&sched, actor.Scheduler_Config{num_workers = 2, enable_parking = false})
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+
+		Worker_Seen :: struct {
+			logger_matched: bool,
+			user_index:     int,
+			ctx_non_nil:    bool,
+			heap_val:       ^int,
+			alloc_count:    int,
+		}
+
+		// Re-bind `context.allocator` back to `inner_track` on main too before `scheduler_start`.
+		seen_actor := actor.spawn(&sched, Worker_Seen{}, proc(s: ^Worker_Seen, cmd: int) {
+			if cmd == 1 {
+				s.logger_matched = context.logger.procedure == test21_custom_logger_proc
+				s.user_index = context.user_index
+				s.ctx_non_nil = actor.current_context() != nil
+				s.heap_val = new(int)
+				s.heap_val^ = 777
+			} else if cmd == 2 {
+				free(s.heap_val)
+				s.heap_val = nil
+			}
+		})
+
+		actor.scheduler_start(&sched)
+		before_worker_allocs := len(inner_track.allocation_map)
+		actor.send(&sched, seen_actor, 1)
+		actor.wait_idle(&sched)
+
+		testing.expect(t, seen_actor.state.logger_matched)
+		testing.expect_value(t, seen_actor.state.user_index, 42)
+		testing.expect(t, seen_actor.state.ctx_non_nil)
+		testing.expect(t, len(inner_track.allocation_map) > before_worker_allocs)
+
+		actor.send(&sched, seen_actor, 2)
+		actor.wait_idle(&sched)
+		actor.destroy(&sched)
+
+		context.allocator = saved_alloc
+		context.logger = saved_logger
+		context.user_index = saved_user_index
+		testing.expect_value(t, len(inner_track.allocation_map), 0)
+		testing.expect_value(t, len(inner_track.bad_free_array), 0)
+
+		// 3. Top-level turn temp allocator wipe without wiping nested cooperative `actor.call` scratch.
+		Temp_State :: struct {
+			temp_ptr:       ^Counting_Temp_State,
+			callee_pid:     actor.PID(i64),
+			scratch_ok:     bool,
+			free_all_same:  bool,
+			call_result:    i64,
+		}
+
+		temp_arena_buf := make([]u8, 64 * 1024)
+		defer delete(temp_arena_buf)
+		temp_arena: mem.Arena
+		mem.arena_init(&temp_arena, temp_arena_buf)
+
+		count_state := Counting_Temp_State{
+			backing = mem.arena_allocator(&temp_arena),
+		}
+		saved_temp := context.temp_allocator
+		context.temp_allocator = runtime.Allocator{
+			procedure = counting_temp_alloc_proc,
+			data      = &count_state,
+		}
+
+		sched1: actor.Scheduler
+		err1 := actor.init(&sched1, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+		testing.expect_value(t, err1, mem.Allocator_Error.None)
+
+		callee := actor.spawn(&sched1, i64(0), proc(ctx: ^actor.Context, st: ^i64, x: ^i64) {
+			scratch := make([]u8, 32, context.temp_allocator)
+			scratch[0] = 0x33
+			st^ += i64(scratch[0])
+			actor.reply(ctx, x^ * 3)
+		})
+
+		caller := actor.spawn(&sched1, Temp_State{temp_ptr = &count_state, callee_pid = actor.pid(callee)}, proc(s: ^Temp_State, cmd: i64) {
+			if cmd == 1 {
+				tmp := make([]u8, 64, context.temp_allocator)
+				tmp[0] = 0x5A
+				return
+			}
+			// Outer turn allocates scratch BEFORE cooperative `actor.call`.
+			before := make([]u8, 64, context.temp_allocator)
+			before[0] = 0xA5
+			before[63] = 0xA5
+			fa_before := intrinsics.atomic_load_explicit(&s.temp_ptr.free_all_count, .Acquire)
+
+			s.call_result = actor.call(s.callee_pid, cmd, i64)
+
+			fa_after_call := intrinsics.atomic_load_explicit(&s.temp_ptr.free_all_count, .Acquire)
+			s.free_all_same = fa_after_call == fa_before
+			s.scratch_ok = before[0] == 0xA5 && before[63] == 0xA5
+		})
+
+		actor.scheduler_start(&sched1)
+		actor.send(&sched1, caller, i64(1))
+		actor.wait_idle(&sched1)
+		fa_after_msg1 := intrinsics.atomic_load_explicit(&count_state.free_all_count, .Acquire)
+		testing.expect(t, fa_after_msg1 >= 1)
+
+		actor.send(&sched1, caller, i64(14))
+		actor.wait_idle(&sched1)
+		actor.destroy(&sched1)
+		context.temp_allocator = saved_temp
+
+		testing.expect_value(t, caller.state.call_result, i64(42))
+		testing.expect(t, caller.state.free_all_same)
+		testing.expect(t, caller.state.scratch_ok)
+		testing.expect(t, intrinsics.atomic_load_explicit(&count_state.free_all_count, .Acquire) > fa_after_msg1)
+	})
+}
+
+@(thread_local)
+_test22_jmp: ^libc.jmp_buf
+
+@(thread_local)
+_test22_caught: int
+
+@(private = "file")
+test22_trap_proc :: proc(prefix, message: string, loc: runtime.Source_Code_Location) -> ! {
+	_test22_caught += 1
+	if _test22_jmp != nil {
+		libc.longjmp(_test22_jmp, 1)
+	}
+	runtime.default_assertion_failure_proc(prefix, message, loc)
+}
+
+@(test)
+test_22_call_slot_offset_zero_uaf_stress_double_reply_and_cycle_guard :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. Offset-0 `ready: sync.Futex` invariant on `Call_Slot($Res)`.
+		testing.expect_value(t, int(offset_of(actor.Call_Slot(i64), ready)), 0)
+
+		// 2. Cross-thread `actor.call` / `actor.reply` stress with duplicate `reply` & `forward` delegation.
+		sched: actor.Scheduler
+		err := actor.init(&sched, actor.Scheduler_Config{num_workers = 4, enable_parking = true})
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		actor.scheduler_start(&sched)
+
+		double_replier := actor.spawn(&sched, 0, proc(ctx: ^actor.Context, count: ^int, req: ^i64) {
+			count^ += 1
+			actor.reply(ctx, req^ * 2)
+			// Duplicate reply must be a safe no-op (must NOT overwrite popped Call_Slot).
+			actor.reply(ctx, req^ * 999)
+		})
+
+		Forward_Pair :: struct {
+			next_pid: actor.PID(i64),
+		}
+		stage2 := actor.spawn(&sched, 0, proc(ctx: ^actor.Context, count: ^int, val: ^i64) {
+			count^ += 1
+			actor.reply(ctx, val^ + 1)
+		})
+		stage1 := actor.spawn(&sched, Forward_Pair{next_pid = actor.pid(stage2)}, proc(ctx: ^actor.Context, st: ^Forward_Pair, val: ^i64) {
+			actor.forward(ctx, st.next_pid, val^ * 2)
+			// Calling `reply` after `forward` must also be a safe no-op!
+			actor.reply(ctx, i64(-1))
+		})
+
+		for i := 0; i < 1000; i += 1 {
+			x := i64(i + 1)
+			res := actor.call(&sched, double_replier, x, i64)
+			testing.expect_value(t, res, x * 2)
+		}
+		fwd_res := actor.call(&sched, stage1, i64(21), i64)
+		testing.expect_value(t, fwd_res, i64(43))
+		actor.destroy(&sched)
+
+		// 3. 1-worker self-call and `A -> B -> A` cycle detection must abort cleanly without hanging.
+		sched1: actor.Scheduler
+		err1 := actor.init(&sched1, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+		testing.expect_value(t, err1, mem.Allocator_Error.None)
+
+		Self_Caller_State :: struct {
+			self_pid: actor.PID(i64),
+			caught:   bool,
+		}
+		self_caller := actor.spawn(&sched1, Self_Caller_State{}, proc(st: ^Self_Caller_State, x: i64) {
+			if x == 1 {
+				prev_proc := context.assertion_failure_proc
+				context.assertion_failure_proc = test22_trap_proc
+				jb: libc.jmp_buf
+				_test22_jmp = &jb
+				_test22_caught = 0
+				if libc.setjmp(&jb) == 0 {
+					_ = actor.call(st.self_pid, i64(2), i64)
+				} else {
+					st.caught = _test22_caught > 0
+				}
+				_test22_jmp = nil
+				context.assertion_failure_proc = prev_proc
+			} else {
+				actor.reply(x)
+			}
+		})
+		self_caller.state.self_pid = actor.pid(self_caller)
+
+		Mutual_State :: struct {
+			peer_pid: actor.PID(i64),
+			caught:   bool,
+		}
+		actor_a: ^actor.Actor(Mutual_State, i64)
+		actor_b := actor.spawn(&sched1, Mutual_State{}, proc(ctx: ^actor.Context, st: ^Mutual_State, x: ^i64) {
+			prev_proc := context.assertion_failure_proc
+			context.assertion_failure_proc = test22_trap_proc
+			jb: libc.jmp_buf
+			_test22_jmp = &jb
+			_test22_caught = 0
+			if libc.setjmp(&jb) == 0 {
+				_ = actor.call(st.peer_pid, x^ + 1, i64)
+			} else {
+				st.caught = _test22_caught > 0
+			}
+			_test22_jmp = nil
+			context.assertion_failure_proc = prev_proc
+			actor.reply(ctx, i64(-7))
+		})
+		actor_a = actor.spawn(&sched1, Mutual_State{peer_pid = actor.pid(actor_b)}, proc(st: ^Mutual_State, x: i64) {
+			if x == 10 {
+				res := actor.call(st.peer_pid, x, i64)
+				st.caught = res == -7
+			} else {
+				actor.reply(x)
+			}
+		})
+		actor_b.state.peer_pid = actor.pid(actor_a)
+
+		actor.scheduler_start(&sched1)
+		actor.send(&sched1, self_caller, i64(1))
+		actor.wait_idle(&sched1)
+		actor.send(&sched1, actor_a, i64(10))
+		actor.wait_idle(&sched1)
+		actor.destroy(&sched1)
+
+		testing.expect(t, self_caller.state.caught)
+		testing.expect(t, actor_b.state.caught)
+		testing.expect(t, actor_a.state.caught)
+	})
+}
+
+@(test)
+test_23_dekker_wait_idle_heap_fallback_pool_id_and_cross_scheduler_send :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. Respect explicit `0 < cfg.num_shards < s.num_workers`.
+		shard_sched: actor.Scheduler
+		err_sh := actor.init(&shard_sched, actor.Scheduler_Config{num_workers = 4, num_shards = 1, enable_parking = false})
+		testing.expect_value(t, err_sh, mem.Allocator_Error.None)
+		testing.expect_value(t, shard_sched.num_shards, 1)
+		actor.destroy(&shard_sched)
+
+		// 2. Heap-fallback envelopes (`pool_id == POOL_ID_NONE`, `ENVELOPE_FLAG_HEAP`) do not corrupt `pools[0]` or leak on `actor.destroy`.
+		tiny_pool := make([]actor.Envelope_Pool(int), 3)
+		for i := 0; i < len(tiny_pool); i += 1 {
+			actor.init(&tiny_pool[i], u16(i), slab_capacity = 2, heap_fallback = true)
+		}
+		defer {
+			for i := 0; i < len(tiny_pool); i += 1 {
+				actor.destroy(&tiny_pool[i])
+			}
+			delete(tiny_pool)
+		}
+
+		heap_sched: actor.Scheduler
+		err_hs := actor.init(&heap_sched, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+		testing.expect_value(t, err_hs, mem.Allocator_Error.None)
+		defer actor.destroy(&heap_sched)
+
+		// Spawn an actor BEFORE starting workers, overload its tiny 2-slot pool with 16 msgs -> forces 14 heap fallbacks,
+		// then destroy the un-stepped actor cleanly (drains queued heap envelopes with 0 leaks).
+		victim := actor.spawn(&heap_sched, 0, proc(ctx: ^actor.Context, self: ^actor.Actor(int, int), x: ^int) {
+			self.state += x^
+		}, pools = tiny_pool)
+		for i := 0; i < 16; i += 1 {
+			actor.send(&heap_sched, victim, i + 1)
+		}
+		// Drain on explicit destroy before starting scheduler, verify no leaks.
+		actor.destroy(victim)
+
+		// Verify normal execution with heap fallbacks also does not corrupt `pools[0]`.
+		active := actor.spawn(&heap_sched, 0, proc(ctx: ^actor.Context, self: ^actor.Actor(int, int), x: ^int) {
+			self.state += x^
+		}, pools = tiny_pool)
+		actor.scheduler_start(&heap_sched)
+		for i := 0; i < 64; i += 1 {
+			actor.send(&heap_sched, active, 1)
+		}
+		actor.wait_idle(&heap_sched)
+		testing.expect_value(t, active.state, 64)
+
+		// 3. Cross-scheduler `actor.send` and `actor.forward` must route to target's scheduler safely.
+		s1: actor.Scheduler
+		s2: actor.Scheduler
+		err1 := actor.init(&s1, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+		err2 := actor.init(&s2, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+		testing.expect_value(t, err1, mem.Allocator_Error.None)
+		testing.expect_value(t, err2, mem.Allocator_Error.None)
+		defer actor.destroy(&s1)
+		defer actor.destroy(&s2)
+
+		S2_State :: struct {
+			sum:       i64,
+			seen_s2:   bool,
+			bad_sched: bool,
+		}
+		s2_sink := actor.spawn(&s2, S2_State{seen_s2 = true}, proc(ctx: ^actor.Context, st: ^S2_State, val: ^i64) {
+			st.sum += val^
+			if ctx.sched != actor.current_context().sched || ctx.sched == nil {
+				st.bad_sched = true
+			}
+		})
+
+		Relay_State :: struct {
+			s2_target: actor.PID(i64),
+			s2_ptr:    ^actor.Scheduler,
+		}
+		s1_relay := actor.spawn(&s1, Relay_State{s2_target = actor.pid(s2_sink), s2_ptr = &s2}, proc(ctx: ^actor.Context, st: ^Relay_State, val: ^i64) {
+			// Cross-scheduler send + cross-scheduler forward
+			actor.send(ctx, st.s2_target, val^)
+			actor.forward(ctx, st.s2_target, val^ * 10)
+		})
+
+		actor.scheduler_start(&s2)
+		actor.scheduler_start(&s1)
+		actor.send(&s1, s1_relay, i64(5))
+		actor.wait_idle(&s1)
+		actor.wait_idle(&s2)
+
+		testing.expect_value(t, s2_sink.state.sum, i64(55))
+		testing.expect(t, !s2_sink.state.bad_sched)
+
+		// 4. Dekker `wait_idle` / unschedule race stress with `enable_parking = true`.
+		dekker_sched: actor.Scheduler
+		err_d := actor.init(&dekker_sched, actor.Scheduler_Config{num_workers = 4, batch_quota = 4, enable_parking = true})
+		testing.expect_value(t, err_d, mem.Allocator_Error.None)
+		defer actor.destroy(&dekker_sched)
+		actor.scheduler_start(&dekker_sched)
+
+		dekker_sink := actor.spawn(&dekker_sched, i64(0), proc(s: ^i64, x: i64) {
+			s^ += x
+		})
+		EXPECTED_ITER :: 500
+		for i := 0; i < EXPECTED_ITER; i += 1 {
+			actor.send(&dekker_sched, dekker_sink, i64(1))
+			if i % 5 == 0 {
+				actor.wait_idle(&dekker_sched)
+			}
+		}
+		actor.wait_idle(&dekker_sched)
+		testing.expect_value(t, dekker_sink.state, i64(EXPECTED_ITER))
+	})
 }
