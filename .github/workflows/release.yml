@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to package and publish (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+        type: string
+      draft:
+        description: 'Create GitHub Release as a draft'
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark GitHub Release as a prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Verify, Package & Publish Release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Determine target tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository metadata (CHANGELOG)
+        uses: actions/checkout@v4
+        with:
+          path: meta
+
+      - name: Checkout target tag (${{ steps.meta.outputs.tag }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+          path: src
+
+      - name: Setup Odin compiler
+        uses: laytan/setup-odin@v2
+        with:
+          release: latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
+
+      - name: Verify target tag builds and passes tests
+        working-directory: src
+        run: |
+          if [ -f actor/supervision.odin ]; then
+            ATTRS="actor,behavior,no_behavior,supervise,reinit"
+          else
+            ATTRS="actor,behavior"
+          fi
+
+          odin check ./actor -no-entry-point
+          odin check ./actor/codegen -no-entry-point
+          odin check ./tools/sleipnir_gen
+          odin doc ./actor > /dev/null
+          odin test ./tests -custom-attribute:"${ATTRS}"
+          odin test examples/05_ast_metaprogramming -custom-attribute:"${ATTRS}"
+
+      - name: Package source archives and sleipnir_gen binary
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VER="${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+
+          git -C src archive --format=tar.gz --prefix="sleipnir-${VER}/" HEAD > "dist/sleipnir-${TAG}-src.tar.gz"
+          git -C src archive --format=zip --prefix="sleipnir-${VER}/" HEAD > "dist/sleipnir-${TAG}-src.zip"
+
+          mkdir -p "dist/sleipnir_gen-${TAG}-linux-x86_64"
+          odin build src/tools/sleipnir_gen -o:speed -out:"dist/sleipnir_gen-${TAG}-linux-x86_64/sleipnir_gen"
+          cp src/LICENSE src/README.md "dist/sleipnir_gen-${TAG}-linux-x86_64/"
+          tar -C dist -czf "dist/sleipnir_gen-${TAG}-linux-x86_64.tar.gz" "sleipnir_gen-${TAG}-linux-x86_64"
+          rm -rf "dist/sleipnir_gen-${TAG}-linux-x86_64"
+
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          VER="${{ steps.meta.outputs.version }}"
+          python3 - "$VER" meta/CHANGELOG.md dist/RELEASE_NOTES.md <<'PY'
+          import re, sys
+
+          version, changelog_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          text = open(changelog_path, "r", encoding="utf-8").read()
+          pattern = re.compile(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          m = pattern.search(text)
+          if m:
+              body = m.group(1).strip()
+              open(out_path, "w", encoding="utf-8").write(body + "\n")
+              print("found=true")
+          else:
+              print("found=false")
+          PY
+          if [ -s dist/RELEASE_NOTES.md ]; then
+            echo "has_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update GitHub Release
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          FLAGS=()
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.draft }}" = "true" ]; then FLAGS+=(--draft); fi
+            if [ "${{ inputs.prerelease }}" = "true" ]; then FLAGS+=(--prerelease); fi
+          elif [[ "$TAG" == *-* ]]; then
+            FLAGS+=(--prerelease)
+          fi
+
+          if [ "${{ steps.notes.outputs.has_notes }}" = "true" ]; then
+            NOTES_FLAGS=(--notes-file dist/RELEASE_NOTES.md)
+          else
+            NOTES_FLAGS=(--generate-notes)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt \
+              --title "Sleipnir ${TAG}" \
+              "${NOTES_FLAGS[@]}" \
+              "${FLAGS[@]}"
+          fi
