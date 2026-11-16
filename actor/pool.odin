@@ -21,6 +21,8 @@ import "core:mem"
 MAX_POOLS    :: 64
 POOL_ID_NONE :: u16(0xFFFF)
 
+#assert(MAX_POOLS <= 64)
+
 ENVELOPE_FLAG_NONE      :: u16(0)
 ENVELOPE_FLAG_FORWARDED :: u16(1 << 0) // Message was forwarded (`iso`); do not auto-recycle
 ENVELOPE_FLAG_STATIC    :: u16(1 << 1) // Pre-allocated static/stack token; do not recycle to pool
@@ -173,10 +175,12 @@ pool_acquire_chain :: #force_inline proc(
 }
 
 // Batch-return collector used on the stack during an actor's step quantum.
-// Groups retired envelopes by their `pool_id` and flushes each chain in ONE atomic XCHG.
+// Groups retired envelopes by their `pool_id` using a `u64` occupancy bitmask
+// (avoiding 1 KB zero-initialization on entry) and flushes each chain in ONE atomic XCHG.
 Batch_Return_Collector :: struct($Msg: typeid) {
-	first: [MAX_POOLS]^Envelope(Msg),
-	last:  [MAX_POOLS]^Envelope(Msg),
+	used_mask: u64,
+	first:     [MAX_POOLS]^Envelope(Msg),
+	last:      [MAX_POOLS]^Envelope(Msg),
 }
 
 // Add a retired envelope to the thread-local collector bucket for its `pool_id`.
@@ -184,7 +188,9 @@ collector_add :: #force_inline proc(c: ^Batch_Return_Collector($Msg), env: ^Enve
 	pid := env.pool_id
 	if pid >= MAX_POOLS { return }
 	env.next = nil
-	if c.first[pid] == nil {
+	bit := u64(1) << pid
+	if (c.used_mask & bit) == 0 {
+		c.used_mask |= bit
 		c.first[pid] = env
 		c.last[pid]  = env
 	} else {
@@ -201,19 +207,21 @@ collector_flush :: #force_inline proc(
 	current_wid: int = -1,
 ) {
 	num_pools := len(pools)
-	for p := 0; p < num_pools; p += 1 {
+	mask := c.used_mask
+	for mask != 0 {
+		p := int(intrinsics.count_trailing_zeros(mask))
+		mask &= mask - 1
+		if p >= num_pools { continue }
 		first := c.first[p]
-		if first == nil { continue }
-		last := c.last[p]
+		last  := c.last[p]
 		if p == current_wid {
 			last.next = pools[p].local_free
 			pools[p].local_free = first
 		} else {
 			mpsc_push_chain(&pools[p].remote_returns, first, last)
 		}
-		c.first[p] = nil
-		c.last[p]  = nil
 	}
+	c.used_mask = 0
 }
 
 // =============================================================================

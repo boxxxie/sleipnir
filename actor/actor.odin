@@ -675,7 +675,15 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 
 		// 2. Execute up to `quota` messages on the actor, then reclaim outer-turn temp memory.
 		processed, has_more := a.step_proc(a, &ctx, quota)
-		free_all(context.temp_allocator)
+		when !runtime.NO_DEFAULT_TEMP_ALLOCATOR {
+			if context.temp_allocator.procedure != runtime.default_temp_allocator_proc {
+				free_all(context.temp_allocator)
+			} else if ta := cast(^runtime.Default_Temp_Allocator)context.temp_allocator.data; ta != nil && ta.arena.total_used > 0 {
+				free_all(context.temp_allocator)
+			}
+		} else {
+			free_all(context.temp_allocator)
+		}
 
 		// 3. Reschedule or unschedule with `.Seq_Cst` Dekker barrier before decrementing `active_actors`
 		if has_more {
@@ -1031,14 +1039,40 @@ spawn_self :: proc(
 	return spawn_val_auto(initial_state, initial_state.receive, id, allocator)
 }
 
+// Retire a consumed or drained envelope (wake pending `actor.call` waiters as faulted if
+// un-replied, then free heap nodes or append pooled nodes to `collector`).
+@(private)
+step_retire_envelope :: #force_inline proc(
+	ref: ^Actor_Ref($Msg),
+	env: ^Envelope(Msg),
+	flags: u16,
+	reply_slot: rawptr,
+	collector: ^Batch_Return_Collector(Msg),
+	has_pools: bool,
+) {
+	if (flags & ENVELOPE_FLAG_CALL) != 0 && reply_slot != nil {
+		complete_call_slot(reply_slot, CALL_STATE_FAULTED)
+	}
+	if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
+		pid := env.pool_id
+		alloc := ref.pools[pid].allocator if (has_pools && int(pid) < len(ref.pools)) else ref.allocator
+		if alloc.procedure == nil {
+			alloc = context.allocator
+		}
+		free(env, alloc)
+	} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 && int(env.pool_id) < len(ref.pools) {
+		collector_add(collector, env)
+	}
+}
+
 // Pop and reclaim all remaining envelopes in an actor's mailbox, waking any
 // queued synchronous `actor.call` waiters with `CALL_STATE_FAULTED`.
 @(private)
 actor_ref_drain_mailbox :: proc(ref: ^Actor_Ref($Msg)) {
 	if ref == nil { return }
-	collector: Batch_Return_Collector(Msg)
+	collector: Batch_Return_Collector(Msg) = ---
+	collector.used_mask = 0
 	has_pools := len(ref.pools) > 0
-	has_pooled_retires := false
 	for {
 		env := mpsc_pop_detached(&ref.mailbox)
 		if env == nil {
@@ -1048,22 +1082,9 @@ actor_ref_drain_mailbox :: proc(ref: ^Actor_Ref($Msg)) {
 			}
 			break
 		}
-		if (env.flags & ENVELOPE_FLAG_CALL) != 0 && env.reply_slot != nil {
-			complete_call_slot(env.reply_slot, CALL_STATE_FAULTED)
-		}
-		if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
-			pid := env.pool_id
-			alloc := ref.pools[pid].allocator if (has_pools && int(pid) < len(ref.pools)) else ref.allocator
-			if alloc.procedure == nil {
-				alloc = context.allocator
-			}
-			free(env, alloc)
-		} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 && int(env.pool_id) < len(ref.pools) {
-			collector_add(&collector, env)
-			has_pooled_retires = true
-		}
+		step_retire_envelope(ref, env, env.flags, env.reply_slot, &collector, has_pools)
 	}
-	if has_pools && has_pooled_retires {
+	if has_pools {
 		collector_flush(&collector, ref.pools, -1)
 	}
 }
@@ -1106,6 +1127,70 @@ actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 	free(a, a.allocator)
 }
 
+@(private)
+actor_step_trapped :: #force_no_inline proc(
+	self: ^Actor($State, $Msg),
+	base: ^Actor_Base,
+	ctx: ^Context,
+	quota: int,
+	collector: ^Batch_Return_Collector(Msg),
+	has_pools: bool,
+	$Mode: int,
+) -> (int, bool) {
+	processed := 0
+	for processed < quota {
+		if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+			break
+		}
+		env := mpsc_pop_detached(&self.mailbox)
+		if env == nil { break }
+
+		ctx.current_env        = env
+		ctx.current_reply_slot = env.reply_slot
+		ctx.current_flags      = env.flags
+		ctx.forwarded          = false
+
+		trapped, normal_exit, fault := execute_trapped_actor_turn(self, env, ctx, Mode)
+		processed += 1
+		if trapped {
+			reply_slot := ctx.current_reply_slot
+			flags := ctx.current_flags
+			if !ctx.forwarded {
+				step_retire_envelope(&self.ref, env, 0, nil, collector, has_pools)
+			}
+			if has_pools {
+				collector_flush(collector, self.pools, -1)
+			}
+
+			ctx.current_env        = nil
+			ctx.current_reply_slot = nil
+			ctx.current_flags      = 0
+			ctx.current_pools_raw  = nil
+			ctx.current_msg_type   = nil
+
+			// Keep `ctx.current_actor = base` across `handle_actor_turn_exit` so
+			// `finalize_actor_stopped` sees `is_self_step == true` while `in_step == 1`.
+			handle_actor_turn_exit(base, normal_exit, fault)
+			if (flags & ENVELOPE_FLAG_CALL) != 0 && reply_slot != nil {
+				complete_call_slot(reply_slot, CALL_STATE_FAULTED)
+			}
+			return processed, false
+		}
+
+		if !ctx.forwarded {
+			step_retire_envelope(&self.ref, env, ctx.current_flags, ctx.current_reply_slot, collector, has_pools)
+		}
+	}
+
+	if has_pools {
+		collector_flush(collector, self.pools, -1)
+	}
+	if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+		return processed, false
+	}
+	return processed, !mpsc_is_empty(&self.mailbox)
+}
+
 // Generates the specialized type-erased step procedure for `Actor($State, $Msg)`.
 // When `quota == 0`, acts as a pure non-consuming readiness probe (`!mpsc_is_empty(&a.mailbox)`).
 @(private)
@@ -1126,98 +1211,58 @@ actor_generic_step_proc :: proc(
 		intrinsics.atomic_store_explicit(&base.in_step, 1, .Seq_Cst)
 		defer intrinsics.atomic_store_explicit(&base.in_step, 0, .Seq_Cst)
 
-		collector: Batch_Return_Collector(Msg)
+		collector: Batch_Return_Collector(Msg) = ---
+		collector.used_mask = 0
 		has_pools := len(self.pools) > 0
-		pools_raw := raw_data(self.pools)
 		processed := 0
 
-		for processed < quota {
-			if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
-				break
-			}
-			env := mpsc_pop_detached(&self.mailbox)
-			if env == nil { break }
-
-			ctx.current_actor      = base
-			ctx.current_pools_raw  = pools_raw
-			ctx.current_msg_type   = typeid_of(Msg)
-			ctx.current_env        = env
-			ctx.current_reply_slot = env.reply_slot
-			ctx.current_flags      = env.flags
-			ctx.forwarded          = false
-
-			if base.trap_panics || base.user_ptr != nil {
-				trapped, normal_exit, fault := execute_trapped_actor_turn(self, env, ctx, Mode)
-				if trapped {
-					processed += 1
-					reply_slot := ctx.current_reply_slot
-					flags := ctx.current_flags
-					if !ctx.forwarded {
-						if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
-							pid := env.pool_id
-							alloc := self.pools[pid].allocator if (has_pools && int(pid) < len(self.pools)) else self.allocator
-							if alloc.procedure == nil {
-								alloc = context.allocator
-							}
-							free(env, alloc)
-						} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 {
-							collector_add(&collector, env)
-						}
-					}
-					if processed > 0 && has_pools {
-						collector_flush(&collector, self.pools, -1)
-					}
-
-					ctx.current_env        = nil
-					ctx.current_reply_slot = nil
-					ctx.current_flags      = 0
-					ctx.current_pools_raw  = nil
-					ctx.current_msg_type   = nil
-
-					// Keep `ctx.current_actor = base` across `handle_actor_turn_exit` so
-					// `finalize_actor_stopped` sees `is_self_step == true` while `in_step == 1`.
-					handle_actor_turn_exit(base, normal_exit, fault)
-					ctx.current_actor      = nil
-					if (flags & ENVELOPE_FLAG_CALL) != 0 && reply_slot != nil {
-						complete_call_slot(reply_slot, CALL_STATE_FAULTED)
-					}
-					return processed, false
-				}
-			} else {
-				when Mode == STEP_MODE_ACTOR {
-					self.receive(ctx, self, &env.msg)
-				} else when Mode == STEP_MODE_STATE {
-					self.receive_state(ctx, &self.state, &env.msg)
-				} else when Mode == STEP_MODE_SIMPLE {
-					self.receive_simple(&self.state, &env.msg)
-				} else when Mode == STEP_MODE_VAL {
-					self.receive_val(&self.state, env.msg)
-				}
-			}
-			processed += 1
-
-			if !ctx.forwarded {
-				if (ctx.current_flags & ENVELOPE_FLAG_CALL) != 0 && ctx.current_reply_slot != nil {
-					complete_call_slot(ctx.current_reply_slot, CALL_STATE_FAULTED)
-				}
-				if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
-					pid := env.pool_id
-					alloc := self.pools[pid].allocator if (has_pools && int(pid) < len(self.pools)) else self.allocator
-					if alloc.procedure == nil {
-						alloc = context.allocator
-					}
-					free(env, alloc)
-				} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 {
-					collector_add(&collector, env)
-				}
-			}
-
+		ctx.current_actor     = base
+		ctx.current_pools_raw = raw_data(self.pools)
+		ctx.current_msg_type  = typeid_of(Msg)
+		defer {
 			ctx.current_env        = nil
 			ctx.current_reply_slot = nil
 			ctx.current_flags      = 0
 			ctx.current_actor      = nil
 			ctx.current_pools_raw  = nil
 			ctx.current_msg_type   = nil
+			ctx.forwarded          = false
+		}
+
+		if base.trap_panics || base.user_ptr != nil {
+			return actor_step_trapped(self, base, ctx, quota, &collector, has_pools, Mode)
+		}
+
+		for processed < quota {
+			if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+				break
+			}
+			if base.trap_panics || base.user_ptr != nil {
+				p2, has_more := actor_step_trapped(self, base, ctx, quota - processed, &collector, has_pools, Mode)
+				return processed + p2, has_more
+			}
+			env := mpsc_pop_detached(&self.mailbox)
+			if env == nil { break }
+
+			ctx.current_env        = env
+			ctx.current_reply_slot = env.reply_slot
+			ctx.current_flags      = env.flags
+			ctx.forwarded          = false
+
+			when Mode == STEP_MODE_ACTOR {
+				self.receive(ctx, self, &env.msg)
+			} else when Mode == STEP_MODE_STATE {
+				self.receive_state(ctx, &self.state, &env.msg)
+			} else when Mode == STEP_MODE_SIMPLE {
+				self.receive_simple(&self.state, &env.msg)
+			} else when Mode == STEP_MODE_VAL {
+				self.receive_val(&self.state, env.msg)
+			}
+			processed += 1
+
+			if !ctx.forwarded {
+				step_retire_envelope(&self.ref, env, ctx.current_flags, ctx.current_reply_slot, &collector, has_pools)
+			}
 		}
 
 		if processed > 0 && has_pools {
