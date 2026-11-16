@@ -539,7 +539,7 @@ actor_cleanup_supervision :: proc(base: ^Actor_Base) {
 }
 
 @(private)
-actor_drain_stopped_target :: proc(base: ^Actor_Base) {
+actor_drain_stopped_target :: proc(base: ^Actor_Base, wait_if_busy: bool = true) {
 	if base == nil {
 		return
 	}
@@ -548,7 +548,7 @@ actor_drain_stopped_target :: proc(base: ^Actor_Base) {
 		return
 	}
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == base
-	if !is_self_step {
+	if wait_if_busy && !is_self_step {
 		for intrinsics.atomic_load_explicit(&base.in_step, .Acquire) != 0 {
 			intrinsics.cpu_relax()
 		}
@@ -556,6 +556,11 @@ actor_drain_stopped_target :: proc(base: ^Actor_Base) {
 		    intrinsics.atomic_load_explicit(&ext.stopped_drained, .Acquire) == 0 {
 			intrinsics.cpu_relax()
 		}
+	}
+	if intrinsics.atomic_load_explicit(&ext.stopped_drained, .Seq_Cst) == 0 {
+		// `finalize_actor_stopped` has not drained this target yet and will drain all
+		// already-pushed envelopes once the target exits its active turn.
+		return
 	}
 	sync.mutex_lock(&ext.monitors_mu)
 	if ext.drain_proc != nil {
@@ -570,7 +575,20 @@ finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fa
 		return
 	}
 	ext := ensure_actor_ext(base)
+
+	sync.mutex_lock(&ext.monitors_mu)
+	if intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 {
+		if ext.drain_proc != nil {
+			ext.drain_proc(base)
+		}
+		sync.mutex_unlock(&ext.monitors_mu)
+		return
+	}
+	intrinsics.atomic_store_explicit(&ext.finalized, 1, .Release)
+	ext.last_exit_reason = reason
+	ext.last_fault       = fault
 	intrinsics.atomic_store_explicit(&base.status, u32(Actor_Status.Stopped), .Seq_Cst)
+	sync.mutex_unlock(&ext.monitors_mu)
 
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == base
 	if !is_self_step {
@@ -580,17 +598,12 @@ finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fa
 	}
 
 	sync.mutex_lock(&ext.monitors_mu)
-	if ext.finalized != 0 {
-		sync.mutex_unlock(&ext.monitors_mu)
-		return
-	}
-	ext.finalized        = 1
-	ext.last_exit_reason = reason
-	ext.last_fault       = fault
+	// Publish `stopped_drained` BEFORE calling `drain_proc` under `monitors_mu` so concurrent
+	// async senders either observe `0` before `drain_proc` starts or `1` and drain under `monitors_mu`.
+	intrinsics.atomic_store_explicit(&ext.stopped_drained, 1, .Seq_Cst)
 	if ext.drain_proc != nil {
 		ext.drain_proc(base)
 	}
-	intrinsics.atomic_store_explicit(&ext.stopped_drained, 1, .Release)
 	local_mons  := ext.monitors
 	local_hooks := ext.reg_hooks
 	ext.monitors  = {}
@@ -658,10 +671,10 @@ handle_actor_turn_exit :: proc(base: ^Actor_Base, normal_exit: bool, fault: Faul
 						reason     = reason,
 						fault      = fault,
 					}))
+					return
 				}
 			}
 		}
-		return
 	}
 
 	finalize_actor_stopped(base, reason, fault)
@@ -739,6 +752,7 @@ monitor_actor :: proc(watcher: PID(Down_Event), target: ^Actor($State, $Msg)) ->
 		return {}
 	}
 	ext := ensure_actor_ext(&target.base)
+	sync.mutex_lock(&ext.monitors_mu)
 	if ext.drain_proc == nil {
 		ext.drain_proc = proc(base: ^Actor_Base) {
 			self := cast(^Actor(State, Msg))base
@@ -751,6 +765,7 @@ monitor_actor :: proc(watcher: PID(Down_Event), target: ^Actor($State, $Msg)) ->
 			return !mpsc_is_empty(&self.mailbox)
 		}
 	}
+	sync.mutex_unlock(&ext.monitors_mu)
 	return monitor_impl(watcher, &target.base, 0)
 }
 
@@ -872,7 +887,7 @@ try_call_sched_pid :: proc(
 
 	var_caller_ext: ^Actor_Extension
 	if caller_ctx != nil && caller_ctx.current_actor != nil {
-		var_caller_ext = get_actor_ext(caller_ctx.current_actor)
+		var_caller_ext = ensure_actor_ext(caller_ctx.current_actor)
 		if var_caller_ext != nil {
 			intrinsics.atomic_store_explicit(&var_caller_ext.calling_target, target_base, .Release)
 		}
@@ -886,7 +901,7 @@ try_call_sched_pid :: proc(
 
 	if intrinsics.atomic_load_explicit(&target_base.status, .Seq_Cst) == u32(Actor_Status.Stopped) &&
 	   intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) < CALL_STATE_REPLIED {
-		actor_drain_stopped_target(target_base)
+		actor_drain_stopped_target(target_base, caller_ctx == nil)
 	}
 
 	final_state := wait_for_call_slot(eff_sched, &slot, caller_ctx)
@@ -1049,6 +1064,7 @@ Child_Entry :: struct {
 @(private)
 Supervisor_Internal :: struct {
 	mu:              sync.Mutex,
+	op_mu:           sync.Recursive_Mutex,
 	sup_actor:       ^Supervisor,
 	children:        [dynamic]Child_Entry,
 	restart_history: [dynamic]time.Tick,
@@ -1184,10 +1200,10 @@ run_trapped_reinit_hook :: #force_no_inline proc(ext: ^Actor_Extension, base: ^A
 }
 
 @(private)
-reinit_child_entry_reset_only :: proc(entry: ^Child_Entry, sup: ^Supervisor) -> (ok: bool, fault: Fault_Info) {
-	c := entry.base
-	cext := get_actor_ext(c)
-
+prepare_child_reset_unlocked :: proc(c: ^Actor_Base) {
+	if c == nil {
+		return
+	}
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == c
 	if !is_self_step {
 		for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
@@ -1195,12 +1211,15 @@ reinit_child_entry_reset_only :: proc(entry: ^Child_Entry, sup: ^Supervisor) -> 
 		}
 	}
 
+	cext := get_actor_ext(c)
 	if cext != nil {
+		sync.mutex_lock(&cext.monitors_mu)
+		intrinsics.atomic_store_explicit(&cext.finalized, 0, .Release)
+		intrinsics.atomic_store_explicit(&cext.stopped_drained, 0, .Release)
 		if !cext.keep_mailbox && cext.drain_proc != nil {
-			sync.mutex_lock(&cext.monitors_mu)
 			cext.drain_proc(c)
-			sync.mutex_unlock(&cext.monitors_mu)
 		}
+		sync.mutex_unlock(&cext.monitors_mu)
 		if cext.use_arena && cext.arena_initialized {
 			vmem.arena_free_all(&cext.arena)
 		}
@@ -1209,16 +1228,6 @@ reinit_child_entry_reset_only :: proc(entry: ^Child_Entry, sup: ^Supervisor) -> 
 			mem.copy(dst, cext.init_state_copy, cext.state_size)
 		}
 	}
-
-	new_gen := intrinsics.atomic_add_explicit(&c.generation, 1, .Acq_Rel) + 1
-	entry.expected_gen = new_gen
-	entry.restarts += 1
-	if sup != nil {
-		sup.state.stats.children_restarted += 1
-		sup.state.stats.total_restarts += 1
-	}
-
-	return run_trapped_reinit_hook(cext, c)
 }
 
 @(private)
@@ -1234,12 +1243,20 @@ activate_restarted_child :: proc(c: ^Actor_Base) {
 }
 
 @(private)
-stop_live_child_for_restart :: proc(sib: ^Child_Entry) {
-	if sib.admin_stopped {
+stop_live_child_for_restart_unlocked :: proc(c: ^Actor_Base, policy: Restart_Policy, is_supervisor: bool, admin_stopped: bool) {
+	if admin_stopped || c == nil {
 		return
 	}
-	c := sib.base
-	target_status := u32(Actor_Status.Stopped) if sib.policy == .Temporary else u32(Actor_Status.Faulted)
+	if is_supervisor {
+		child_sup := cast(^Supervisor)c
+		perm := policy == .Temporary
+		if !perm {
+			intrinsics.atomic_store_explicit(&child_sup.base.status, u32(Actor_Status.Faulted), .Seq_Cst)
+		}
+		stop_supervisor_subtree_iterative(child_sup, .Supervisor_Shutdown, -1, {}, permanent_stop = perm)
+		return
+	}
+	target_status := u32(Actor_Status.Stopped) if policy == .Temporary else u32(Actor_Status.Faulted)
 	prev := intrinsics.atomic_exchange_explicit(&c.status, target_status, .Seq_Cst)
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == c
 	if !is_self_step {
@@ -1251,7 +1268,7 @@ stop_live_child_for_restart :: proc(sib: ^Child_Entry) {
 	if prev == u32(Actor_Status.Running) {
 		run_trapped_stop_hook(cext, c, .Supervisor_Shutdown)
 	}
-	if sib.policy == .Temporary {
+	if policy == .Temporary {
 		finalize_actor_stopped(c, .Supervisor_Shutdown, {})
 		free_actor_reset_resources(cext)
 	}
@@ -1261,16 +1278,24 @@ stop_live_child_for_restart :: proc(sib: ^Child_Entry) {
 Stop_Frame :: struct {
 	sup:      ^Supervisor,
 	next_idx: int,
+	perm:     bool,
 }
 
 @(private)
-stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason, crashed_root_child_idx: int, crash_fault: Fault_Info, permanent_stop: bool) {
+stop_supervisor_subtree_iterative :: proc(
+	root: ^Supervisor,
+	reason: Exit_Reason,
+	crashed_root_child_idx: int,
+	crash_fault: Fault_Info,
+	permanent_stop: bool,
+	mark_stopped: bool = false,
+) {
 	if root == nil {
 		return
 	}
 	root_si := get_sup_internal(root)
 	if root_si == nil {
-		if permanent_stop {
+		if permanent_stop || mark_stopped {
 			finalize_actor_stopped(&root.base, reason, crash_fault)
 		}
 		return
@@ -1280,7 +1305,7 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 	}
 	alloc := root.allocator
 
-	// Phase 1: Iteratively mark every supervisor in the subtree STOPPING + Stopped status
+	// Phase 1: Iteratively mark non-stopped supervisors in the subtree STOPPING + Stopped/Faulted status
 	// and wait for any active `step_proc` turn on those supervisors to quiesce before reading rosters.
 	visit_stack := make([dynamic]^Supervisor, 0, 16, alloc)
 	defer delete(visit_stack)
@@ -1292,11 +1317,27 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		if csi == nil {
 			continue
 		}
-		old_st := intrinsics.atomic_exchange_explicit(&csi.sup_state, SUP_STOPPING, .Seq_Cst)
-		if old_st == SUP_STOPPED {
+		was_already_stopped := false
+		for {
+			cur_st := intrinsics.atomic_load_explicit(&csi.sup_state, .Acquire)
+			if cur_st == SUP_STOPPED {
+				was_already_stopped = true
+				break
+			}
+			if _, cas_ok := intrinsics.atomic_compare_exchange_weak_explicit(
+				&csi.sup_state,
+				cur_st,
+				SUP_STOPPING,
+				.Seq_Cst,
+				.Acquire,
+			); cas_ok {
+				break
+			}
+		}
+		if was_already_stopped && !permanent_stop {
 			continue
 		}
-		if permanent_stop {
+		if permanent_stop || mark_stopped {
 			intrinsics.atomic_store_explicit(&cur.base.status, u32(Actor_Status.Stopped), .Seq_Cst)
 		} else if cur != root {
 			intrinsics.atomic_store_explicit(&cur.base.status, u32(Actor_Status.Faulted), .Seq_Cst)
@@ -1308,6 +1349,9 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		}
 		sync.mutex_lock(&csi.mu)
 		for entry in csi.children {
+			if !permanent_stop && entry.admin_stopped {
+				continue
+			}
 			if entry.is_supervisor && entry.base != nil {
 				append(&visit_stack, cast(^Supervisor)entry.base)
 			}
@@ -1322,7 +1366,7 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 	sync.mutex_lock(&root_si.mu)
 	root_len := len(root_si.children)
 	sync.mutex_unlock(&root_si.mu)
-	append(&frames, Stop_Frame{sup = root, next_idx = root_len - 1})
+	append(&frames, Stop_Frame{sup = root, next_idx = root_len - 1, perm = permanent_stop})
 
 	for len(frames) > 0 {
 		top := &frames[len(frames) - 1]
@@ -1331,6 +1375,7 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 			pop(&frames)
 			continue
 		}
+		cur_perm := top.perm
 		sync.mutex_lock(&tsi.mu)
 		idx := top.next_idx
 		if idx < 0 || idx >= len(tsi.children) {
@@ -1345,8 +1390,10 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 			}
 			sync.mutex_unlock(&tsi.mu)
 			done_sup := pop(&frames).sup
-			if permanent_stop {
-				intrinsics.atomic_store_explicit(&tsi.sup_state, SUP_STOPPED, .Seq_Cst)
+			if cur_perm || mark_stopped {
+				if intrinsics.atomic_load_explicit(&tsi.sup_state, .Acquire) != SUP_STOPPED {
+					intrinsics.atomic_store_explicit(&tsi.sup_state, SUP_STOPPED, .Seq_Cst)
+				}
 				sup_reason := Exit_Reason.Escalated if (done_sup == root && crashed_root_child_idx >= 0) else reason
 				finalize_actor_stopped(&done_sup.base, sup_reason, crash_fault if done_sup == root else {})
 			}
@@ -1355,6 +1402,10 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		entry := tsi.children[idx]
 		top.next_idx = idx - 1
 		sync.mutex_unlock(&tsi.mu)
+
+		if !cur_perm && entry.admin_stopped {
+			continue
+		}
 
 		if entry.is_supervisor && entry.base != nil {
 			child_sup := cast(^Supervisor)entry.base
@@ -1365,7 +1416,8 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 				c_len = len(child_si.children)
 				sync.mutex_unlock(&child_si.mu)
 			}
-			append(&frames, Stop_Frame{sup = child_sup, next_idx = c_len - 1})
+			child_perm := cur_perm || (entry.policy == .Temporary)
+			append(&frames, Stop_Frame{sup = child_sup, next_idx = c_len - 1, perm = child_perm})
 			continue
 		}
 
@@ -1373,7 +1425,7 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		if c == nil {
 			continue
 		}
-		target_status := u32(Actor_Status.Stopped) if (permanent_stop || entry.policy == .Temporary) else u32(Actor_Status.Faulted)
+		target_status := u32(Actor_Status.Stopped) if (cur_perm || mark_stopped || entry.policy == .Temporary) else u32(Actor_Status.Faulted)
 		prev := intrinsics.atomic_exchange_explicit(&c.status, target_status, .Seq_Cst)
 		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != c {
 			for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
@@ -1385,11 +1437,13 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		if !is_crashed_child && prev == u32(Actor_Status.Running) && !entry.admin_stopped {
 			run_trapped_stop_hook(cext, c, reason)
 		}
-		if permanent_stop || entry.policy == .Temporary {
+		if cur_perm || mark_stopped || entry.policy == .Temporary {
 			eff_reason := reason if !is_crashed_child else crash_fault.reason
 			eff_fault  := crash_fault if is_crashed_child else Fault_Info{}
 			finalize_actor_stopped(c, eff_reason, eff_fault)
-			free_actor_reset_resources(cext)
+			if cur_perm || entry.policy == .Temporary {
+				free_actor_reset_resources(cext)
+			}
 		} else {
 			if cext != nil {
 				if !cext.keep_mailbox && cext.drain_proc != nil {
@@ -1429,6 +1483,7 @@ supervisor_reinit_as_child :: proc(base: ^Actor_Base, _fn_ptr: rawptr, _alloc: m
 		if csi == nil {
 			continue
 		}
+		sync.recursive_mutex_lock(&csi.op_mu)
 		sync.mutex_lock(&csi.mu)
 		clear(&csi.restart_history)
 		intrinsics.atomic_store_explicit(&csi.sup_state, SUP_RUNNING, .Seq_Cst)
@@ -1440,11 +1495,32 @@ supervisor_reinit_as_child :: proc(base: ^Actor_Base, _fn_ptr: rawptr, _alloc: m
 			}
 		}
 
-		for i := 0; i < len(csi.children); i += 1 {
-			entry := &csi.children[i]
-			if entry.admin_stopped {
+		child_ids := make([]u64, len(csi.children), alloc)
+		for entry, i in csi.children {
+			child_ids[i] = entry.id
+		}
+		sync.mutex_unlock(&csi.mu)
+
+		reinit_failed := false
+		for cid in child_ids {
+			sync.mutex_lock(&csi.mu)
+			if intrinsics.atomic_load_explicit(&csi.sup_state, .Acquire) != SUP_RUNNING {
+				sync.mutex_unlock(&csi.mu)
+				reinit_failed = true
+				break
+			}
+			idx := -1
+			for e, i in csi.children {
+				if e.id == cid {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 || csi.children[idx].admin_stopped {
+				sync.mutex_unlock(&csi.mu)
 				continue
 			}
+			entry := &csi.children[idx]
 			if entry.is_supervisor && entry.base != nil {
 				sub := cast(^Supervisor)entry.base
 				intrinsics.atomic_add_explicit(&sub.base.generation, 1, .Acq_Rel)
@@ -1454,14 +1530,52 @@ supervisor_reinit_as_child :: proc(base: ^Actor_Base, _fn_ptr: rawptr, _alloc: m
 				cur.state.stats.total_restarts += 1
 				append(&stack, sub)
 				intrinsics.atomic_store_explicit(&sub.base.status, u32(Actor_Status.Running), .Seq_Cst)
+				sync.mutex_unlock(&csi.mu)
 				continue
 			}
-			ok, _ := reinit_child_entry_reset_only(entry, cur)
-			if ok {
-				activate_restarted_child(entry.base)
+			c_base := entry.base
+			sync.mutex_unlock(&csi.mu)
+
+			prepare_child_reset_unlocked(c_base)
+
+			sync.mutex_lock(&csi.mu)
+			idx = -1
+			for e, i in csi.children {
+				if e.id == cid {
+					idx = i
+					break
+				}
 			}
+			if idx < 0 || csi.children[idx].admin_stopped || intrinsics.atomic_load_explicit(&csi.sup_state, .Acquire) != SUP_RUNNING {
+				sync.mutex_unlock(&csi.mu)
+				continue
+			}
+			entry = &csi.children[idx]
+			new_gen := intrinsics.atomic_add_explicit(&c_base.generation, 1, .Acq_Rel) + 1
+			entry.expected_gen = new_gen
+			entry.restarts += 1
+			cur.state.stats.children_restarted += 1
+			cur.state.stats.total_restarts += 1
+			sync.mutex_unlock(&csi.mu)
+
+			ok, _ := run_trapped_reinit_hook(get_actor_ext(c_base), c_base)
+			if !ok {
+				reinit_failed = true
+				break
+			}
+			activate_restarted_child(c_base)
 		}
-		sync.mutex_unlock(&csi.mu)
+		delete(child_ids, alloc)
+		sync.recursive_mutex_unlock(&csi.op_mu)
+
+		if reinit_failed {
+			delete(stack)
+			stack = nil
+			stop_supervisor_subtree_iterative(root_sup, .Supervisor_Shutdown, -1, {}, permanent_stop = false)
+			intrinsics.atomic_store_explicit(&root_sup.base.status, u32(Actor_Status.Faulted), .Seq_Cst)
+			fail_turn_reason(.Panic, "child reinit failed during supervisor_reinit_as_child")
+			return
+		}
 	}
 }
 
@@ -1471,6 +1585,9 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 	if si == nil {
 		return
 	}
+
+	sync.recursive_mutex_lock(&si.op_mu)
+	defer sync.recursive_mutex_unlock(&si.op_mu)
 
 	// Acquire supervisor roster lock cleanly.
 	sync.mutex_lock(&si.mu)
@@ -1498,14 +1615,18 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 	}
 
 	if !should_restart_for_reason(entry.policy, down.reason) {
-		finalize_actor_stopped(entry.base, down.reason, down.fault)
-		if entry.policy == .Temporary {
-			free_actor_reset_resources(get_actor_ext(entry.base))
-			ordered_remove(&si.children, idx)
-		} else {
+		base_ptr := entry.base
+		is_temp := entry.policy == .Temporary
+		if !is_temp {
 			entry.admin_stopped = true
+		} else {
+			ordered_remove(&si.children, idx)
 		}
 		sync.mutex_unlock(&si.mu)
+		finalize_actor_stopped(base_ptr, down.reason, down.fault)
+		if is_temp {
+			free_actor_reset_resources(get_actor_ext(base_ptr))
+		}
 		return
 	}
 
@@ -1524,6 +1645,12 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 		end_idx = len(si.children) - 1
 	}
 
+	cohort_ids := make([]u64, end_idx - start_idx + 1, sup.allocator)
+	for i := start_idx; i <= end_idx; i += 1 {
+		cohort_ids[i - start_idx] = si.children[i].id
+	}
+	defer delete(cohort_ids, sup.allocator)
+
 	window := sup.state.cfg.max_window
 	if window <= 0 {
 		window = sup.state.cfg.within_window
@@ -1535,6 +1662,8 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 	siblings_stopped := false
 	cur_fault := down.fault
 	cur_fault.reason = down.reason
+	reinit_bases := make([dynamic]^Actor_Base, 0, len(cohort_ids), sup.allocator)
+	defer delete(reinit_bases)
 
 	for {
 		if intrinsics.atomic_load_explicit(&si.sup_state, .Acquire) != SUP_RUNNING {
@@ -1554,6 +1683,13 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 		resize(&si.restart_history, write_i)
 
 		if len(si.restart_history) >= sup.state.cfg.max_restarts {
+			cur_crash_idx := -1
+			for e, i in si.children {
+				if e.id == down.child_id {
+					cur_crash_idx = i
+					break
+				}
+			}
 			sup.state.stats.escalated = true
 			sup_ext := get_actor_ext(&sup.base)
 			has_parent := sup_ext != nil && sup_ext.is_supervised && sup_ext.sup != nil
@@ -1561,7 +1697,7 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 			if has_parent {
 				// Release lock while iterative subtree helper traverses sub-supervisors
 				sync.mutex_unlock(&si.mu)
-				stop_supervisor_subtree_iterative(sup, .Supervisor_Shutdown, idx, cur_fault, permanent_stop = false)
+				stop_supervisor_subtree_iterative(sup, .Supervisor_Shutdown, cur_crash_idx, cur_fault, permanent_stop = false)
 				// Prune temporary children from our roster while retaining Permanent/Transient for parent restart
 				sync.mutex_lock(&si.mu)
 				for i := len(si.children) - 1; i >= 0; i -= 1 {
@@ -1585,7 +1721,7 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 				}
 			} else {
 				sync.mutex_unlock(&si.mu)
-				stop_supervisor_subtree_iterative(sup, .Supervisor_Shutdown, idx, cur_fault, permanent_stop = true)
+				stop_supervisor_subtree_iterative(sup, .Supervisor_Shutdown, cur_crash_idx, cur_fault, permanent_stop = true)
 			}
 			return
 		}
@@ -1593,63 +1729,128 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 		append(&si.restart_history, now)
 		sup.state.stats.restart_cycles += 1
 
-		// Stop affected live siblings in reverse order on first iteration
+		// Stop affected live siblings in reverse order on first iteration without holding si.mu
 		if !siblings_stopped {
 			siblings_stopped = true
-			for i := end_idx; i >= start_idx; i -= 1 {
-				if i == idx {
+			sync.mutex_unlock(&si.mu)
+			for k := len(cohort_ids) - 1; k >= 0; k -= 1 {
+				sib_id := cohort_ids[k]
+				if sib_id == down.child_id {
 					continue
 				}
-				sib := &si.children[i]
-				stop_live_child_for_restart(sib)
+				sync.mutex_lock(&si.mu)
+				sib_base: ^Actor_Base
+				sib_policy: Restart_Policy
+				sib_is_sup: bool
+				sib_admin_stopped := true
+				for e in si.children {
+					if e.id == sib_id {
+						sib_base          = e.base
+						sib_policy        = e.policy
+						sib_is_sup        = e.is_supervisor
+						sib_admin_stopped = e.admin_stopped
+						break
+					}
+				}
+				sync.mutex_unlock(&si.mu)
+				stop_live_child_for_restart_unlocked(sib_base, sib_policy, sib_is_sup, sib_admin_stopped)
+			}
+			sync.mutex_lock(&si.mu)
+			if intrinsics.atomic_load_explicit(&si.sup_state, .Acquire) != SUP_RUNNING {
+				sync.mutex_unlock(&si.mu)
+				return
 			}
 		}
 
-		// Reinitialize cohort in forward order
+		// Reinitialize cohort in forward order without holding si.mu across in_step waits or hooks
+		clear(&reinit_bases)
 		reinit_failed := false
-		failed_at := -1
-		for i := start_idx; i <= end_idx; i += 1 {
-			c_entry := &si.children[i]
+		for cid in cohort_ids {
+			c_idx := -1
+			for e, i in si.children {
+				if e.id == cid {
+					c_idx = i
+					break
+				}
+			}
+			if c_idx < 0 {
+				continue
+			}
+			c_entry := &si.children[c_idx]
 			if c_entry.admin_stopped || c_entry.policy == .Temporary {
 				continue
 			}
-			ok, rfault := reinit_child_entry_reset_only(c_entry, sup)
+			c_base := c_entry.base
+			sync.mutex_unlock(&si.mu)
+
+			prepare_child_reset_unlocked(c_base)
+
+			sync.mutex_lock(&si.mu)
+			if intrinsics.atomic_load_explicit(&si.sup_state, .Acquire) != SUP_RUNNING {
+				sync.mutex_unlock(&si.mu)
+				return
+			}
+			c_idx = -1
+			for e, i in si.children {
+				if e.id == cid {
+					c_idx = i
+					break
+				}
+			}
+			if c_idx < 0 || si.children[c_idx].admin_stopped || si.children[c_idx].policy == .Temporary {
+				continue
+			}
+			c_entry = &si.children[c_idx]
+			new_gen := intrinsics.atomic_add_explicit(&c_base.generation, 1, .Acq_Rel) + 1
+			c_entry.expected_gen = new_gen
+			c_entry.restarts += 1
+			sup.state.stats.children_restarted += 1
+			sup.state.stats.total_restarts += 1
+			sync.mutex_unlock(&si.mu)
+
+			ok, rfault := run_trapped_reinit_hook(get_actor_ext(c_base), c_base)
+
+			sync.mutex_lock(&si.mu)
 			if !ok {
 				reinit_failed = true
-				failed_at = i
 				cur_fault = rfault
 				cur_fault.reason = .Panic
 				break
 			}
+			append(&reinit_bases, c_base)
 		}
 
 		if reinit_failed {
-			// Roll back siblings [start_idx ..< failed_at] in reverse order via trapped `on_stop`
-			for i := failed_at - 1; i >= start_idx; i -= 1 {
-				rb := &si.children[i]
-				if rb.admin_stopped || rb.policy == .Temporary {
-					continue
-				}
-				run_trapped_stop_hook(get_actor_ext(rb.base), rb.base, .Supervisor_Shutdown)
+			sync.mutex_unlock(&si.mu)
+			// Roll back already-reinitialized cohort children in reverse order via trapped `on_stop`
+			for i := len(reinit_bases) - 1; i >= 0; i -= 1 {
+				rb_base := reinit_bases[i]
+				run_trapped_stop_hook(get_actor_ext(rb_base), rb_base, .Supervisor_Shutdown)
 			}
+			sync.mutex_lock(&si.mu)
 			continue
 		}
 
-		// Cohort reinitialized cleanly: mark children Running and remove Temporary bystanders
-		for i := start_idx; i <= end_idx; i += 1 {
-			c_entry := &si.children[i]
-			if c_entry.admin_stopped || c_entry.policy == .Temporary {
-				continue
-			}
-			activate_restarted_child(c_entry.base)
-		}
-		for i := end_idx; i >= start_idx; i -= 1 {
-			if si.children[i].policy == .Temporary {
-				free_actor_reset_resources(get_actor_ext(si.children[i].base))
-				ordered_remove(&si.children, i)
+		// Cohort reinitialized cleanly: collect children to activate and prune Temporary bystanders
+		clear(&reinit_bases)
+		for cid in cohort_ids {
+			for i := len(si.children) - 1; i >= 0; i -= 1 {
+				if si.children[i].id != cid {
+					continue
+				}
+				if si.children[i].policy == .Temporary {
+					free_actor_reset_resources(get_actor_ext(si.children[i].base))
+					ordered_remove(&si.children, i)
+				} else if !si.children[i].admin_stopped {
+					append(&reinit_bases, si.children[i].base)
+				}
+				break
 			}
 		}
 		sync.mutex_unlock(&si.mu)
+		for c_base in reinit_bases {
+			activate_restarted_child(c_base)
+		}
 		return
 	}
 }
@@ -1844,9 +2045,10 @@ supervise_hooks :: proc(
 		return !mpsc_is_empty(&self.mailbox)
 	}
 	if hooks.use_arena && !ext.arena_initialized {
-		_ = vmem.arena_init_growing(&ext.arena, uint(16 * mem.Kilobyte))
-		ext.arena_alloc = vmem.arena_allocator(&ext.arena)
-		ext.arena_initialized = true
+		if arena_err := vmem.arena_init_growing(&ext.arena, uint(16 * mem.Kilobyte)); arena_err == nil {
+			ext.arena_alloc = vmem.arena_allocator(&ext.arena)
+			ext.arena_initialized = true
+		}
 	}
 
 	gen := intrinsics.atomic_load_explicit(&child.base.generation, .Acquire)
@@ -1972,15 +2174,41 @@ stop_supervisor :: proc(sup: ^Supervisor) {
 	stop_supervisor_subtree_iterative(sup, .Supervisor_Shutdown, -1, {}, permanent_stop = true)
 }
 
+@(private)
+free_subtree_reset_resources :: proc(root_base: ^Actor_Base, alloc: mem.Allocator) {
+	if root_base == nil {
+		return
+	}
+	stack := make([dynamic]^Actor_Base, 0, 8, alloc)
+	defer delete(stack)
+	append(&stack, root_base)
+	for len(stack) > 0 {
+		cur := pop(&stack)
+		cext := get_actor_ext(cur)
+		if cext != nil && cext.sup_internal != nil {
+			csi := cext.sup_internal
+			sync.mutex_lock(&csi.mu)
+			for entry in csi.children {
+				if entry.base != nil {
+					append(&stack, entry.base)
+				}
+			}
+			sync.mutex_unlock(&csi.mu)
+		}
+		free_actor_reset_resources(cext)
+	}
+}
+
 supervisor_terminate_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_Error {
 	si := get_sup_internal(sup)
 	if si == nil {
 		return .Not_Found
 	}
 
-	sync.mutex_lock(&si.mu)
-	defer sync.mutex_unlock(&si.mu)
+	sync.recursive_mutex_lock(&si.op_mu)
+	defer sync.recursive_mutex_unlock(&si.op_mu)
 
+	sync.mutex_lock(&si.mu)
 	idx := -1
 	for i := 0; i < len(si.children); i += 1 {
 		if si.children[i].id == child_id {
@@ -1989,31 +2217,30 @@ supervisor_terminate_child :: proc(sup: ^Supervisor, child_id: u64) -> Superviso
 		}
 	}
 	if idx < 0 {
+		sync.mutex_unlock(&si.mu)
 		return .Not_Found
 	}
 
 	entry := &si.children[idx]
-	if !entry.admin_stopped {
-		c := entry.base
-		if entry.is_supervisor && c != nil {
+	already_admin_stopped := entry.admin_stopped
+	is_sup := entry.is_supervisor
+	policy := entry.policy
+	c := entry.base
+	if !already_admin_stopped {
+		entry.admin_stopped = true
+		sync.mutex_unlock(&si.mu)
+
+		if is_sup && c != nil {
 			child_sup := cast(^Supervisor)c
-			sync.mutex_unlock(&si.mu)
-			stop_supervisor_subtree_iterative(child_sup, .Supervisor_Shutdown, -1, {}, permanent_stop = true)
-			sync.mutex_lock(&si.mu)
-			// Re-locate idx after re-locking in case roster mutated
-			idx = -1
-			for i := 0; i < len(si.children); i += 1 {
-				if si.children[i].id == child_id {
-					idx = i
-					break
-				}
-			}
-			if idx < 0 {
-				return .Not_Found
-			}
-			entry = &si.children[idx]
-			entry.admin_stopped = true
-		} else {
+			stop_supervisor_subtree_iterative(
+				child_sup,
+				.Supervisor_Shutdown,
+				-1,
+				{},
+				permanent_stop = (policy == .Temporary),
+				mark_stopped = (policy != .Temporary),
+			)
+		} else if c != nil {
 			prev := intrinsics.atomic_exchange_explicit(&c.status, u32(Actor_Status.Stopped), .Seq_Cst)
 			if _tls_active_ctx == nil || _tls_active_ctx.current_actor != c {
 				for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
@@ -2025,14 +2252,23 @@ supervisor_terminate_child :: proc(sup: ^Supervisor, child_id: u64) -> Superviso
 				run_trapped_stop_hook(cext, c, .Supervisor_Shutdown)
 			}
 			finalize_actor_stopped(c, .Supervisor_Shutdown, {})
-			entry.admin_stopped = true
+		}
+
+		sync.mutex_lock(&si.mu)
+		idx = -1
+		for i := 0; i < len(si.children); i += 1 {
+			if si.children[i].id == child_id {
+				idx = i
+				break
+			}
 		}
 	}
 
-	if entry.policy == .Temporary {
-		free_actor_reset_resources(get_actor_ext(entry.base))
+	if idx >= 0 && si.children[idx].policy == .Temporary {
+		free_subtree_reset_resources(si.children[idx].base, sup.allocator)
 		ordered_remove(&si.children, idx)
 	}
+	sync.mutex_unlock(&si.mu)
 	return .None
 }
 
@@ -2042,10 +2278,12 @@ supervisor_restart_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_
 		return .Not_Found
 	}
 
-	sync.mutex_lock(&si.mu)
-	defer sync.mutex_unlock(&si.mu)
+	sync.recursive_mutex_lock(&si.op_mu)
+	defer sync.recursive_mutex_unlock(&si.op_mu)
 
+	sync.mutex_lock(&si.mu)
 	if intrinsics.atomic_load_explicit(&si.sup_state, .Acquire) != SUP_RUNNING {
+		sync.mutex_unlock(&si.mu)
 		return .Supervisor_Stopping
 	}
 
@@ -2057,29 +2295,78 @@ supervisor_restart_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_
 		}
 	}
 	if idx < 0 {
+		sync.mutex_unlock(&si.mu)
 		return .Not_Found
 	}
 
 	entry := &si.children[idx]
 	cur_status := intrinsics.atomic_load_explicit(&entry.base.status, .Acquire)
-	if !entry.admin_stopped && cur_status == u32(Actor_Status.Running) {
+	if !entry.admin_stopped && cur_status != u32(Actor_Status.Stopped) {
+		sync.mutex_unlock(&si.mu)
 		return .Child_Still_Running
 	}
 
-	// Reset monitor finalization marker if re-activating an admin-stopped worker
-	if cext := get_actor_ext(entry.base); cext != nil {
+	c_base := entry.base
+	was_admin_stopped := entry.admin_stopped
+	sync.mutex_unlock(&si.mu)
+
+	cext := get_actor_ext(c_base)
+	prev_finalized: u32 = 0
+	prev_stopped_drained: u32 = 0
+	if cext != nil {
 		sync.mutex_lock(&cext.monitors_mu)
-		cext.finalized = 0
-		intrinsics.atomic_store_explicit(&cext.stopped_drained, 0, .Release)
+		prev_finalized = cext.finalized
+		prev_stopped_drained = cext.stopped_drained
 		sync.mutex_unlock(&cext.monitors_mu)
 	}
 
-	ok, _ := reinit_child_entry_reset_only(entry, sup)
-	if !ok {
+	prepare_child_reset_unlocked(c_base)
+
+	sync.mutex_lock(&si.mu)
+	if intrinsics.atomic_load_explicit(&si.sup_state, .Acquire) != SUP_RUNNING {
+		sync.mutex_unlock(&si.mu)
 		return .Supervisor_Stopping
 	}
-	entry.admin_stopped = false
-	activate_restarted_child(entry.base)
+	idx = -1
+	for i := 0; i < len(si.children); i += 1 {
+		if si.children[i].id == child_id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		sync.mutex_unlock(&si.mu)
+		return .Not_Found
+	}
+	entry = &si.children[idx]
+	new_gen := intrinsics.atomic_add_explicit(&c_base.generation, 1, .Acq_Rel) + 1
+	entry.expected_gen = new_gen
+	entry.restarts += 1
+	sup.state.stats.children_restarted += 1
+	sup.state.stats.total_restarts += 1
+	sync.mutex_unlock(&si.mu)
+
+	ok, _ := run_trapped_reinit_hook(cext, c_base)
+	if !ok {
+		if cext != nil && was_admin_stopped {
+			sync.mutex_lock(&cext.monitors_mu)
+			intrinsics.atomic_store_explicit(&cext.finalized, prev_finalized, .Release)
+			intrinsics.atomic_store_explicit(&cext.stopped_drained, prev_stopped_drained, .Release)
+			sync.mutex_unlock(&cext.monitors_mu)
+		}
+		return .Supervisor_Stopping
+	}
+
+	sync.mutex_lock(&si.mu)
+	for i := 0; i < len(si.children); i += 1 {
+		if si.children[i].id == child_id {
+			si.children[i].admin_stopped = false
+			break
+		}
+	}
+	sync.mutex_unlock(&si.mu)
+
+	activate_restarted_child(c_base)
 	return .None
 }
 
@@ -2105,11 +2392,11 @@ supervisor_delete_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_E
 
 	entry := &si.children[idx]
 	cur_status := intrinsics.atomic_load_explicit(&entry.base.status, .Acquire)
-	if !entry.admin_stopped && cur_status == u32(Actor_Status.Running) {
+	if !entry.admin_stopped && cur_status != u32(Actor_Status.Stopped) {
 		return .Child_Still_Running
 	}
 
-	free_actor_reset_resources(get_actor_ext(entry.base))
+	free_subtree_reset_resources(entry.base, sup.allocator)
 	ordered_remove(&si.children, idx)
 	return .None
 }
@@ -2246,12 +2533,33 @@ registry_init :: proc(r: ^Registry($Key), allocator := context.allocator) {
 	r.entries   = make(map[Key]Registry_Entry, 16, allocator)
 }
 
+@(private)
+detach_registry_hook_from_actor :: proc(base: ^Actor_Base, reg_ptr: rawptr) {
+	if base == nil || reg_ptr == nil {
+		return
+	}
+	ext := get_actor_ext(base)
+	if ext == nil {
+		return
+	}
+	sync.mutex_lock(&ext.monitors_mu)
+	for i := len(ext.reg_hooks) - 1; i >= 0; i -= 1 {
+		if ext.reg_hooks[i].reg_ptr == reg_ptr {
+			unordered_remove(&ext.reg_hooks, i)
+		}
+	}
+	sync.mutex_unlock(&ext.monitors_mu)
+}
+
 registry_destroy :: proc(r: ^Registry($Key)) {
 	if r == nil {
 		return
 	}
 	sync.rw_mutex_lock(&r.mu)
 	if r.entries != nil {
+		for _, entry in r.entries {
+			detach_registry_hook_from_actor(entry.ref, rawptr(r))
+		}
 		delete(r.entries)
 		r.entries = nil
 	}
@@ -2402,7 +2710,19 @@ registry_unregister :: proc(r: ^Registry($Key), key: Key) {
 	}
 	sync.rw_mutex_lock(&r.mu)
 	if r.entries != nil {
-		delete_key(&r.entries, key)
+		if old_entry, found := r.entries[key]; found {
+			delete_key(&r.entries, key)
+			still_registered := false
+			for _, v in r.entries {
+				if v.ref == old_entry.ref {
+					still_registered = true
+					break
+				}
+			}
+			if !still_registered {
+				detach_registry_hook_from_actor(old_entry.ref, rawptr(r))
+			}
+		}
 	}
 	sync.rw_mutex_unlock(&r.mu)
 }
@@ -2418,15 +2738,17 @@ registry_lookup :: proc(r: ^Registry($Key), key: Key, $Msg: typeid) -> (PID(Msg)
 		return {}, false
 	}
 	entry, found := r.entries[key]
+	if !found || entry.ref == nil || entry.msg_type != typeid_of(Msg) {
+		sync.rw_mutex_shared_unlock(&r.mu)
+		return {}, false
+	}
+	st  := Actor_Status(intrinsics.atomic_load_explicit(&entry.ref.status, .Acquire))
+	gen := intrinsics.atomic_load_explicit(&entry.ref.generation, .Acquire)
 	sync.rw_mutex_shared_unlock(&r.mu)
 
-	if !found || entry.ref == nil || entry.msg_type != typeid_of(Msg) {
+	if st == .Stopped {
 		return {}, false
 	}
-	if intrinsics.atomic_load_explicit(&entry.ref.status, .Acquire) == u32(Actor_Status.Stopped) {
-		return {}, false
-	}
-	gen := intrinsics.atomic_load_explicit(&entry.ref.generation, .Acquire)
 	return PID(Msg){ref = cast(^Actor_Ref(Msg))entry.ref, generation = gen}, true
 }
 
@@ -2694,7 +3016,6 @@ cleanup_tenant_registry_entry :: proc(ps: ^Partitioned_Supervisor, entry: ^Tenan
 	if entry.subtree.router != nil {
 		registry_cleanup_for_key(u64)(rawptr(ps.cfg.registry), entry.subtree.router)
 	}
-	registry_unregister(ps.cfg.registry, entry.org_id)
 }
 
 @(private)
@@ -2886,11 +3207,11 @@ get_or_spawn_tenant_cfg :: proc(
 	$Msg: typeid,
 ) -> (PID(Msg), Supervisor_Error) {
 	entry, err := acquire_tenant_entry(ps, org_id, nil, nil, inc_in_flight = true)
-	if err != .None || entry == nil || entry.subtree.router == nil {
+	if err != .None || entry == nil {
 		return {}, err if err != .None else .Supervisor_Stopping
 	}
 	defer intrinsics.atomic_sub_explicit(&entry.in_flight, 1, .Acq_Rel)
-	if entry.subtree.msg_type != typeid_of(Msg) {
+	if entry.subtree.router == nil || entry.subtree.msg_type != typeid_of(Msg) {
 		return {}, .Supervisor_Stopping
 	}
 	gen := intrinsics.atomic_load_explicit(&entry.subtree.router.generation, .Acquire)
@@ -2906,11 +3227,11 @@ get_or_spawn_tenant_with_factory :: proc(
 	user_ctx: rawptr = nil,
 ) -> (PID(Msg), Supervisor_Error) {
 	entry, err := acquire_tenant_entry(ps, org_id, factory_proc, user_ctx, inc_in_flight = true)
-	if err != .None || entry == nil || entry.subtree.router == nil {
+	if err != .None || entry == nil {
 		return {}, err if err != .None else .Supervisor_Stopping
 	}
 	defer intrinsics.atomic_sub_explicit(&entry.in_flight, 1, .Acq_Rel)
-	if entry.subtree.msg_type != typeid_of(Msg) {
+	if entry.subtree.router == nil || entry.subtree.msg_type != typeid_of(Msg) {
 		return {}, .Supervisor_Stopping
 	}
 	gen := intrinsics.atomic_load_explicit(&entry.subtree.router.generation, .Acquire)

@@ -1,6 +1,7 @@
 package actor
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:mem"
 import "core:os"
 import "core:sync"
@@ -50,6 +51,9 @@ _tls_active_sched: ^Scheduler
 
 @(thread_local)
 _tls_call_depth: int
+
+// Count of live initialized Schedulers so `default_registry` is destroyed only when the last exits.
+_active_scheduler_count: i32
 
 // Returns the active `^Context` when called inside an actor handler on a worker thread,
 // or `nil` when called from an external thread.
@@ -279,6 +283,7 @@ scheduler_init :: proc(
 
 	s.prev_tls_sched  = _tls_active_sched
 	_tls_active_sched = s
+	intrinsics.atomic_add_explicit(&_active_scheduler_count, 1, .Acq_Rel)
 	return .None
 }
 
@@ -360,6 +365,9 @@ scheduler_start :: proc(s: ^Scheduler = nil) {
 		}
 		sched.workers[w] = thread.create(scheduler_worker_proc)
 		sched.workers[w].data = &sched.worker_ctxs[w]
+		// Inherit caller context (`logger`, `allocator`, custom `temp_allocator` in tests).
+		// When using `default_temp_allocator_proc`, `core:thread`'s `_select_context_for_thread`
+		// rebinds `temp_allocator.data` to each worker thread's own `@(thread_local)` instance.
 		sched.workers[w].init_context = context
 		thread.start(sched.workers[w])
 	}
@@ -420,12 +428,25 @@ scheduler_stop_and_destroy :: proc(s: ^Scheduler) {
 		s.shards = nil
 	}
 	if _tls_active_sched == s {
-		_tls_active_sched = s.prev_tls_sched
+		if s.prev_tls_sched != nil && intrinsics.atomic_load_explicit(&s.prev_tls_sched.running, .Acquire) {
+			_tls_active_sched = s.prev_tls_sched
+		} else {
+			_tls_active_sched = nil
+		}
 	}
-	if s.prev_tls_sched == nil {
-		registry_destroy(&default_registry)
+	_ = intrinsics.atomic_sub_explicit(&_active_scheduler_count, 1, .Acq_Rel)
+	sync.rw_mutex_lock(&default_registry.mu)
+	if intrinsics.atomic_load_explicit(&_active_scheduler_count, .Acquire) == 0 {
+		if default_registry.entries != nil {
+			for _, entry in default_registry.entries {
+				detach_registry_hook_from_actor(entry.ref, rawptr(&default_registry))
+			}
+			delete(default_registry.entries)
+			default_registry.entries = nil
+		}
 		default_registry.allocator = {}
 	}
+	sync.rw_mutex_unlock(&default_registry.mu)
 }
 
 // Look up or lazily create a shared `[]Envelope_Pool($Msg)` slice on `s` for `$Msg`.
@@ -607,6 +628,9 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 	_tls_active_sched = s
 	defer {
 		free_all(context.temp_allocator)
+		if context.temp_allocator.procedure == runtime.default_temp_allocator_proc && context.temp_allocator.data != nil {
+			runtime.default_temp_allocator_destroy(cast(^runtime.Default_Temp_Allocator)context.temp_allocator.data)
+		}
 		_tls_active_ctx   = nil
 		_tls_active_sched = nil
 	}
@@ -953,6 +977,9 @@ spawn_val_auto :: proc(
 	s := current_scheduler()
 	eff_alloc := resolve_spawn_allocator(s, allocator)
 	a := new(Actor(State, Msg), eff_alloc)
+	if a == nil {
+		return nil
+	}
 	actor_init_common(a, initial_state, STEP_MODE_VAL, nil, id, s, eff_alloc)
 	a.receive_val = receive_proc
 	register_spawned_actor(a, s)
@@ -970,6 +997,9 @@ spawn_sched_val_auto :: proc(
 ) -> ^Actor(State, Msg) where !intrinsics.type_is_pointer(Msg) {
 	eff_alloc := resolve_spawn_allocator(s, allocator)
 	a := new(Actor(State, Msg), eff_alloc)
+	if a == nil {
+		return nil
+	}
 	actor_init_common(a, initial_state, STEP_MODE_VAL, nil, id, s, eff_alloc)
 	a.receive_val = receive_proc
 	register_spawned_actor(a, s)
@@ -1141,11 +1171,13 @@ actor_generic_step_proc :: proc(
 					ctx.current_env        = nil
 					ctx.current_reply_slot = nil
 					ctx.current_flags      = 0
-					ctx.current_actor      = nil
 					ctx.current_pools_raw  = nil
 					ctx.current_msg_type   = nil
 
+					// Keep `ctx.current_actor = base` across `handle_actor_turn_exit` so
+					// `finalize_actor_stopped` sees `is_self_step == true` while `in_step == 1`.
 					handle_actor_turn_exit(base, normal_exit, fault)
+					ctx.current_actor      = nil
 					if (flags & ENVELOPE_FLAG_CALL) != 0 && reply_slot != nil {
 						complete_call_slot(reply_slot, CALL_STATE_FAULTED)
 					}
@@ -1204,8 +1236,8 @@ actor_generic_step_proc :: proc(
 
 @(private)
 resolve_target_scheduler :: #force_inline proc(s: ^Scheduler, target: ^Actor_Ref($Msg)) -> ^Scheduler {
+	if target != nil && target.sched != nil { return target.sched }
 	if s != nil { return s }
-	if target.sched != nil { return target.sched }
 	return current_scheduler()
 }
 
@@ -1361,6 +1393,9 @@ send_envelope :: #force_inline proc(
 	}
 	mpsc_push(&target.mailbox, env)
 	scheduler_schedule_actor(s, &target.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.base, false)
+	}
 }
 
 send_envelope_pid :: #force_inline proc(
@@ -1375,6 +1410,9 @@ send_envelope_pid :: #force_inline proc(
 	}
 	mpsc_push(&target.ref.mailbox, env)
 	scheduler_schedule_actor(s, &target.ref.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.ref.base, false)
+	}
 }
 
 send_ambient_envelope :: #force_inline proc(
@@ -1416,6 +1454,9 @@ send_envelope_chain :: #force_inline proc(
 	}
 	mpsc_push_chain(&target.mailbox, first, last)
 	scheduler_schedule_actor(s, &target.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.base, false)
+	}
 }
 
 send_envelope_chain_pid :: #force_inline proc(
@@ -1431,6 +1472,9 @@ send_envelope_chain_pid :: #force_inline proc(
 	}
 	mpsc_push_chain(&target.ref.mailbox, first, last)
 	scheduler_schedule_actor(s, &target.ref.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.ref.base, false)
+	}
 }
 
 // Allocate an envelope from `pool`, copy `msg` into it, and send to `target`.
@@ -1706,21 +1750,19 @@ forward_ref_impl :: #force_inline proc(
 	}
 
 	target_sched := resolve_target_scheduler(ctx.sched, target_ref)
-	same_pool_space := ctx.current_pools_raw == raw_data(target_ref.pools) || (env.flags & ENVELOPE_FLAG_HEAP) != 0
+	same_pool_space := ctx.current_pools_raw != nil && ctx.current_pools_raw == raw_data(target_ref.pools)
 	if target_sched == ctx.sched && same_pool_space {
 		ctx.forwarded = true
 		ctx.current_env = nil
 		if has_update {
 			env.msg = updated_msg
 		}
-		if saved_reply_slot != nil && env.reply_slot == nil {
-			env.reply_slot = saved_reply_slot
-		}
-		env.flags |= saved_reply_flags
+		env.reply_slot = saved_reply_slot
+		env.flags = (env.flags &~ (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)) | saved_reply_flags
 		mpsc_push(&target_ref.mailbox, env)
 		scheduler_schedule_actor(target_sched, &target_ref.base, ctx.worker_id)
 		if intrinsics.atomic_load_explicit(&target_ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
-			actor_drain_stopped_target(&target_ref.base)
+			actor_drain_stopped_target(&target_ref.base, false)
 		}
 		return
 	}
@@ -1729,14 +1771,14 @@ forward_ref_impl :: #force_inline proc(
 	// a target-owned envelope so the caller safely recycles `env` to its own pool.
 	new_env, hint := acquire_auto_envelope(target_sched, target_ref, -1)
 	new_env.msg = updated_msg if has_update else env.msg
-	new_env.reply_slot = env.reply_slot if env.reply_slot != nil else saved_reply_slot
+	new_env.reply_slot = saved_reply_slot
 	new_env.flags |= saved_reply_flags
 	env.reply_slot = nil
 	env.flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
 	mpsc_push(&target_ref.mailbox, new_env)
 	scheduler_schedule_actor(target_sched, &target_ref.base, hint)
 	if intrinsics.atomic_load_explicit(&target_ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
-		actor_drain_stopped_target(&target_ref.base)
+		actor_drain_stopped_target(&target_ref.base, false)
 	}
 }
 
@@ -1896,6 +1938,11 @@ reply_ctx :: #force_inline proc(ctx: ^Context, val: $Res) {
 	flags := ctx.current_flags
 	ctx.current_reply_slot = nil
 	ctx.current_flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+	if ctx.current_env != nil {
+		raw_env := cast(^Envelope(u8))ctx.current_env
+		raw_env.reply_slot = nil
+		raw_env.flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+	}
 	if (flags & ENVELOPE_FLAG_CALL) != 0 {
 		slot := cast(^Call_Slot(Res))slot_ptr
 		assert(slot.res_type == typeid_of(Res), "actor.reply result type mismatch with actor.call")
@@ -2023,6 +2070,13 @@ call_sched_pid :: proc(
 	msg: Msg,
 	$Res: typeid,
 ) -> Res {
+	if target.ref == nil {
+		if is_trap_active() {
+			fail_turn_reason(.Panic, "actor.call on nil PID")
+		}
+		assert(target.ref != nil, "actor.call on nil PID")
+		return {}
+	}
 	caller_ctx := _tls_active_ctx
 	if caller_ctx != nil && caller_ctx.sched == s {
 		if caller_ctx.current_actor == &target.ref.base {

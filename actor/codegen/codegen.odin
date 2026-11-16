@@ -49,6 +49,7 @@ Behavior_Spec :: struct {
 	proc_name:     string, // Actual Odin procedure name (e.g. `deposit` or `account_reset`)
 	short_name:    string, // Exposed method/behavior name (e.g. `deposit` or `reset`)
 	actor_type:    string,
+	actor_alias:   string, // File-local import alias for `actor` in the file where parsed
 	takes_ctx:     bool,
 	return_type:   string, // Empty string for 1-way `send_` behaviors; non-empty for `call_` behaviors
 	result_struct: string, // Non-empty for multi-return behaviors (e.g. `Actor_proc_Result`)
@@ -248,12 +249,13 @@ current_os_tag :: proc() -> string {
 	case .Linux:   return "linux"
 	case .Windows: return "windows"
 	case .Darwin:  return "darwin"
-	case .FreeBSD: return "freebsd"
-	case .OpenBSD: return "openbsd"
-	case .NetBSD:  return "netbsd"
-	case .JS:      return "js"
-	case .WASI:    return "wasi"
-	case .Orca:    return "orca"
+	case .FreeBSD:      return "freebsd"
+	case .OpenBSD:      return "openbsd"
+	case .NetBSD:       return "netbsd"
+	case .JS:           return "js"
+	case .WASI:         return "wasi"
+	case .Orca:         return "orca"
+	case .Freestanding: return "freestanding"
 	}
 	return ""
 }
@@ -733,18 +735,21 @@ parse_source_into_spec :: proc(
 			// Determine whether param 0 is `self: ^Actor` or `(ctx: ^Context, self: ^Actor)`
 			actor_type := ""
 			takes_ctx  := false
+			self_field_idx  := 0
 			start_field_idx := 1
 
 			if first_name, first_pkg, ok0 := extract_pointer_ident(fields[0].type); ok0 {
 				if first_name == "Context" && (first_pkg == "" || first_pkg == file_actor_alias) && len(fields) >= 2 {
 					if second_name, second_pkg, ok1 := extract_pointer_ident(fields[1].type); ok1 && second_pkg == "" {
-						actor_type = second_name
-						takes_ctx  = true
+						actor_type      = second_name
+						takes_ctx       = true
+						self_field_idx  = 1
 						start_field_idx = 2
 					}
 				} else if first_pkg == "" {
-					actor_type = first_name
-					takes_ctx  = false
+					actor_type      = first_name
+					takes_ctx       = false
+					self_field_idx  = 0
 					start_field_idx = 1
 				}
 			}
@@ -805,6 +810,7 @@ parse_source_into_spec :: proc(
 				proc_name     = ident.name,
 				short_name    = short,
 				actor_type    = actor_type,
+				actor_alias   = file_actor_alias,
 				takes_ctx     = takes_ctx,
 				result_fields = make([dynamic]Result_Field),
 				params        = make([dynamic]Behavior_Param),
@@ -815,11 +821,7 @@ parse_source_into_spec :: proc(
 				res_list := proc_lit.type.results.list
 				total_res := 0
 				for rf in res_list {
-					if rf.type != nil && len(rf.names) > 0 {
-						total_res += len(rf.names)
-					} else {
-						total_res += 1
-					}
+					total_res += max(1, len(rf.names))
 				}
 				if total_res == 1 {
 					res_field := res_list[0]
@@ -870,6 +872,23 @@ parse_source_into_spec :: proc(
 
 			param_valid := true
 			anon_idx := 0
+			// Handle grouped receiver declarations such as `proc(self, peer: ^Actor)`
+			if self_field := fields[self_field_idx]; len(self_field.names) > 1 && self_field.type != nil {
+				self_type_str := node_source(src, self_field.type)
+				for extra_expr in self_field.names[1:] {
+					if p_ident, p_ok := extra_expr.derived.(^ast.Ident); p_ok {
+						pname := p_ident.name
+						if pname == "_" {
+							pname = fmt.aprintf("_arg%d", anon_idx, allocator = arena_alloc)
+							anon_idx += 1
+						}
+						append(&bspec.params, Behavior_Param{
+							name      = pname,
+							type_expr = self_type_str,
+						})
+					}
+				}
+			}
 			for f_idx := start_field_idx; f_idx < len(fields); f_idx += 1 {
 				field := fields[f_idx]
 				type_str := node_source(src, field.type)
@@ -926,6 +945,8 @@ finalize_module_spec :: proc(
 	pending_behaviors: []Behavior_Spec,
 	pending_reinits: []Reinit_Spec = nil,
 ) {
+	arena_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
+	mod_alias := mod.actor_alias if len(mod.actor_alias) > 0 else "actor"
 	for b in pending_behaviors {
 		matched := false
 		for &a in mod.actors {
@@ -941,7 +962,18 @@ finalize_module_spec :: proc(
 					delete(b.params)
 					delete(b.result_fields)
 				} else {
-					append(&a.behaviors, b)
+					nb := b
+					if len(nb.actor_alias) > 0 && nb.actor_alias != mod_alias {
+						nb.return_type = normalize_pkg_alias(nb.return_type, nb.actor_alias, mod_alias, arena_alloc)
+						for &rf in nb.result_fields {
+							rf.type_expr = normalize_pkg_alias(rf.type_expr, nb.actor_alias, mod_alias, arena_alloc)
+						}
+						for &bp in nb.params {
+							bp.type_expr    = normalize_pkg_alias(bp.type_expr, nb.actor_alias, mod_alias, arena_alloc)
+							bp.default_expr = normalize_pkg_alias(bp.default_expr, nb.actor_alias, mod_alias, arena_alloc)
+						}
+					}
+					append(&a.behaviors, nb)
 				}
 				matched = true
 				break
@@ -1032,6 +1064,62 @@ has_pkg_reference :: proc(expr: string, alias: string) -> bool {
 		}
 	}
 	return false
+}
+
+// Replace identifier-bounded `old_alias.` with `new_alias.` outside string literals.
+normalize_pkg_alias :: proc(expr: string, old_alias: string, new_alias: string, allocator := context.allocator) -> string {
+	if len(expr) == 0 || len(old_alias) == 0 || len(new_alias) == 0 || old_alias == new_alias {
+		return expr
+	}
+	if !has_pkg_reference(expr, old_alias) {
+		return expr
+	}
+	sb := strings.builder_make(allocator)
+	in_str: byte = 0
+	escaped := false
+	n := len(expr)
+	alen := len(old_alias)
+	i := 0
+	for i < n {
+		ch := expr[i]
+		if in_str != 0 {
+			strings.write_byte(&sb, ch)
+			if in_str == '"' || in_str == '\'' {
+				if escaped {
+					escaped = false
+					i += 1
+					continue
+				}
+				if ch == '\\' {
+					escaped = true
+					i += 1
+					continue
+				}
+			}
+			if ch == in_str {
+				in_str = 0
+			}
+			i += 1
+			continue
+		}
+		if ch == '"' || ch == '`' || ch == '\'' {
+			in_str = ch
+			strings.write_byte(&sb, ch)
+			i += 1
+			continue
+		}
+		if i + alen < n && expr[i:i + alen] == old_alias && expr[i + alen] == '.' {
+			if i == 0 || !is_ident_char(expr[i - 1]) {
+				strings.write_string(&sb, new_alias)
+				strings.write_byte(&sb, '.')
+				i += alen + 1
+				continue
+			}
+		}
+		strings.write_byte(&sb, ch)
+		i += 1
+	}
+	return strings.to_string(sb)
 }
 
 // Check if an import alias (e.g. `time.`) is referenced in any behavior parameter, default, or return type.
@@ -1170,14 +1258,15 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 			param_sig_b := strings.builder_make(context.temp_allocator)
 			for p in b.params {
+				p_arg := fmt.tprintf("_sleipnir_param_%s", p.name) if p.name == a_alias else p.name
 				wtype := p.type_expr
 				if p.is_variadic && strings.has_prefix(wtype, "[]") {
 					wtype = fmt.tprintf("..%s", wtype[2:])
 				}
 				if len(p.default_expr) > 0 {
-					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p.name, wtype, p.default_expr)
+					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p_arg, wtype, p.default_expr)
 				} else {
-					fmt.sbprintf(&param_sig_b, ", %s: %s", p.name, wtype)
+					fmt.sbprintf(&param_sig_b, ", %s: %s", p_arg, wtype)
 				}
 			}
 			param_sig := strings.to_string(param_sig_b)
@@ -1268,28 +1357,45 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 			target_arg := "_sleipnir_target" if has_target else "target"
 			reply_arg  := "_sleipnir_reply_to" if has_reply else "reply_to"
 
-			param_sig_b  := strings.builder_make(context.temp_allocator)
-			no_def_sig_b := strings.builder_make(context.temp_allocator)
-			lit_init_b   := strings.builder_make(context.temp_allocator)
+			param_sig_b   := strings.builder_make(context.temp_allocator)
+			no_def_sig_b  := strings.builder_make(context.temp_allocator)
+			lit_init_b    := strings.builder_make(context.temp_allocator)
+			async_init_b  := strings.builder_make(context.temp_allocator)
+			variadic_prep := strings.builder_make(context.temp_allocator)
 			for p, idx in b.params {
+				p_arg := fmt.tprintf("_sleipnir_param_%s", p.name) if p.name == a_alias else p.name
 				wtype := p.type_expr
 				if p.is_variadic && strings.has_prefix(wtype, "[]") {
 					wtype = fmt.tprintf("..%s", wtype[2:])
 				}
 				if len(p.default_expr) > 0 {
-					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p.name, wtype, p.default_expr)
+					fmt.sbprintf(&param_sig_b, ", %s: %s = %s", p_arg, wtype, p.default_expr)
 				} else {
-					fmt.sbprintf(&param_sig_b, ", %s: %s", p.name, wtype)
+					fmt.sbprintf(&param_sig_b, ", %s: %s", p_arg, wtype)
 				}
-				fmt.sbprintf(&no_def_sig_b, ", %s: %s", p.name, p.type_expr)
+				fmt.sbprintf(&no_def_sig_b, ", %s: %s", p_arg, p.type_expr)
 				if idx > 0 {
 					fmt.sbprint(&lit_init_b, ", ")
+					fmt.sbprint(&async_init_b, ", ")
 				}
-				fmt.sbprintf(&lit_init_b, "%s = %s", p.name, p.name)
+				fmt.sbprintf(&lit_init_b, "%s = %s", p.name, p_arg)
+				if p.is_variadic {
+					v_name := fmt.tprintf("_sleipnir_var_%s", p_arg)
+					fmt.sbprintf(
+						&variadic_prep,
+						"\t%s: %s\n\tif len(%s) > 0 {{\n\t\t%s = make(%s, len(%s), context.temp_allocator)\n\t\tcopy(%s, %s)\n\t}}\n",
+						v_name, p.type_expr, p_arg, v_name, p.type_expr, p_arg, v_name, p_arg,
+					)
+					fmt.sbprintf(&async_init_b, "%s = %s", p.name, v_name)
+				} else {
+					fmt.sbprintf(&async_init_b, "%s = %s", p.name, p_arg)
+				}
 			}
-			param_sig  := strings.to_string(param_sig_b)
-			no_def_sig := strings.to_string(no_def_sig_b)
-			lit_init   := strings.to_string(lit_init_b)
+			param_sig      := strings.to_string(param_sig_b)
+			no_def_sig     := strings.to_string(no_def_sig_b)
+			lit_init       := strings.to_string(lit_init_b)
+			async_init     := strings.to_string(async_init_b)
+			async_prep_str := strings.to_string(variadic_prep)
 
 			if len(b.return_type) > 0 {
 				// Behavior returns `-> Return_Type`:
@@ -1300,13 +1406,13 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(%s: %s_Actor%s) -> %s {{\n", call_actor_fn, target_arg, a.name, param_sig, b.return_type)
 				if len(b.result_fields) > 0 {
-					fmt.sbprintf(&sb, "\tres := %s.call(%s.raw, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, lit_init, call_res_type)
+					fmt.sbprintf(&sb, "\t_sleipnir_res := %s.call(%s.raw, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, lit_init, call_res_type)
 					fmt.sbprint(&sb, "\treturn ")
 					for rf, ridx in b.result_fields {
 						if ridx > 0 {
 							fmt.sbprint(&sb, ", ")
 						}
-						fmt.sbprintf(&sb, "res.%s", rf.name)
+						fmt.sbprintf(&sb, "_sleipnir_res.%s", rf.name)
 					}
 					fmt.sbprintln(&sb)
 				} else {
@@ -1316,13 +1422,13 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(%s: %s.PID(%s_Msg)%s) -> %s {{\n", call_pid_fn, target_arg, a_alias, a.name, param_sig, b.return_type)
 				if len(b.result_fields) > 0 {
-					fmt.sbprintf(&sb, "\tres := %s.call(%s, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, lit_init, call_res_type)
+					fmt.sbprintf(&sb, "\t_sleipnir_res := %s.call(%s, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, lit_init, call_res_type)
 					fmt.sbprint(&sb, "\treturn ")
 					for rf, ridx in b.result_fields {
 						if ridx > 0 {
 							fmt.sbprint(&sb, ", ")
 						}
-						fmt.sbprintf(&sb, "res.%s", rf.name)
+						fmt.sbprintf(&sb, "_sleipnir_res.%s", rf.name)
 					}
 					fmt.sbprintln(&sb)
 				} else {
@@ -1337,11 +1443,13 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 				send_reply_pid_fn   := fmt.tprintf("send_%s_%s_reply_pid", snake_actor, b.short_name)
 
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(%s: %s_Actor%s, %s: %s.PID(%s)) {{\n", send_reply_actor_fn, target_arg, a.name, no_def_sig, reply_arg, a_alias, call_res_type)
-				fmt.sbprintf(&sb, "\t%s.send(%s.raw, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, lit_init, reply_arg)
+				fmt.sbprint(&sb, async_prep_str)
+				fmt.sbprintf(&sb, "\t%s.send(%s.raw, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, async_init, reply_arg)
 				fmt.sbprintln(&sb, "}\n")
 
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(%s: %s.PID(%s_Msg)%s, %s: %s.PID(%s)) {{\n", send_reply_pid_fn, target_arg, a_alias, a.name, no_def_sig, reply_arg, a_alias, call_res_type)
-				fmt.sbprintf(&sb, "\t%s.send(%s, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, lit_init, reply_arg)
+				fmt.sbprint(&sb, async_prep_str)
+				fmt.sbprintf(&sb, "\t%s.send(%s, %s_Msg(%s{{%s}}), %s)\n", a_alias, target_arg, a.name, msg_struct_name, async_init, reply_arg)
 				fmt.sbprintln(&sb, "}\n")
 
 				add_pair_to_group(&send_groups, b, send_reply_actor_fn, send_reply_pid_fn)
@@ -1351,11 +1459,13 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 				pid_fn   := fmt.tprintf("send_%s_%s_pid", snake_actor, b.short_name)
 
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(%s: %s_Actor%s) {{\n", actor_fn, target_arg, a.name, param_sig)
-				fmt.sbprintf(&sb, "\t%s.send(%s.raw, %s_Msg(%s{{%s}}))\n", a_alias, target_arg, a.name, msg_struct_name, lit_init)
+				fmt.sbprint(&sb, async_prep_str)
+				fmt.sbprintf(&sb, "\t%s.send(%s.raw, %s_Msg(%s{{%s}}))\n", a_alias, target_arg, a.name, msg_struct_name, async_init)
 				fmt.sbprintln(&sb, "}\n")
 
 				fmt.sbprintf(&sb, "%s :: #force_inline proc(%s: %s.PID(%s_Msg)%s) {{\n", pid_fn, target_arg, a_alias, a.name, param_sig)
-				fmt.sbprintf(&sb, "\t%s.send(%s, %s_Msg(%s{{%s}}))\n", a_alias, target_arg, a.name, msg_struct_name, lit_init)
+				fmt.sbprint(&sb, async_prep_str)
+				fmt.sbprintf(&sb, "\t%s.send(%s, %s_Msg(%s{{%s}}))\n", a_alias, target_arg, a.name, msg_struct_name, async_init)
 				fmt.sbprintln(&sb, "}\n")
 
 				add_pair_to_group(&send_groups, b, actor_fn, pid_fn)
@@ -1399,7 +1509,9 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
 		fmt.sbprintf(&sb, "\ta, _ := %s.spawn(initial_state, %s_dispatch, id, allocator)\n", a_alias, snake_actor)
 		if a.supervise.enabled {
-			fmt.sbprintf(&sb, "\t_ = %s.enable_actor_supervision(a, initial_state, %s, %s)\n", a_alias, reinit_cb, use_arena_lit)
+			fmt.sbprintln(&sb, "\tif a != nil {")
+			fmt.sbprintf(&sb, "\t\t_ = %s.enable_actor_supervision(a, initial_state, %s, %s)\n", a_alias, reinit_cb, use_arena_lit)
+			fmt.sbprintln(&sb, "\t}")
 		}
 		fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 		fmt.sbprintln(&sb, "}\n")
@@ -1412,7 +1524,9 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
 		fmt.sbprintf(&sb, "\ta, _ := %s.spawn(s, initial_state, %s_dispatch, id, allocator)\n", a_alias, snake_actor)
 		if a.supervise.enabled {
-			fmt.sbprintf(&sb, "\t_ = %s.enable_actor_supervision(a, initial_state, %s, %s)\n", a_alias, reinit_cb, use_arena_lit)
+			fmt.sbprintln(&sb, "\tif a != nil {")
+			fmt.sbprintf(&sb, "\t\t_ = %s.enable_actor_supervision(a, initial_state, %s, %s)\n", a_alias, reinit_cb, use_arena_lit)
+			fmt.sbprintln(&sb, "\t}")
 		}
 		fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 		fmt.sbprintln(&sb, "}\n")
@@ -1426,7 +1540,13 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 			fmt.sbprintln(&sb, "\tid: u32 = 0,")
 			fmt.sbprintln(&sb, "\tallocator := context.allocator,")
 			fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
+			fmt.sbprintln(&sb, "\tif sup == nil {")
+			fmt.sbprintln(&sb, "\t\treturn {}")
+			fmt.sbprintln(&sb, "\t}")
 			fmt.sbprintf(&sb, "\ta, _ := %s.spawn(sup.sched, initial_state, %s_dispatch, id, allocator)\n", a_alias, snake_actor)
+			fmt.sbprintln(&sb, "\tif a == nil {")
+			fmt.sbprintln(&sb, "\t\treturn {}")
+			fmt.sbprintln(&sb, "\t}")
 			fmt.sbprintf(&sb, "\t_ = %s.supervise(sup, a, initial_state, policy, %s, nil, use_arena)\n", a_alias, reinit_cb)
 			fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 			fmt.sbprintln(&sb, "}\n")

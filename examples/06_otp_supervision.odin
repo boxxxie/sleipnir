@@ -235,7 +235,8 @@ tenant_factory :: proc(sched: ^actor.Scheduler, org_id: u64, user_data: rawptr) 
 		stage  = .Writer,
 		store  = store,
 	}
-	writer, _ := actor.spawn(sched, writer_init, writer_receive, id = u32(org_id * 10 + 2))
+	writer, w_err := actor.spawn(sched, writer_init, writer_receive, id = u32(org_id * 10 + 2))
+	assert(w_err == .None, "failed to spawn pipeline writer")
 
 	enricher_init := Pipeline_Worker_State{
 		env        = env,
@@ -244,7 +245,8 @@ tenant_factory :: proc(sched: ^actor.Scheduler, org_id: u64, user_data: rawptr) 
 		store      = store,
 		next_stage = actor.PID(Pipeline_Msg){ref = &writer.ref},
 	}
-	enricher, _ := actor.spawn(sched, enricher_init, enricher_receive, id = u32(org_id * 10 + 1))
+	enricher, e_err := actor.spawn(sched, enricher_init, enricher_receive, id = u32(org_id * 10 + 1))
+	assert(e_err == .None, "failed to spawn pipeline enricher")
 
 	validator_init := Pipeline_Worker_State{
 		env        = env,
@@ -253,7 +255,8 @@ tenant_factory :: proc(sched: ^actor.Scheduler, org_id: u64, user_data: rawptr) 
 		store      = store,
 		next_stage = actor.PID(Pipeline_Msg){ref = &enricher.ref},
 	}
-	validator, _ := actor.spawn(sched, validator_init, validator_receive, id = u32(org_id * 10))
+	validator, v_err := actor.spawn(sched, validator_init, validator_receive, id = u32(org_id * 10))
+	assert(v_err == .None, "failed to spawn pipeline validator")
 
 	hooks := actor.Child_Hooks(Pipeline_Worker_State){
 		on_reinit    = pipeline_on_reinit,
@@ -261,9 +264,12 @@ tenant_factory :: proc(sched: ^actor.Scheduler, org_id: u64, user_data: rawptr) 
 		use_arena    = true,
 		keep_mailbox = false,
 	}
-	_ = actor.supervise(org_sup, validator, validator_init, .Permanent, hooks, 1)
-	_ = actor.supervise(org_sup, enricher, enricher_init, .Permanent, hooks, 2)
-	_ = actor.supervise(org_sup, writer, writer_init, .Permanent, hooks, 3)
+	sup_err := actor.supervise(org_sup, validator, validator_init, .Permanent, hooks, 1)
+	assert(sup_err == .None, "failed to supervise pipeline validator")
+	sup_err = actor.supervise(org_sup, enricher, enricher_init, .Permanent, hooks, 2)
+	assert(sup_err == .None, "failed to supervise pipeline enricher")
+	sup_err = actor.supervise(org_sup, writer, writer_init, .Permanent, hooks, 3)
+	assert(sup_err == .None, "failed to supervise pipeline writer")
 
 	subtree := actor.Tenant_Subtree{
 		sup      = org_sup,

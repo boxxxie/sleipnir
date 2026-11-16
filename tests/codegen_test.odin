@@ -458,3 +458,53 @@ compute :: proc(self: ^Rpc_Worker, x: int, reply_to: actor.Reply($T)) {
 	})
 }
 
+@(test)
+test_07_codegen_regression_multi_return_grouped_receiver_alias_and_guards :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		file_a :: `
+package edge_reg
+
+import act "../actor"
+
+@(actor, supervise="restart=Permanent")
+Node :: struct {
+	val: int,
+}
+
+pair_status :: proc(self: ^Node, res: int) -> (int, bool) {
+	return self.val + res, true
+}
+`
+		file_b :: `
+package edge_reg
+
+import a "../actor"
+
+link_peer :: proc(ctx: ^a.Context, self, peer: ^Node, act: a.PID(int)) {
+	_ = ctx
+	_ = peer
+	_ = act
+}
+`
+
+		generated, ok := codegen.generate_from_sources({file_a, file_b}, {"a.odin", "b.odin"})
+		defer delete(generated)
+
+		testing.expect(t, ok)
+		// BUG-004: unnamed multi-return `(int, bool)` generates 2-field result struct
+		testing.expect(t, strings.contains(generated, "Node_pair_status_Result :: struct {"))
+		testing.expect(t, strings.contains(generated, "\tr0: int,"))
+		testing.expect(t, strings.contains(generated, "\tr1: bool,"))
+		testing.expect(t, strings.contains(generated, ") -> (int, bool)"))
+		// BUG-021: `_sleipnir_res` prevents collision with parameter named `res`, and `act` param is disambiguated
+		testing.expect(t, strings.contains(generated, "_sleipnir_res := act.call("))
+		testing.expect(t, strings.contains(generated, "_sleipnir_param_act: act.PID(int)"))
+		// BUG-020 & BUG-026: grouped `self, peer: ^Node` emits `peer: ^Node`, and `a.` normalizes to `act.`
+		testing.expect(t, strings.contains(generated, "\tpeer: ^Node,"))
+		testing.expect(t, strings.contains(generated, "\tact: act.PID(int),"))
+		// BUG-027: `spawn_*_sup` guards `sup == nil` and `a == nil`
+		testing.expect(t, strings.contains(generated, "if sup == nil {"))
+		testing.expect(t, strings.contains(generated, "if a == nil {"))
+	})
+}
+

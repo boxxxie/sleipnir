@@ -899,3 +899,61 @@ prop_29_multithreaded_fault_injection_supervision_linearizability :: proc(t: ^te
 		}
 	})
 }
+
+@(test)
+spec_30_otp_audit_bugfix_regressions :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. BUG-009: Dead tenant respawn retains newly registered router in Partitioned_Supervisor registry.
+		{
+			w: Supervision_World
+			world_init(&w, t, num_workers = 2)
+			defer world_destroy(&w)
+
+			given_partitioned_tenant_supervisor(&w, partitions = 4, idle_timeout = 30 * time.Second, max_children = 0, policy = .Temporary)
+			upon_sending_org_delta(&w, org_id = 303, delta = 10)
+			then_org_value_is(&w, org_id = 303, expected = 110)
+			then_org_is_registered(&w, org_id = 303, expected = true)
+
+			// Crash temporary tenant router -> tenant becomes dead.
+			upon_crashing_org_router(&w, org_id = 303, bad_index = 99)
+
+			// Respawn org 303 -> must remain registered in `ps.cfg.registry`.
+			upon_sending_org_delta(&w, org_id = 303, delta = 55)
+			then_org_value_is(&w, org_id = 303, expected = 155)
+			then_org_is_registered(&w, org_id = 303, expected = true)
+		}
+
+		// 2. BUG-029 & BUG-007: Admin terminate + restart of child supervisor and rollback on flaky child reinit.
+		{
+			w: Supervision_World
+			world_init(&w, t, num_workers = 2)
+			defer world_destroy(&w)
+
+			given_supervisor(&w, "root", .One_For_One, max_restarts = 3)
+			given_child_supervisor(&w, "sub", under = "root", strategy = .One_For_One, max_restarts = 2)
+			sub_id := w.next_child_id
+
+			given_supervised_worker(&w, "ok_w", under = "sub", policy = .Permanent, committed = 10)
+			given_flaky_reinit_worker(&w, "flaky_w", under = "sub", fail_reinit_attempts = 1, committed = 20)
+
+			root_sup := w.supervisors["root"]
+			sub_sup := w.supervisors["sub"]
+
+			// Admin-terminate child supervisor -> sub & grandchildren stopped cleanly.
+			testing.expect_value(t, actor.supervisor_terminate_child(root_sup, sub_id), actor.Supervisor_Error.None)
+			then_supervisor_is_stopped(&w, "sub")
+			then_worker_status_is(&w, "ok_w", .Stopped)
+			then_worker_status_is(&w, "flaky_w", .Stopped)
+
+			// First restart attempt hits `flaky_w` reinit panic (BUG-007 rolls back `ok_w` & fails restart cleanly).
+			testing.expect_value(t, actor.supervisor_restart_child(root_sup, sub_id), actor.Supervisor_Error.Supervisor_Stopping)
+			testing.expect(t, actor.actor_status(sub_sup) != .Running)
+
+			// Second restart attempt succeeds once flaky counter reaches 0 (BUG-029 keeps reset resources).
+			testing.expect_value(t, actor.supervisor_restart_child(root_sup, sub_id), actor.Supervisor_Error.None)
+			then_supervisor_is_running(&w, "sub")
+			then_worker_status_is(&w, "ok_w", .Running)
+			then_worker_status_is(&w, "flaky_w", .Running)
+		}
+	})
+}
