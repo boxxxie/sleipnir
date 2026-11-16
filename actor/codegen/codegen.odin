@@ -8,6 +8,7 @@ import "core:odin/tokenizer"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 
 // =============================================================================
@@ -55,9 +56,28 @@ Behavior_Spec :: struct {
 	params:        [dynamic]Behavior_Param,
 }
 
+Reinit_Spec :: struct {
+	proc_name:   string,
+	actor_type:  string,
+	takes_alloc: bool,
+	file:        string,
+	line:        int,
+}
+
+Supervise_Spec :: struct {
+	enabled:      bool,
+	strategy:     string, // "One_For_One" (default), "One_For_All", "Rest_For_One"
+	restart:      string, // "Permanent" (default), "Transient", "Temporary"
+	max_restarts: int,
+	window_ms:    int,
+	use_arena:    bool,
+}
+
 Actor_Spec :: struct {
 	name:      string,
 	behaviors: [dynamic]Behavior_Spec,
+	supervise: Supervise_Spec,
+	reinit:    Reinit_Spec,
 }
 
 Import_Spec :: struct {
@@ -73,6 +93,7 @@ Module_Spec :: struct {
 	actor_raw_imp: string,
 	imports:       [dynamic]Import_Spec,
 	actors:        [dynamic]Actor_Spec,
+	diagnostics:   [dynamic]Diagnostic,
 	ast_arena:     mem.Dynamic_Arena,
 }
 
@@ -86,6 +107,7 @@ init_module_spec :: proc(m: ^Module_Spec) {
 	m.actor_alias = "actor"
 	m.imports     = make([dynamic]Import_Spec)
 	m.actors      = make([dynamic]Actor_Spec)
+	m.diagnostics = make([dynamic]Diagnostic)
 	mem.dynamic_arena_init(&m.ast_arena)
 }
 
@@ -99,6 +121,7 @@ destroy_module_spec :: proc(m: ^Module_Spec) {
 	}
 	delete(m.actors)
 	delete(m.imports)
+	delete(m.diagnostics)
 	mem.dynamic_arena_destroy(&m.ast_arena)
 }
 
@@ -396,13 +419,145 @@ has_poly_params :: proc(fields: []^ast.Field) -> bool {
 	return false
 }
 
+ascii_eq_fold :: proc(a: string, b: string) -> bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i += 1 {
+		ca := a[i]
+		cb := b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
+parse_supervise_attr :: proc(raw_val: string, file: string, line: int, mod: ^Module_Spec) -> Supervise_Spec {
+	spec := Supervise_Spec{
+		enabled      = true,
+		strategy     = "One_For_One",
+		restart      = "Permanent",
+		max_restarts = 3,
+		window_ms    = 5000,
+		use_arena    = true,
+	}
+	trimmed := strings.trim_space(raw_val)
+	if len(trimmed) == 0 {
+		return spec
+	}
+
+	rem := trimmed
+	for part in strings.split_by_byte_iterator(&rem, ',') {
+		kv := strings.trim_space(part)
+		if len(kv) == 0 {
+			continue
+		}
+		if eq_idx := strings.index_byte(kv, '='); eq_idx >= 0 {
+			k := strings.trim_space(kv[:eq_idx])
+			v := strings.trim_space(kv[eq_idx + 1:])
+			if ascii_eq_fold(k, "strategy") {
+				if ascii_eq_fold(v, "one_for_one") {
+					spec.strategy = "One_For_One"
+				} else if ascii_eq_fold(v, "one_for_all") {
+					spec.strategy = "One_For_All"
+				} else if ascii_eq_fold(v, "rest_for_one") {
+					spec.strategy = "Rest_For_One"
+				} else {
+					append(&mod.diagnostics, Diagnostic{
+						file    = file,
+						line    = line,
+						message = "unknown @(supervise) strategy; expected one_for_one, one_for_all, or rest_for_one",
+					})
+				}
+			} else if ascii_eq_fold(k, "restart") || ascii_eq_fold(k, "policy") {
+				if ascii_eq_fold(v, "permanent") {
+					spec.restart = "Permanent"
+				} else if ascii_eq_fold(v, "transient") {
+					spec.restart = "Transient"
+				} else if ascii_eq_fold(v, "temporary") {
+					spec.restart = "Temporary"
+				} else {
+					append(&mod.diagnostics, Diagnostic{
+						file    = file,
+						line    = line,
+						message = "unknown @(supervise) restart policy; expected permanent, transient, or temporary",
+					})
+				}
+			} else if ascii_eq_fold(k, "max_restarts") {
+				val, ok := strconv.parse_int(v)
+				if !ok || val < 0 {
+					append(&mod.diagnostics, Diagnostic{
+						file    = file,
+						line    = line,
+						message = "invalid @(supervise) max_restarts; expected non-negative integer",
+					})
+				} else {
+					spec.max_restarts = val
+				}
+			} else if ascii_eq_fold(k, "window_ms") {
+				val, ok := strconv.parse_int(v)
+				if !ok || val <= 0 {
+					append(&mod.diagnostics, Diagnostic{
+						file    = file,
+						line    = line,
+						message = "invalid @(supervise) window_ms; expected positive integer",
+					})
+				} else {
+					spec.window_ms = val
+				}
+			} else if ascii_eq_fold(k, "use_arena") {
+				if ascii_eq_fold(v, "true") {
+					spec.use_arena = true
+				} else if ascii_eq_fold(v, "false") {
+					spec.use_arena = false
+				} else {
+					append(&mod.diagnostics, Diagnostic{
+						file    = file,
+						line    = line,
+						message = "invalid @(supervise) use_arena; expected true or false",
+					})
+				}
+			} else {
+				append(&mod.diagnostics, Diagnostic{
+					file    = file,
+					line    = line,
+					message = "unknown @(supervise) option key",
+				})
+			}
+		} else {
+			if ascii_eq_fold(kv, "permanent") {
+				spec.restart = "Permanent"
+			} else if ascii_eq_fold(kv, "transient") {
+				spec.restart = "Transient"
+			} else if ascii_eq_fold(kv, "temporary") {
+				spec.restart = "Temporary"
+			} else {
+				append(&mod.diagnostics, Diagnostic{
+					file    = file,
+					line    = line,
+					message = "unknown @(supervise) option; expected permanent, transient, or temporary",
+				})
+			}
+		}
+	}
+	return spec
+}
+
 // Parse a single Odin source buffer and append discovered imports, `@(actor)` structs,
-// and candidate behavior procedures into `mod` and `pending_behaviors`.
+// candidate behavior procedures, and `@(reinit)` handlers into `mod`, `pending_behaviors`, and `pending_reinits`.
 parse_source_into_spec :: proc(
 	src: string,
 	filename: string,
 	mod: ^Module_Spec,
 	pending_behaviors: ^[dynamic]Behavior_Spec,
+	pending_reinits: ^[dynamic]Reinit_Spec = nil,
 ) -> bool {
 	arena_alloc := mem.dynamic_arena_allocator(&mod.ast_arena)
 	p := parser.default_parser()
@@ -468,9 +623,17 @@ parse_source_into_spec :: proc(
 					if st.poly_params != nil {
 						continue
 					}
+					sup_val, has_sup := get_attribute(d, "supervise")
+					sup_spec: Supervise_Spec
+					if has_sup {
+						sup_spec = parse_supervise_attr(sup_val, filename, d.pos.line, mod)
+					}
 					already_exists := false
-					for existing in mod.actors {
+					for &existing in mod.actors {
 						if existing.name == ident.name {
+							if has_sup {
+								existing.supervise = sup_spec
+							}
 							already_exists = true
 							break
 						}
@@ -479,9 +642,19 @@ parse_source_into_spec :: proc(
 						append(&mod.actors, Actor_Spec{
 							name      = ident.name,
 							behaviors = make([dynamic]Behavior_Spec),
+							supervise = sup_spec,
 						})
 					}
 				}
+				continue
+			}
+
+			if _, has_sup_non_actor := get_attribute(d, "supervise"); has_sup_non_actor {
+				append(&mod.diagnostics, Diagnostic{
+					file    = filename,
+					line    = d.pos.line,
+					message = "@(supervise) can only be placed on an @(actor) struct",
+				})
 				continue
 			}
 
@@ -490,19 +663,70 @@ parse_source_into_spec :: proc(
 			_, is_private     := get_attribute(d, "private")
 			_, is_no_behavior := get_attribute(d, "no_behavior")
 			custom_be_name, has_explicit_be := get_attribute(d, "behavior")
-			if (is_private || is_no_behavior) && !has_explicit_be {
+			_, has_reinit     := get_attribute(d, "reinit")
+
+			if has_reinit && has_explicit_be {
+				append(&mod.diagnostics, Diagnostic{
+					file    = filename,
+					line    = d.pos.line,
+					message = "@(behavior) and @(reinit) are mutually exclusive on the same procedure",
+				})
 				continue
 			}
 
 			proc_lit, is_proc := d.values[0].derived.(^ast.Proc_Lit)
+			if has_reinit {
+				if !is_proc || proc_lit.type == nil || proc_lit.type.params == nil || len(proc_lit.type.params.list) == 0 {
+					append(&mod.diagnostics, Diagnostic{
+						file    = filename,
+						line    = d.pos.line,
+						message = "@(reinit) procedure must accept (self: ^Actor) or (self: ^Actor, alloc: actor.Allocator)",
+					})
+					continue
+				}
+				if proc_lit.type.results != nil && len(proc_lit.type.results.list) > 0 {
+					append(&mod.diagnostics, Diagnostic{
+						file    = filename,
+						line    = d.pos.line,
+						message = "@(reinit) procedure must not return a value",
+					})
+					continue
+				}
+				r_fields := proc_lit.type.params.list
+				param_count := 0
+				for rf in r_fields {
+					param_count += max(1, len(rf.names))
+				}
+				actor_name, pkg_name, ok0 := extract_pointer_ident(r_fields[0].type)
+				if !ok0 || pkg_name != "" || param_count < 1 || param_count > 2 {
+					append(&mod.diagnostics, Diagnostic{
+						file    = filename,
+						line    = d.pos.line,
+						message = "@(reinit) procedure must accept (self: ^Actor) or (self: ^Actor, alloc: actor.Allocator)",
+					})
+					continue
+				}
+				if pending_reinits != nil {
+					append(pending_reinits, Reinit_Spec{
+						proc_name   = ident.name,
+						actor_type  = actor_name,
+						takes_alloc = param_count == 2,
+						file        = filename,
+						line        = d.pos.line,
+					})
+				}
+				continue
+			}
+
+			if (is_private || is_no_behavior) && !has_explicit_be {
+				continue
+			}
+
 			if !is_proc || proc_lit.type == nil || proc_lit.type.params == nil {
 				continue
 			}
 			fields := proc_lit.type.params.list
 			if len(fields) == 0 {
-				continue
-			}
-			if proc_lit.type.generic || len(proc_lit.where_clauses) > 0 || has_poly_params(fields) {
 				continue
 			}
 
@@ -526,6 +750,53 @@ parse_source_into_spec :: proc(
 			}
 
 			if actor_type == "" {
+				continue
+			}
+
+			// Validate RPC reply signatures before polymorphic parameter filtering.
+			has_return_val := proc_lit.type.results != nil && len(proc_lit.type.results.list) > 0
+			has_rpc_error := false
+			for f_idx := start_field_idx; f_idx < len(fields); f_idx += 1 {
+				field := fields[f_idx]
+				t_src := node_source(src, field.type)
+				if strings.contains(t_src, "Reply(") {
+					append(&mod.diagnostics, Diagnostic{
+						file    = filename,
+						line    = d.pos.line,
+						message = "malformed reply channel type; use a return type '-> T' instead of actor.Reply",
+					})
+					has_rpc_error = true
+					break
+				}
+				if has_return_val && (strings.contains(t_src, "PID(") || strings.has_suffix(t_src, "_PID")) {
+					for n_expr in field.names {
+						if p_ident, p_ok := n_expr.derived.(^ast.Ident); p_ok && p_ident.name == "reply_to" {
+							append(&mod.diagnostics, Diagnostic{
+								file    = filename,
+								line    = d.pos.line,
+								message = "ambiguous RPC signature: behavior declares both a reply_to PID parameter and a return value",
+							})
+							has_rpc_error = true
+							break
+						}
+					}
+					if has_rpc_error {
+						break
+					}
+				}
+			}
+			if has_rpc_error {
+				continue
+			}
+
+			if proc_lit.type.generic || len(proc_lit.where_clauses) > 0 || has_poly_params(fields) {
+				if has_explicit_be {
+					append(&mod.diagnostics, Diagnostic{
+						file    = filename,
+						line    = d.pos.line,
+						message = "@(behavior) procedure cannot use polymorphic parameters",
+					})
+				}
 				continue
 			}
 
@@ -648,9 +919,13 @@ parse_source_into_spec :: proc(
 	return true
 }
 
-// Bind all candidate behavior procedures to their matching `@(actor)` struct,
-// deduplicating behavior names and freeing parameter lists of non-actor procedures.
-finalize_module_spec :: proc(mod: ^Module_Spec, pending_behaviors: []Behavior_Spec) {
+// Bind all candidate behavior and `@(reinit)` procedures to their matching `@(actor)` struct,
+// deduplicating behavior names, freeing parameter lists of non-actor procedures, and recording diagnostics.
+finalize_module_spec :: proc(
+	mod: ^Module_Spec,
+	pending_behaviors: []Behavior_Spec,
+	pending_reinits: []Reinit_Spec = nil,
+) {
 	for b in pending_behaviors {
 		matched := false
 		for &a in mod.actors {
@@ -675,6 +950,42 @@ finalize_module_spec :: proc(mod: ^Module_Spec, pending_behaviors: []Behavior_Sp
 		if !matched {
 			delete(b.params)
 			delete(b.result_fields)
+		}
+	}
+
+	for r in pending_reinits {
+		matched := false
+		for &a in mod.actors {
+			if a.name == r.actor_type {
+				matched = true
+				if len(a.reinit.proc_name) > 0 {
+					append(&mod.diagnostics, Diagnostic{
+						file    = r.file,
+						line    = r.line,
+						message = "duplicate @(reinit) procedure for the same @(actor) struct",
+					})
+				} else {
+					a.reinit = r
+					if !a.supervise.enabled {
+						a.supervise = Supervise_Spec{
+							enabled      = true,
+							strategy     = "One_For_One",
+							restart      = "Permanent",
+							max_restarts = 3,
+							window_ms    = 5000,
+							use_arena    = true,
+						}
+					}
+				}
+				break
+			}
+		}
+		if !matched {
+			append(&mod.diagnostics, Diagnostic{
+				file    = r.file,
+				line    = r.line,
+				message = "@(reinit) receiver must be a pointer to an @(actor) struct",
+			})
 		}
 	}
 }
@@ -754,7 +1065,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 	has_emitted := false
 	for a in mod.actors {
-		if len(a.behaviors) > 0 {
+		if len(a.behaviors) > 0 || a.supervise.enabled || len(a.reinit.proc_name) > 0 {
 			has_emitted = true
 			break
 		}
@@ -807,7 +1118,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 	}
 
 	for a in mod.actors {
-		if len(a.behaviors) == 0 {
+		if len(a.behaviors) == 0 && !a.supervise.enabled && len(a.reinit.proc_name) == 0 {
 			continue
 		}
 		snake_actor := to_snake_case(a.name)
@@ -887,51 +1198,58 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 
 		// 3. Generated `dispatch` procedure
 		fmt.sbprintf(&sb, "%s_dispatch :: proc(ctx: ^%s.Context, self: ^%s, msg: ^%s_Msg) {{\n", snake_actor, a_alias, a.name, a.name)
-		fmt.sbprintln(&sb, "\tswitch m in msg^ {")
-		for b in a.behaviors {
-			fmt.sbprintf(&sb, "\tcase %s_Msg_%s:\n", a.name, b.short_name)
-			if len(b.result_fields) > 0 {
-				fmt.sbprint(&sb, "\t\t")
-				for _, ridx in b.result_fields {
-					if ridx > 0 {
-						fmt.sbprint(&sb, ", ")
+		if len(a.behaviors) == 0 {
+			fmt.sbprintln(&sb, "\t_ = ctx")
+			fmt.sbprintln(&sb, "\t_ = self")
+			fmt.sbprintln(&sb, "\t_ = msg")
+			fmt.sbprintln(&sb, "}\n")
+		} else {
+			fmt.sbprintln(&sb, "\tswitch m in msg^ {")
+			for b in a.behaviors {
+				fmt.sbprintf(&sb, "\tcase %s_Msg_%s:\n", a.name, b.short_name)
+				if len(b.result_fields) > 0 {
+					fmt.sbprint(&sb, "\t\t")
+					for _, ridx in b.result_fields {
+						if ridx > 0 {
+							fmt.sbprint(&sb, ", ")
+						}
+						fmt.sbprintf(&sb, "res_%d", ridx)
 					}
-					fmt.sbprintf(&sb, "res_%d", ridx)
-				}
-				fmt.sbprintf(&sb, " := %s(", b.proc_name)
-			} else if len(b.return_type) > 0 {
-				fmt.sbprintf(&sb, "\t\tres := %s(", b.proc_name)
-			} else {
-				fmt.sbprintf(&sb, "\t\t%s(", b.proc_name)
-			}
-			if b.takes_ctx {
-				fmt.sbprint(&sb, "ctx, self")
-			} else {
-				fmt.sbprint(&sb, "self")
-			}
-			for p in b.params {
-				if p.is_variadic {
-					fmt.sbprintf(&sb, ", ..m.%s", p.name)
+					fmt.sbprintf(&sb, " := %s(", b.proc_name)
+				} else if len(b.return_type) > 0 {
+					fmt.sbprintf(&sb, "\t\tres := %s(", b.proc_name)
 				} else {
-					fmt.sbprintf(&sb, ", m.%s", p.name)
+					fmt.sbprintf(&sb, "\t\t%s(", b.proc_name)
 				}
-			}
-			fmt.sbprintln(&sb, ")")
-			if len(b.result_fields) > 0 {
-				fmt.sbprintf(&sb, "\t\t%s.reply(ctx, %s{{", a_alias, b.result_struct)
-				for _, ridx in b.result_fields {
-					if ridx > 0 {
-						fmt.sbprint(&sb, ", ")
+				if b.takes_ctx {
+					fmt.sbprint(&sb, "ctx, self")
+				} else {
+					fmt.sbprint(&sb, "self")
+				}
+				for p in b.params {
+					if p.is_variadic {
+						fmt.sbprintf(&sb, ", ..m.%s", p.name)
+					} else {
+						fmt.sbprintf(&sb, ", m.%s", p.name)
 					}
-					fmt.sbprintf(&sb, "res_%d", ridx)
 				}
-				fmt.sbprintln(&sb, "})")
-			} else if len(b.return_type) > 0 {
-				fmt.sbprintf(&sb, "\t\t%s.reply(ctx, res)\n", a_alias)
+				fmt.sbprintln(&sb, ")")
+				if len(b.result_fields) > 0 {
+					fmt.sbprintf(&sb, "\t\t%s.reply(ctx, %s{{", a_alias, b.result_struct)
+					for _, ridx in b.result_fields {
+						if ridx > 0 {
+							fmt.sbprint(&sb, ", ")
+						}
+						fmt.sbprintf(&sb, "res_%d", ridx)
+					}
+					fmt.sbprintln(&sb, "})")
+				} else if len(b.return_type) > 0 {
+					fmt.sbprintf(&sb, "\t\t%s.reply(ctx, res)\n", a_alias)
+				}
 			}
+			fmt.sbprintln(&sb, "\t}")
+			fmt.sbprintln(&sb, "}\n")
 		}
-		fmt.sbprintln(&sb, "\t}")
-		fmt.sbprintln(&sb, "}\n")
 
 		// 4. Generated `send_<actor>_<behavior>` and `call_<actor>_<behavior>` procedures
 		for b in a.behaviors {
@@ -1044,7 +1362,7 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 			}
 		}
 
-		// 5. Static VTable instance & `spawn_<actor>` constructors
+		// 5. Static VTable instance, optional supervision constants/reinit trampoline, & `spawn_<actor>` constructors
 		fmt.sbprintf(&sb, "@(private)\n%s_vtable := %s_VTable{{\n", snake_actor, a.name)
 		for b in a.behaviors {
 			if len(b.return_type) > 0 {
@@ -1055,12 +1373,34 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		}
 		fmt.sbprintln(&sb, "}\n")
 
+		reinit_cb := "nil"
+		if a.supervise.enabled {
+			policy := a.supervise.restart if len(a.supervise.restart) > 0 else "Permanent"
+			fmt.sbprintf(&sb, "%s_DEFAULT_RESTART_POLICY :: %s.Restart_Policy.%s\n\n", a.name, a_alias, policy)
+			if len(a.reinit.proc_name) > 0 {
+				reinit_cb = fmt.tprintf("_%s_reinit_trampoline", snake_actor)
+				fmt.sbprintf(&sb, "@(private)\n%s :: proc(self: ^%s, alloc: %s.Allocator) {{\n", reinit_cb, a.name, a_alias)
+				if a.reinit.takes_alloc {
+					fmt.sbprintf(&sb, "\t%s(self, alloc)\n", a.reinit.proc_name)
+				} else {
+					fmt.sbprintln(&sb, "\t_ = alloc")
+					fmt.sbprintf(&sb, "\t%s(self)\n", a.reinit.proc_name)
+				}
+				fmt.sbprintln(&sb, "}\n")
+			}
+		}
+
+		use_arena_lit := "true" if a.supervise.use_arena else "false"
+
 		fmt.sbprintf(&sb, "spawn_%s_auto :: proc(\n", snake_actor)
 		fmt.sbprintf(&sb, "\tinitial_state: %s = {{}},\n", a.name)
 		fmt.sbprintln(&sb, "\tid: u32 = 0,")
 		fmt.sbprintln(&sb, "\tallocator := context.allocator,")
 		fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
 		fmt.sbprintf(&sb, "\ta, _ := %s.spawn(initial_state, %s_dispatch, id, allocator)\n", a_alias, snake_actor)
+		if a.supervise.enabled {
+			fmt.sbprintf(&sb, "\t_ = %s.enable_actor_supervision(a, initial_state, %s, %s)\n", a_alias, reinit_cb, use_arena_lit)
+		}
 		fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 		fmt.sbprintln(&sb, "}\n")
 
@@ -1071,12 +1411,33 @@ emit_module_code :: proc(mod: ^Module_Spec, allocator := context.allocator) -> s
 		fmt.sbprintln(&sb, "\tallocator := context.allocator,")
 		fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
 		fmt.sbprintf(&sb, "\ta, _ := %s.spawn(s, initial_state, %s_dispatch, id, allocator)\n", a_alias, snake_actor)
+		if a.supervise.enabled {
+			fmt.sbprintf(&sb, "\t_ = %s.enable_actor_supervision(a, initial_state, %s, %s)\n", a_alias, reinit_cb, use_arena_lit)
+		}
 		fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
 		fmt.sbprintln(&sb, "}\n")
+
+		if a.supervise.enabled {
+			fmt.sbprintf(&sb, "spawn_%s_sup :: proc(\n", snake_actor)
+			fmt.sbprintf(&sb, "\tsup: ^%s.Supervisor,\n", a_alias)
+			fmt.sbprintf(&sb, "\tinitial_state: %s = {{}},\n", a.name)
+			fmt.sbprintf(&sb, "\tpolicy: %s.Restart_Policy = %s_DEFAULT_RESTART_POLICY,\n", a_alias, a.name)
+			fmt.sbprintf(&sb, "\tuse_arena: bool = %s,\n", use_arena_lit)
+			fmt.sbprintln(&sb, "\tid: u32 = 0,")
+			fmt.sbprintln(&sb, "\tallocator := context.allocator,")
+			fmt.sbprintf(&sb, ") -> %s_Actor {{\n", a.name)
+			fmt.sbprintf(&sb, "\ta, _ := %s.spawn(sup.sched, initial_state, %s_dispatch, id, allocator)\n", a_alias, snake_actor)
+			fmt.sbprintf(&sb, "\t_ = %s.supervise(sup, a, initial_state, policy, %s, nil, use_arena)\n", a_alias, reinit_cb)
+			fmt.sbprintf(&sb, "\treturn %s_Actor{{raw = a, vtable = &%s_vtable}}\n", a.name, snake_actor)
+			fmt.sbprintln(&sb, "}\n")
+		}
 
 		fmt.sbprintf(&sb, "spawn_%s :: proc {{\n", snake_actor)
 		fmt.sbprintf(&sb, "\tspawn_%s_auto,\n", snake_actor)
 		fmt.sbprintf(&sb, "\tspawn_%s_sched,\n", snake_actor)
+		if a.supervise.enabled {
+			fmt.sbprintf(&sb, "\tspawn_%s_sup,\n", snake_actor)
+		}
 		fmt.sbprintln(&sb, "}\n")
 	}
 
@@ -1130,9 +1491,12 @@ generate_from_sources :: proc(
 	pending := make([dynamic]Behavior_Spec)
 	defer delete(pending)
 
+	pending_reinits := make([dynamic]Reinit_Spec)
+	defer delete(pending_reinits)
+
 	for src, idx in sources {
 		fname := filenames[idx] if idx < len(filenames) else "input.odin"
-		if !parse_source_into_spec(src, fname, &mod, &pending) {
+		if !parse_source_into_spec(src, fname, &mod, &pending, &pending_reinits) {
 			for b in pending {
 				delete(b.params)
 				delete(b.result_fields)
@@ -1140,19 +1504,23 @@ generate_from_sources :: proc(
 			return "", false
 		}
 	}
-	finalize_module_spec(&mod, pending[:])
+	finalize_module_spec(&mod, pending[:], pending_reinits[:])
+	if len(mod.diagnostics) > 0 {
+		return "", false
+	}
 	return emit_module_code(&mod, allocator), true
 }
 
 // Validate a parsed `Module_Spec` for invalid `@(supervise)` / `@(reinit)` attributes
-// or ambiguous RPC reply signatures. Stubbed in Track 2; implemented in Track 4.
+// or ambiguous RPC reply signatures.
 validate_module_spec :: proc(
 	spec: ^Module_Spec,
 	allocator := context.allocator,
 ) -> (diags: []Diagnostic, ok: bool) {
-	_ = spec
-	_ = allocator
-	return nil, true
+	if spec == nil || len(spec.diagnostics) == 0 {
+		return nil, true
+	}
+	return slice.clone(spec.diagnostics[:], allocator), false
 }
 
 // High-level helper: parse a single Odin source string and validate its module specification.
@@ -1168,7 +1536,10 @@ validate_source :: proc(
 	pending := make([dynamic]Behavior_Spec)
 	defer delete(pending)
 
-	if !parse_source_into_spec(src, filename, &mod, &pending) {
+	pending_reinits := make([dynamic]Reinit_Spec)
+	defer delete(pending_reinits)
+
+	if !parse_source_into_spec(src, filename, &mod, &pending, &pending_reinits) {
 		for b in pending {
 			delete(b.params)
 			delete(b.result_fields)
@@ -1181,12 +1552,13 @@ validate_source :: proc(
 		}
 		return out, false
 	}
-	finalize_module_spec(&mod, pending[:])
+	finalize_module_spec(&mod, pending[:], pending_reinits[:])
 	return validate_module_spec(&mod, allocator)
 }
 
 // Scan a directory of `.odin` files (skipping `*_gen.odin`, `*_test.odin`, and mismatched OS/build files),
-// parse all `@(actor)` and behavior declarations across all files in the package, and write `<dir>/actors_gen.odin`.
+// parse all `@(actor)` and behavior declarations across all files in the package, validate diagnostics,
+// and write `<dir>/actors_gen.odin`.
 generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.odin") -> (out_path: string, ok: bool) {
 	f, err := os.open(dir_path)
 	if err != nil {
@@ -1221,6 +1593,9 @@ generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.
 	pending := make([dynamic]Behavior_Spec)
 	defer delete(pending)
 
+	pending_reinits := make([dynamic]Reinit_Spec)
+	defer delete(pending_reinits)
+
 	file_buffers := make([dynamic][]byte)
 	defer {
 		for buf in file_buffers {
@@ -1244,7 +1619,7 @@ generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.
 		if !matches_build_tags(src) {
 			continue
 		}
-		if !parse_source_into_spec(src, full, &mod, &pending) {
+		if !parse_source_into_spec(src, full, &mod, &pending, &pending_reinits) {
 			for b in pending {
 				delete(b.params)
 				delete(b.result_fields)
@@ -1253,7 +1628,16 @@ generate_directory :: proc(dir_path: string, out_filename: string = "actors_gen.
 		}
 	}
 
-	finalize_module_spec(&mod, pending[:])
+	finalize_module_spec(&mod, pending[:], pending_reinits[:])
+	diags, valid := validate_module_spec(&mod, context.allocator)
+	defer delete(diags)
+	if !valid {
+		for d in diags {
+			fmt.eprintfln("%s(%d): %s", d.file, d.line, d.message)
+		}
+		return "", false
+	}
+
 	code := emit_module_code(&mod, context.allocator)
 	defer delete(code)
 
