@@ -549,7 +549,7 @@ actor_drain_stopped_target :: proc(base: ^Actor_Base, wait_if_busy: bool = true)
 	}
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == base
 	if wait_if_busy && !is_self_step {
-		for intrinsics.atomic_load_explicit(&base.in_step, .Acquire) != 0 {
+		for intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
 		for intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 &&
@@ -813,7 +813,7 @@ try_call_would_deadlock :: proc(s: ^Scheduler, caller_ctx: ^Context, target_base
 	if caller == target_base {
 		return true
 	}
-	if caller_ctx.sched == s && s != nil && s.num_workers == 1 && intrinsics.atomic_load_explicit(&target_base.in_step, .Acquire) != 0 {
+	if caller_ctx.sched == s && s != nil && s.num_workers == 1 && intrinsics.atomic_load_explicit(&target_base.in_step, .Seq_Cst) != 0 {
 		return true
 	}
 	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
@@ -1206,7 +1206,7 @@ prepare_child_reset_unlocked :: proc(c: ^Actor_Base) {
 	}
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == c
 	if !is_self_step {
-		for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
+		for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
 	}
@@ -1260,7 +1260,7 @@ stop_live_child_for_restart_unlocked :: proc(c: ^Actor_Base, policy: Restart_Pol
 	prev := intrinsics.atomic_exchange_explicit(&c.status, target_status, .Seq_Cst)
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == c
 	if !is_self_step {
-		for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
+		for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
 	}
@@ -1428,7 +1428,7 @@ stop_supervisor_subtree_iterative :: proc(
 		target_status := u32(Actor_Status.Stopped) if (cur_perm || mark_stopped || entry.policy == .Temporary) else u32(Actor_Status.Faulted)
 		prev := intrinsics.atomic_exchange_explicit(&c.status, target_status, .Seq_Cst)
 		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != c {
-			for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
+			for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
 		}
@@ -2243,7 +2243,7 @@ supervisor_terminate_child :: proc(sup: ^Supervisor, child_id: u64) -> Superviso
 		} else if c != nil {
 			prev := intrinsics.atomic_exchange_explicit(&c.status, u32(Actor_Status.Stopped), .Seq_Cst)
 			if _tls_active_ctx == nil || _tls_active_ctx.current_actor != c {
-				for intrinsics.atomic_load_explicit(&c.in_step, .Acquire) != 0 {
+				for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 					intrinsics.cpu_relax()
 				}
 			}
@@ -2853,7 +2853,7 @@ actor_base_is_busy :: #force_inline proc(b: ^Actor_Base) -> bool {
 		return false
 	}
 	return intrinsics.atomic_load_explicit(&b.scheduled, .Acquire) != 0 ||
-	       intrinsics.atomic_load_explicit(&b.in_step, .Acquire) != 0
+	       intrinsics.atomic_load_explicit(&b.in_step, .Seq_Cst) != 0
 }
 
 @(private)

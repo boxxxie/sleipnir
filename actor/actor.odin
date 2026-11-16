@@ -1087,7 +1087,7 @@ actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 	if s != nil {
 		if s.started && intrinsics.atomic_load_explicit(&s.running, .Acquire) {
 			for intrinsics.atomic_load_explicit(&a.base.scheduled, .Acquire) != 0 ||
-			    intrinsics.atomic_load_explicit(&a.base.in_step, .Acquire) != 0 {
+			    intrinsics.atomic_load_explicit(&a.base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
 		}
@@ -2082,7 +2082,7 @@ call_sched_pid :: proc(
 		if caller_ctx.current_actor == &target.ref.base {
 			panic("actor.call self-call deadlock detected")
 		}
-		if s.num_workers == 1 && intrinsics.atomic_load_explicit(&target.ref.base.in_step, .Acquire) != 0 {
+		if s.num_workers == 1 && intrinsics.atomic_load_explicit(&target.ref.base.in_step, .Seq_Cst) != 0 {
 			panic("actor.call cycle detected on single-worker scheduler")
 		}
 		if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
