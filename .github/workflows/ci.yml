@@ -5,9 +5,15 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test-and-verify:
+  static-analysis:
+    name: Static Analysis & Codegen Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,21 +26,72 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           cache: false
 
-      - name: Strict static analysis checks
+      - name: Strict static analysis (core, codegen, tools, tests)
         run: |
           odin check ./actor -no-entry-point -vet -strict-style -disallow-do -warnings-as-errors
           odin check ./actor/codegen -no-entry-point -vet -strict-style -disallow-do -warnings-as-errors
           odin check ./tools/sleipnir_gen -vet -strict-style -disallow-do -warnings-as-errors
           odin check ./tests -no-entry-point -vet -strict-style -disallow-do -warnings-as-errors -custom-attribute:actor,behavior,no_behavior,supervise,reinit
 
-      - name: Run unit, OTP supervision & codegen test suite (debug with memory leak detection)
-        run: odin test ./tests -custom-attribute:actor,behavior,no_behavior,supervise,reinit
-
-      - name: Run unit, OTP supervision & codegen test suite (-o:speed with memory leak detection)
-        run: odin test ./tests -custom-attribute:actor,behavior,no_behavior,supervise,reinit -o:speed
+      - name: Strict static analysis (examples)
+        run: |
+          odin check examples/01_ping_pong.odin -file -vet -strict-style -disallow-do -warnings-as-errors
+          odin check examples/02_heterogeneous_pipeline.odin -file -vet -strict-style -disallow-do -warnings-as-errors
+          odin check examples/03_sharded_spsc_mailbox.odin -file -vet -strict-style -disallow-do -warnings-as-errors
+          odin check examples/04_ergonomic_dsl.odin -file -vet -strict-style -disallow-do -warnings-as-errors
+          odin check examples/05_ast_metaprogramming -vet -strict-style -disallow-do -warnings-as-errors -custom-attribute:actor,behavior,no_behavior,supervise,reinit
+          odin check examples/06_otp_supervision.odin -file -vet -strict-style -disallow-do -warnings-as-errors
+          odin check examples/library_demo.odin -file -vet -strict-style -disallow-do -warnings-as-errors
 
       - name: Verify package documentation generation
         run: odin doc ./actor > /dev/null
+
+      - name: Verify sleipnir_gen AST codegen is up to date
+        run: |
+          odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
+          git diff --exit-code examples/05_ast_metaprogramming/actors_gen.odin
+
+  tests:
+    name: Test Suite (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: debug
+            flags: ""
+          - mode: speed
+            flags: "-o:speed"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Odin compiler
+        uses: laytan/setup-odin@v2
+        with:
+          release: latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
+
+      - name: Run unit, OTP supervision & codegen test suite
+        run: odin test ./tests -custom-attribute:actor,behavior,no_behavior,supervise,reinit ${{ matrix.flags }}
+
+      - name: Run AST metaprogramming DSL test suite
+        run: odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit ${{ matrix.flags }}
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Odin compiler
+        uses: laytan/setup-odin@v2
+        with:
+          release: latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
 
       - name: Run example 01 (Ping-Pong)
         run: odin run examples/01_ping_pong.odin -file -o:speed
@@ -48,18 +105,30 @@ jobs:
       - name: Run example 04 (Ergonomic Actor DSL)
         run: odin run examples/04_ergonomic_dsl.odin -file -o:speed
 
-      - name: Run AST Metaprogramming Codegen & Example 05
-        run: |
-          odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
-          git diff --exit-code examples/05_ast_metaprogramming/actors_gen.odin
-          odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit
-          odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit -o:speed
+      - name: Run example 05 (AST Metaprogramming)
+        run: odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit -o:speed
 
       - name: Run example 06 (Multi-Tenant OTP Supervision)
         run: |
-          odin check examples/06_otp_supervision.odin -file -vet -strict-style -disallow-do -warnings-as-errors
           odin run examples/06_otp_supervision.odin -file
           odin run examples/06_otp_supervision.odin -file -o:speed
+
+      - name: Run library demo
+        run: odin run examples/library_demo.odin -file -o:speed
+
+  benchmarks:
+    name: Benchmarks & libponyrt FFI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Odin compiler
+        uses: laytan/setup-odin@v2
+        with:
+          release: latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
 
       - name: Type-check full benchmark suite
         run: odin check benchmarks/actor_benchmark.odin -file

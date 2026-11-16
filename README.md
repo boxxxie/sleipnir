@@ -1,7 +1,14 @@
 # Sleipnir (`package actor`)
 
 [![CI](https://github.com/boxxxie/sleipnir/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/sleipnir/actions/workflows/ci.yml)
+[![Odin](https://img.shields.io/badge/Odin-Actor%20Runtime-3882D2)](https://odin-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Memory: Zero-GC](https://img.shields.io/badge/Memory-Zero--GC%20%7C%200%20Leaks-00C853)](tests/README.md)
+[![Scheduler: Work-Stealing M:N](https://img.shields.io/badge/Scheduler-Work--Stealing%20M%3AN-7C4DFF)](actor/actor.odin)
+[![Fault Tolerance: OTP Supervision](https://img.shields.io/badge/Fault%20Tolerance-OTP%20Supervision-FF6D00)](examples/06_otp_supervision.odin)
+[![DSL: @(actor) AST Codegen](https://img.shields.io/badge/DSL-%40(actor)%20AST%20Codegen-00ACC1)](docs/DSL_GUIDE.md)
+[![SPSC: 1.06B msgs/s](https://img.shields.io/badge/SPSC-1.06B%20msgs%2Fs-E91E63)](benchmarks/README.md)
+[![Tests: 4-Layer ATDD](https://img.shields.io/badge/Tests-4--Layer%20ATDD-2E7D32)](tests/README.md)
 
 High-throughput, zero-GC, Pony-style actor runtime for [Odin](https://odin-lang.org/).
 
