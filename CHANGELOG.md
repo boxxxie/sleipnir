@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.1] - 2026-11-16
+
+### Fixed
+- **Step Hot-Path Throughput Recovery (`actor/actor.odin`, `actor/pool.odin`):**
+  - Guarded per-batch `free_all(context.temp_allocator)` in `scheduler_worker_proc` so default `temp_allocator` arenas with `total_used == 0` avoid indirect allocator calls on empty-temp batches.
+  - Replaced the `1 KB` `Batch_Return_Collector` stack zero-initialization (`memset`) with a `u64` `used_mask` occupancy bitset.
+  - Extracted `actor_step_trapped` (`#force_no_inline`) and `step_retire_envelope` out of `actor_generic_step_proc`, hoisted loop-invariant `ctx` fields (`current_actor`, `current_pools_raw`, `current_msg_type`), and cleared `ctx` fields once per batch via `defer`—recovering `Chain=32` fan-in throughput (`29.71 ms` / `67.31 M/s` vs `34.03–34.88 ms`) and A2A scaling.
+
+---
+
 ## [1.1.0] - 2026-11-16
 
 ### Added
@@ -54,6 +64,7 @@ Initial pre-OTP release of **Sleipnir** (`package actor`) at commit [`90d94f5`](
 ### Fixed
 - Prevented lost worker wakeups and false-empty MPSC runqueue observations in `scheduler_worker_proc` (`90d94f5`).
 
-[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/boxxxie/sleipnir/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/boxxxie/sleipnir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/boxxxie/sleipnir/releases/tag/v1.0.0
