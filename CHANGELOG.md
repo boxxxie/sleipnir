@@ -7,18 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.1.0] - 2026-11-16
+
 ### Added
 - **OTP Supervision & Fault Tolerance (`actor/supervision.odin`):**
-  - `Supervisor` with `.One_For_One`, `.One_For_All`, and `.Rest_For_One` restart strategies, max-restart intensity windows, `.Permanent` / `.Transient` / `.Temporary` child restart policies, and nested supervision subtrees.
-  - Panic recovery (`actor.try_call`, trapped turn execution, `Exit_Reason` / `Fault_Info`), process monitors (`actor.monitor` / `DOWN`), and `on_reinit` / `on_stop` lifecycle hooks.
-  - `Registry($Key)` typed process registry with automatic cleanup on actor termination.
-  - `Partitioned_Supervisor` for sharded multi-tenant actor subtrees with idle tenant eviction and per-tenant `try_call_tenant` / `call_tenant` / `send_to_tenant`.
+  - `Supervisor` with `.One_For_One`, `.One_For_All`, and `.Rest_For_One` restart strategies, max-restart intensity windows, `.Permanent` / `.Transient` / `.Temporary` child restart policies, and nested supervision subtrees (`supervise_supervisor`).
+  - Trapped turn panic recovery (`actor.try_call`, `fail_turn`, `exit_turn`, `defer_on_fault`, `Exit_Reason` / `Fault_Info`), process monitors (`actor.monitor` / `demonitor` / `Down_Event`), and `on_reinit` / `on_stop` lifecycle hooks backed by per-actor `vmem.Arena` reset.
+  - `Registry($Key)` typed process registry with automatic cleanup on actor termination or restart.
+  - `Partitioned_Supervisor` (and `Dynamic_Supervisor` compatibility wrappers) for sharded multi-tenant actor subtrees with idle tenant eviction and per-tenant `try_call_tenant` / `call_tenant` / `send_to_tenant`.
 - **AST Codegen Enhancements (`actor/codegen`, `tools/sleipnir_gen`):**
-  - `@(supervise)` and `@(reinit)` attribute support plus `@(no_behavior)` filtering and structured AST diagnostics.
-- **Examples, Tests & CI:**
+  - `@(supervise)` and `@(reinit)` attribute support (generating `spawn_<actor>(sup, ...)` overloads and reinit trampolines) plus `@(no_behavior)` filtering and structured AST diagnostics.
+- **Examples, Documentation, Tests & CI:**
   - Multi-tenant OTP supervision showcase ([`examples/06_otp_supervision.odin`](examples/06_otp_supervision.odin)).
-  - 4-layer ATDD supervision test suite ([`tests/supervision_spec_test.odin`](tests/supervision_spec_test.odin), [`tests/supervision_dsl_test.odin`](tests/supervision_dsl_test.odin), [`tests/supervision_driver_test.odin`](tests/supervision_driver_test.odin); 60 total tests).
-  - Parallel GitHub Actions CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) and README badges.
+  - Updated [`README.md`](README.md), [`docs/DSL_GUIDE.md`](docs/DSL_GUIDE.md), and [`tests/README.md`](tests/README.md) with OTP supervision APIs, `@(supervise)` / `@(reinit)` guide, and updated `-custom-attribute` flags.
+  - 4-layer ATDD supervision test suite ([`tests/supervision_spec_test.odin`](tests/supervision_spec_test.odin), [`tests/supervision_dsl_test.odin`](tests/supervision_dsl_test.odin), [`tests/supervision_driver_test.odin`](tests/supervision_driver_test.odin); 60 tests in `./tests` plus end-to-end AST DSL test).
+  - Parallel GitHub Actions CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), release workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)), and README badges.
 
 ### Fixed
 - Sequential-consistency (`Seq_Cst`) ordering for `base.in_step` loads and `.Release`/`.Acquire` pairing on `last_active_ns` for latest Odin memory-ordering checks.
@@ -49,5 +54,6 @@ Initial pre-OTP release of **Sleipnir** (`package actor`) at commit [`90d94f5`](
 ### Fixed
 - Prevented lost worker wakeups and false-empty MPSC runqueue observations in `scheduler_worker_proc` (`90d94f5`).
 
-[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/boxxxie/sleipnir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/boxxxie/sleipnir/releases/tag/v1.0.0

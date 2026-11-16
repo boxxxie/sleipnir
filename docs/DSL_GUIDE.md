@@ -12,9 +12,10 @@ Sleipnir (`package actor`) offers **two ergonomic tiers** for writing actors in 
 | Feature | Pure-Library Runtime DSL (`actor`) | AST Metaprogramming DSL (`@(actor)`) |
 | :--- | :--- | :--- |
 | **Build Step** | None (`odin run .`) | `odin run tools/sleipnir_gen -- <pkg_dir>` |
-| **Compiler Flag** | None | `-custom-attribute:actor,behavior,no_behavior` |
+| **Compiler Flag** | None | `-custom-attribute:actor,behavior,no_behavior,supervise,reinit` |
 | **Defining State** | `Bank_Account :: struct { ... }` | `@(actor) Bank_Account :: struct { ... }` |
 | **Defining Behaviors** | Message structs + `union` + `switch` handler | Plain procs: `deposit :: proc(self: ^Bank_Account, ...)` |
+| **OTP Supervision** | `actor.spawn_supervisor` + `actor.supervise` | `@(supervise(...))` + `@(reinit)` + `spawn_<actor>(sup)` |
 | **1-Way Async Send** | `actor.send(account, Deposit{amount = 250})` | `account->deposit(250)` or `send_deposit(account, 250)` |
 | **Request / Reply** | `actor.reply(val)` + `actor.call(account, Get_Balance{}, i64)` | `return self.balance` + `account->get_balance()` or `call_get_balance(account)` |
 | **Default Arguments** | Manual struct defaults | Preserved automatically (`memo: string = "deposit"`) |
@@ -167,14 +168,45 @@ logger->reset()  // OR: send_reset(logger)
 
 ---
 
-### 6. Running the Code Generator (`tools/sleipnir_gen`)
+### 6. OTP Supervision Attributes (`@(supervise)` & `@(reinit)`)
+
+Attach `@(supervise)` alongside `@(actor)` on a state struct to generate supervisor-aware constructors and fault-recovery wiring:
+
+```odin
+@(actor, supervise = "transient, use_arena=true")
+Worker :: struct {
+    scratch: []byte,
+    count:   int,
+}
+
+@(reinit)
+worker_reinit :: proc(self: ^Worker, alloc: actor.Allocator) {
+    self.scratch = make([]byte, 256, alloc)
+}
+```
+
+- **Supported `@(supervise)` options** (all optional; defaults shown):
+  - `restart` / `policy`: `permanent` (default), `transient`, or `temporary` (shorthand `@(supervise="transient")` is also accepted).
+  - `strategy`: `one_for_one` (default), `one_for_all`, or `rest_for_one`.
+  - `max_restarts`: non-negative integer (default `3`).
+  - `window_ms`: positive integer in milliseconds (default `5000`).
+  - `use_arena`: `true` (default) or `false`.
+- **Generated bindings:**
+  - `<Actor>_DEFAULT_RESTART_POLICY` constant.
+  - `spawn_<actor>(sup: ^actor.Supervisor, initial_state = {}, policy = <Actor>_DEFAULT_RESTART_POLICY, use_arena = ...)` overload wired into `actor.supervise(...)` with your `@(reinit)` hook.
+  - Standard `spawn_<actor>(...)` overloads automatically call `actor.enable_actor_supervision(...)` so trapped turn recovery works even outside a supervisor.
+- **`@(reinit)` rules:** Must be placed on a procedure taking `(self: ^Actor)` or `(self: ^Actor, alloc: actor.Allocator)` with no return value, and cannot be combined with `@(behavior)`.
+
+---
+
+### 7. Running the Code Generator (`tools/sleipnir_gen`)
 
 ```bash
 # 1. Generate `<dir>/actors_gen.odin` for one or more package directories:
 odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
 
 # 2. Build or run your package with Odin's `-custom-attribute` flag:
-odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior -o:speed
+odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit -o:speed
 ```
 
 ---

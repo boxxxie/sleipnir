@@ -15,7 +15,8 @@ High-throughput, zero-GC, Pony-style actor runtime for [Odin](https://odin-lang.
 Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N` thread scheduler, lock-free `Envelope_Pool` slab recycling, and a wait-free `Sharded_SPSC_Mailbox`—all integrated with Odin's `context.allocator` and ergonomic compile-time polymorphism.
 
 - **Zero Garbage Collector:** Deterministic memory management via automatic per-message `Envelope_Pool(Msg)` slabs or custom `mem.Allocator`.
-- **Zero-Ceremony Ergonomics:** Single-line RAII `actor.scoped_scheduler` (`@(deferred_out)`), ambient thread-local context, envelope-header `actor.call` / `actor.reply`, and optional `@(actor)` AST metaprogramming (`account->deposit(250)`, `account->get_balance()`). See the [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md) and [**Testing & 4-Layer ATDD Architecture Guide (`tests/README.md`)**](tests/README.md).
+- **OTP Supervision & Fault Tolerance:** Erlang/OTP-style `Supervisor` trees (`.One_For_One`, `.One_For_All`, `.Rest_For_One`), trapped turn panic recovery (`actor.try_call`), `actor.monitor` / `Down_Event`, typed `Registry($Key)`, and sharded multi-tenant `Partitioned_Supervisor` with idle tenant eviction. See [`examples/06_otp_supervision.odin`](examples/06_otp_supervision.odin).
+- **Zero-Ceremony Ergonomics:** Single-line RAII `actor.scoped_scheduler` (`@(deferred_out)`), ambient thread-local context, envelope-header `actor.call` / `actor.reply`, and optional `@(actor)` / `@(supervise)` AST metaprogramming (`account->deposit(250)`, `account->get_balance()`). See the [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md) and [**Testing & 4-Layer ATDD Architecture Guide (`tests/README.md`)**](tests/README.md).
 - **Performance:** **31–44M msgs/sec** on single-message 4-producer MPSC fan-in (**64–78M msgs/sec** with `Chain=32` batching), **827M–1.06B msgs/sec** (`0.9–1.2 ns/msg`) on wait-free sharded SPSC, **48–62M msgs/sec** across a 1,024-actor `M:N` swarm, and **16.65–17.85M hops/sec** across 1,024 autonomous actors on 8 cores—matching or outperforming the official Pony C runtime (`libponyrt` 0.77.2) and raw C11 (`stdatomic.h`). See the full [**Benchmark Report & Cross-Runtime Comparison (`benchmarks/README.md`)**](benchmarks/README.md).
 
 ---
@@ -25,13 +26,14 @@ Sleipnir combines Vyukov Intrusive MPSC mailboxes, a sharded work-stealing `M:N`
 Import `./actor` into your Odin project and run tests or examples:
 
 ```bash
-odin test ./tests
-odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior
+odin test ./tests -custom-attribute:actor,behavior,no_behavior,supervise,reinit
+odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit
 odin run examples/01_ping_pong.odin -file -o:speed
 odin run examples/02_heterogeneous_pipeline.odin -file -o:speed
 odin run examples/03_sharded_spsc_mailbox.odin -file -o:speed
 odin run examples/04_ergonomic_dsl.odin -file -o:speed
-odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior -o:speed
+odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit -o:speed
+odin run examples/06_otp_supervision.odin -file -o:speed
 ```
 
 ---
@@ -231,7 +233,39 @@ assert(len(track.allocation_map) == 0) // Zero bytes leaked!
 
 ---
 
-### 7. Optional AST Metaprogramming (`@(actor)`)
+### 7. OTP Supervision, Panic Recovery & Multi-Tenant Trees
+
+Sleipnir provides Erlang/OTP-style fault isolation in [`actor/supervision.odin`](actor/supervision.odin):
+
+- **Supervision Trees (`Supervisor`):** Supports `.One_For_One`, `.One_For_All`, and `.Rest_For_One` restart strategies, max-restart intensity windows (`max_restarts`, `within_window`), `.Permanent` / `.Transient` / `.Temporary` child policies, nested child supervisors (`supervise_supervisor`), and deterministic `on_stop` / `on_reinit` lifecycle hooks backed by per-actor `vmem.Arena` reset.
+- **Trapped Faults & Non-Panicking RPC (`actor.try_call`):** Worker turns execute inside a per-worker `Trap_Frame` (`_setjmp`/`_longjmp`) with `defer_on_fault` cleanup hooks; callers using `actor.try_call` receive `(res, Call_Error)` (such as `.Call_Target_Crashed`, `.Target_Stopped`, or `.Timeout`) instead of crashing the caller or sibling actors.
+- **Process Monitors & Registries (`actor.monitor` / `Registry($Key)`):** Watch any actor or `PID` for `Down_Event` notifications (`actor.monitor`, `actor.demonitor`), and map typed keys to live `PID(Msg)` handles with automatic cleanup on termination or restart.
+- **Multi-Tenant `Partitioned_Supervisor`:** Shards isolated tenant supervision subtrees across partitions with lazy on-demand spawning (`try_call_tenant`, `send_to_tenant`, `call_tenant`) and `sweep_idle_tenants` eviction.
+
+```odin
+sup := actor.spawn_supervisor(sched, actor.Supervisor_Config{
+    strategy      = .Rest_For_One,
+    max_restarts  = 5,
+    within_window = 10 * time.Second,
+})
+
+actor.supervise(sup, worker, initial_state, .Permanent, actor.Child_Hooks(Worker_State){
+    on_reinit = worker_reinit,
+    on_stop   = worker_stop,
+    use_arena = true,
+})
+
+res, err := actor.try_call(worker, Worker_Msg(Do_Work{}), Work_Result)
+if err == .Call_Target_Crashed {
+    // Worker faulted and is restarted cleanly by `sup`
+}
+```
+
+> See [`examples/06_otp_supervision.odin`](examples/06_otp_supervision.odin) for a full 50-tenant, 200-actor `.Rest_For_One` pipeline showcase with out-of-bounds panic recovery and idle tenant eviction.
+
+---
+
+### 8. Optional AST Metaprogramming (`@(actor)`)
 
 If you want ergonomic actor methods without writing message structs, `union` definitions, or `switch` dispatchers by hand, Sleipnir includes an **optional** zero-dependency AST code generator ([`actor/codegen`](actor/codegen/codegen.odin) & [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin)) built on Odin's standard library (`core:odin/parser` + `core:odin/ast`).
 
@@ -289,14 +323,14 @@ main :: proc() {
 }
 ```
 
-> **Tip:** Need an internal helper procedure taking `self: ^Bank_Account` that shouldn't become a message? Mark it `@(private)` or `@(no_behavior)`. Need two actors in the same package to share a method name like `reset`? Name the procedures `account_reset` and `logger_reset` and mark both `@(behavior="reset")`—`sleipnir_gen` gives both a `->reset()` method and merges them into a unified `send_reset` overload group!
+> **Tip:** Need an internal helper procedure taking `self: ^Bank_Account` that shouldn't become a message? Mark it `@(private)` or `@(no_behavior)`. Need two actors in the same package to share a method name like `reset`? Name the procedures `account_reset` and `logger_reset` and mark both `@(behavior="reset")`—`sleipnir_gen` gives both a `->reset()` method and merges them into a unified `send_reset` overload group! You can also attach `@(supervise)` to an `@(actor)` struct and `@(reinit)` to a reset procedure to generate supervisor-aware `spawn_<actor>(sup, ...)` constructors automatically.
 
 #### What `sleipnir_gen` Generates (`actors_gen.odin`):
 
 Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` files in the target package directory, matches every `proc(self: ^Actor_Type, ...)` (or `proc(ctx: ^actor.Context, self: ^Actor_Type, ...)`) to its `@(actor)` struct, forwards any cross-file `import` declarations used in parameter or return types, and writes `actors_gen.odin` containing:
 - Message structs (`Bank_Account_Msg_deposit`, `Bank_Account_Msg_withdraw`, `Bank_Account_Msg_get_balance`)
 - Tagged union (`Bank_Account_Msg`) and `<Actor>_VTable` + `<Actor>_Actor` / `<Actor>_PID` handle (`using raw`, `using vtable`) enabling `account->method(...)` syntax
-- `bank_account_dispatch` procedure and `spawn_bank_account` constructor (supporting both ambient and explicit `^actor.Scheduler`)
+- `bank_account_dispatch` procedure and `spawn_bank_account` constructor (supporting ambient, explicit `^actor.Scheduler`, and—when `@(supervise)` is used—`^actor.Supervisor` with `@(reinit)` wiring)
 - Overloaded `send_<behavior>` (1-way async send + 2-way async `reply_to` forwarding for both `<Actor>_Actor` and `actor.PID`) and `call_<behavior>` (synchronous request/reply) proc groups
 
 ```bash
@@ -304,8 +338,8 @@ Running [`tools/sleipnir_gen`](tools/sleipnir_gen/main.odin) scans all `.odin` f
 odin run tools/sleipnir_gen -- examples/05_ast_metaprogramming
 
 # 2. Compile, test, or run with Odin's `-custom-attribute` flag:
-odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior
-odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior -o:speed
+odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit
+odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit -o:speed
 ```
 
 > See the full [**Actor DSL & AST Metaprogramming Guide (`docs/DSL_GUIDE.md`)**](docs/DSL_GUIDE.md) and [`examples/05_ast_metaprogramming/`](examples/05_ast_metaprogramming/) ([`audit_logger.odin`](examples/05_ast_metaprogramming/audit_logger.odin), [`bank_account.odin`](examples/05_ast_metaprogramming/bank_account.odin), [`main.odin`](examples/05_ast_metaprogramming/main.odin), and generated [`actors_gen.odin`](examples/05_ast_metaprogramming/actors_gen.odin)) for a complete multi-file reference.
@@ -323,10 +357,15 @@ odin run examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_beh
 | [`actor.Sharded_SPSC_Mailbox(T, N)`](actor/spsc.odin) | Wait-free cache-line-isolated SPSC ring lanes (`0.9–1.2 ns/msg`, zero atomic RMW instructions). |
 | [`actor.spawn`](actor/actor.odin) / [`actor.spawn_self`](actor/actor.odin) | Spawns an actor with 2-arg `(^State, ^Msg)`, 2-arg value `(^State, Msg)`, 3-arg `(^Context, ...)`, or embedded `receive` struct field. |
 | [`actor.send`](actor/doc.odin) | Sends a single `Msg`, batched `[]Msg` (`Chain=K`), or request with `reply_to` (`actor.send(target, msg, reply_to)` where `reply_to` is `^Actor` or `PID`). |
-| [`actor.call`](actor/actor.odin) / [`actor.reply`](actor/actor.odin) | Envelope-header request/reply (`res := actor.call(target, msg, Res)` and `actor.reply(val)` inside handlers) with cooperative worker stepping and zero `reply_to` pollution in `Msg`. |
+| [`actor.call`](actor/actor.odin) / [`actor.try_call`](actor/supervision.odin) / [`actor.reply`](actor/actor.odin) | Envelope-header request/reply (`call` and non-panicking `try_call` returning `(Res, Call_Error)`) with cooperative worker stepping. |
 | [`actor.forward`](actor/actor.odin) | Zero-copy `iso` forwarding of the currently executing message envelope (`actor.forward(target)` or `actor.forward(target, new_msg)`). |
+| [`actor.Supervisor`](actor/supervision.odin) / [`actor.spawn_supervisor`](actor/supervision.odin) / [`actor.supervise`](actor/supervision.odin) | OTP supervision tree with `.One_For_One`, `.One_For_All`, and `.Rest_For_One` strategies, intensity windows, child management (`supervisor_terminate_child`, `supervisor_restart_child`, `supervisor_delete_child`), and `Child_Hooks`. |
+| [`actor.monitor`](actor/supervision.odin) / [`actor.demonitor`](actor/supervision.odin) / [`actor.Down_Event`](actor/supervision.odin) | Process lifecycle monitoring delivering `Down_Event` notifications on actor termination. |
+| [`actor.fail_turn`](actor/supervision.odin) / [`actor.exit_turn`](actor/supervision.odin) / [`actor.defer_on_fault`](actor/supervision.odin) | Controlled turn fault/exit triggers and trapped-turn cleanup hooks. |
+| [`actor.Registry($Key)`](actor/supervision.odin) | Thread-safe typed process registry (`registry_register`, `registry_lookup`, `registry_unregister`) with automatic cleanup on actor exit. |
+| [`actor.Partitioned_Supervisor`](actor/supervision.odin) | Multi-tenant sharded supervisor (`try_call_tenant`, `send_to_tenant`, `call_tenant`, `sweep_idle_tenants`, `tenant_count`). |
 | [`actor.wait_idle`](actor/actor.odin) / [`actor.wait_messages`](actor/actor.odin) / [`actor.wait_tokens`](actor/actor.odin) | Ambient or explicit synchronization primitives for draining mailboxes, waiting on message counts, or awaiting `actor.complete_token()`. |
-| [`actor.init`](actor/doc.odin) / [`actor.destroy`](actor/doc.odin) | Unified lifecycle procedure overload groups for `Scheduler`, `Actor`, `Envelope_Pool`, `Watermark_Slab`, and `Sharded_SPSC_Mailbox`. |
+| [`actor.init`](actor/doc.odin) / [`actor.destroy`](actor/doc.odin) | Unified lifecycle procedure overload groups for `Scheduler`, `Actor`, `Envelope_Pool`, `Watermark_Slab`, `Sharded_SPSC_Mailbox`, `Registry`, and `Partitioned_Supervisor`. |
 
 ---
 
