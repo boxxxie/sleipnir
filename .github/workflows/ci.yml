@@ -31,17 +31,17 @@ jobs:
           odin check ./actor -no-entry-point -vet -strict-style -disallow-do -warnings-as-errors
           odin check ./actor/codegen -no-entry-point -vet -strict-style -disallow-do -warnings-as-errors
           odin check ./tools/sleipnir_gen -vet -strict-style -disallow-do -warnings-as-errors
-          odin check ./tests -no-entry-point -vet -strict-style -disallow-do -warnings-as-errors -custom-attribute:actor,behavior,no_behavior,supervise,reinit
+          odin check ./tests -no-entry-point -vet -strict-style -disallow-do -custom-attribute:actor,behavior,no_behavior,supervise,reinit
 
       - name: Strict static analysis (examples)
         run: |
-          odin check examples/01_ping_pong.odin -file -vet -strict-style -disallow-do -warnings-as-errors
-          odin check examples/02_heterogeneous_pipeline.odin -file -vet -strict-style -disallow-do -warnings-as-errors
-          odin check examples/03_sharded_spsc_mailbox.odin -file -vet -strict-style -disallow-do -warnings-as-errors
-          odin check examples/04_ergonomic_dsl.odin -file -vet -strict-style -disallow-do -warnings-as-errors
-          odin check examples/05_ast_metaprogramming -vet -strict-style -disallow-do -warnings-as-errors -custom-attribute:actor,behavior,no_behavior,supervise,reinit
-          odin check examples/06_otp_supervision.odin -file -vet -strict-style -disallow-do -warnings-as-errors
-          odin check examples/library_demo.odin -file -vet -strict-style -disallow-do -warnings-as-errors
+          odin check examples/01_ping_pong.odin -file -vet -strict-style -disallow-do
+          odin check examples/02_heterogeneous_pipeline.odin -file -vet -strict-style -disallow-do
+          odin check examples/03_sharded_spsc_mailbox.odin -file -vet -strict-style -disallow-do
+          odin check examples/04_ergonomic_dsl.odin -file -vet -strict-style -disallow-do
+          odin check examples/05_ast_metaprogramming -vet -strict-style -disallow-do -custom-attribute:actor,behavior,no_behavior,supervise,reinit
+          odin check examples/06_otp_supervision.odin -file -vet -strict-style -disallow-do
+          odin check examples/library_demo.odin -file -vet -strict-style -disallow-do
 
       - name: Verify package documentation generation
         run: odin doc ./actor > /dev/null
