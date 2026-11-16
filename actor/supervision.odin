@@ -592,7 +592,7 @@ finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fa
 
 	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == base
 	if !is_self_step {
-		for intrinsics.atomic_load_explicit(&base.in_step, .Acquire) != 0 {
+		for intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
 	}
@@ -1343,7 +1343,7 @@ stop_supervisor_subtree_iterative :: proc(
 			intrinsics.atomic_store_explicit(&cur.base.status, u32(Actor_Status.Faulted), .Seq_Cst)
 		}
 		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != &cur.base {
-			for intrinsics.atomic_load_explicit(&cur.base.in_step, .Acquire) != 0 {
+			for intrinsics.atomic_load_explicit(&cur.base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
 		}
@@ -2478,7 +2478,7 @@ actor_base_destroy_sched :: proc(s: ^Scheduler, base: ^Actor_Base) {
 	if eff_s != nil && eff_s.started && intrinsics.atomic_load_explicit(&eff_s.running, .Acquire) {
 		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != base {
 			for intrinsics.atomic_load_explicit(&base.scheduled, .Acquire) != 0 ||
-			    intrinsics.atomic_load_explicit(&base.in_step, .Acquire) != 0 {
+			    intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
 		}
@@ -3131,7 +3131,7 @@ acquire_tenant_entry :: proc(
 	sync.rw_mutex_shared_lock(&part.mu)
 	if part.tenants != nil {
 		if entry, found := part.tenants[org_id]; found && entry != nil && !entry.evicting && !tenant_entry_is_dead(entry) {
-			intrinsics.atomic_store_explicit(&entry.last_active_ns, now._nsec, .Relaxed)
+			intrinsics.atomic_store_explicit(&entry.last_active_ns, now._nsec, .Release)
 			if inc_in_flight {
 				intrinsics.atomic_add_explicit(&entry.in_flight, 1, .Acq_Rel)
 			}
@@ -3158,7 +3158,7 @@ acquire_tenant_entry :: proc(
 	}
 	if existing, found := part.tenants[org_id]; found && existing != nil {
 		if !existing.evicting && !tenant_entry_is_dead(existing) {
-			intrinsics.atomic_store_explicit(&existing.last_active_ns, now._nsec, .Relaxed)
+			intrinsics.atomic_store_explicit(&existing.last_active_ns, now._nsec, .Release)
 			if inc_in_flight {
 				intrinsics.atomic_add_explicit(&existing.in_flight, 1, .Acq_Rel)
 			}

@@ -26,10 +26,10 @@ package actor_benchmark
 
 import "../actor"
 import "base:intrinsics"
-import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
@@ -2246,8 +2246,8 @@ print_row :: proc(name: string, msgs: int, elapsed: time.Duration, score: i64) {
 
 main :: proc() {
 	when USE_LIBPONYRT {
-		if len(runtime.args__) > 1 {
-			mode := string(runtime.args__[1])
+		if len(os.args) > 1 {
+			mode := os.args[1]
 			switch mode {
 			case "--child-pony-w4":
 				run_child_ponyrt_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
