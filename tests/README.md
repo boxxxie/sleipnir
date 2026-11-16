@@ -4,7 +4,8 @@ Sleipnir separates its test suite into this dedicated `tests/` directory (`packa
 
 Tests are structured using **Acceptance Test-Driven Development (ATDD)** and **Dave Farley's 4-Layer Executable Specification Architecture** (popularized during the development of the LMAX Disruptor) across:
 - [`tests/actor_test.odin`](actor_test.odin) — Lock-free MPSC/SPSC mailboxes, `Envelope_Pool` / `Watermark_Slab`, and `M:N` work-stealing `Scheduler` & `Actor` concurrency specifications.
-- [`tests/codegen_test.odin`](codegen_test.odin) — AST metaprogramming parser and code generator specifications (`actor/codegen`).
+- [`tests/supervision_spec_test.odin`](supervision_spec_test.odin), [`tests/supervision_dsl_test.odin`](supervision_dsl_test.odin), & [`tests/supervision_driver_test.odin`](supervision_driver_test.odin) — 4-layer ATDD specifications for OTP supervision strategies (`.One_For_One`, `.One_For_All`, `.Rest_For_One`), panic recovery (`try_call`), `monitor`/`demonitor`, `Registry($Key)`, and `Partitioned_Supervisor`.
+- [`tests/codegen_test.odin`](codegen_test.odin) — AST metaprogramming parser and code generator specifications (`actor/codegen`, including `@(supervise)` and `@(reinit)`).
 - [`examples/05_ast_metaprogramming/dsl_test.odin`](../examples/05_ast_metaprogramming/dsl_test.odin) — End-to-end runtime verification of generated `@(actor)` bindings.
 
 ---
@@ -14,11 +15,11 @@ Tests are structured using **Acceptance Test-Driven Development (ATDD)** and **D
 Every test in Sleipnir runs inside a `with_leak_check` harness backed by `core:mem.Tracking_Allocator` and `free_all(context.temp_allocator)`, verifying **zero leaked bytes** and **zero invalid frees** after every test case:
 
 ```bash
-# 1. Core runtime, MPSC/SPSC mailboxes, pools, scheduler, & AST codegen (22 tests):
-odin test ./tests
+# 1. Core runtime, OTP supervision, & AST codegen suite (60 tests):
+odin test ./tests -custom-attribute:actor,behavior,no_behavior,supervise,reinit
 
 # 2. End-to-end generated `@(actor)` DSL runtime specification:
-odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior
+odin test examples/05_ast_metaprogramming -custom-attribute:actor,behavior,no_behavior,supervise,reinit
 ```
 
 ---
