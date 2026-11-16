@@ -422,6 +422,10 @@ scheduler_stop_and_destroy :: proc(s: ^Scheduler) {
 	if _tls_active_sched == s {
 		_tls_active_sched = s.prev_tls_sched
 	}
+	if s.prev_tls_sched == nil {
+		registry_destroy(&default_registry)
+		default_registry.allocator = {}
+	}
 }
 
 // Look up or lazily create a shared `[]Envelope_Pool($Msg)` slice on `s` for `$Msg`.
@@ -1000,15 +1004,15 @@ spawn_self :: proc(
 // Pop and reclaim all remaining envelopes in an actor's mailbox, waking any
 // queued synchronous `actor.call` waiters with `CALL_STATE_FAULTED`.
 @(private)
-actor_drain_mailbox :: proc(a: ^Actor($State, $Msg)) {
-	if a == nil { return }
+actor_ref_drain_mailbox :: proc(ref: ^Actor_Ref($Msg)) {
+	if ref == nil { return }
 	collector: Batch_Return_Collector(Msg)
-	has_pools := len(a.pools) > 0
+	has_pools := len(ref.pools) > 0
 	has_pooled_retires := false
 	for {
-		env := mpsc_pop_detached(&a.mailbox)
+		env := mpsc_pop_detached(&ref.mailbox)
 		if env == nil {
-			if !mpsc_is_empty(&a.mailbox) {
+			if !mpsc_is_empty(&ref.mailbox) {
 				intrinsics.cpu_relax()
 				continue
 			}
@@ -1019,19 +1023,25 @@ actor_drain_mailbox :: proc(a: ^Actor($State, $Msg)) {
 		}
 		if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
 			pid := env.pool_id
-			alloc := a.pools[pid].allocator if (has_pools && int(pid) < len(a.pools)) else a.allocator
+			alloc := ref.pools[pid].allocator if (has_pools && int(pid) < len(ref.pools)) else ref.allocator
 			if alloc.procedure == nil {
 				alloc = context.allocator
 			}
 			free(env, alloc)
-		} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 && int(env.pool_id) < len(a.pools) {
+		} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 && int(env.pool_id) < len(ref.pools) {
 			collector_add(&collector, env)
 			has_pooled_retires = true
 		}
 	}
 	if has_pools && has_pooled_retires {
-		collector_flush(&collector, a.pools, -1)
+		collector_flush(&collector, ref.pools, -1)
 	}
+}
+
+@(private)
+actor_drain_mailbox :: proc(a: ^Actor($State, $Msg)) {
+	if a == nil { return }
+	actor_ref_drain_mailbox(&a.ref)
 }
 
 // Free a heap-allocated `Actor($State, $Msg)` created via `spawn`.
@@ -1039,6 +1049,10 @@ actor_drain_mailbox :: proc(a: ^Actor($State, $Msg)) {
 // a `Scheduler` (which automatically destroys all remaining registered actors on shutdown).
 actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 	if a == nil { return }
+	if a.base.destroy_proc != nil {
+		actor_base_destroy(&a.base)
+		return
+	}
 	s := a.base.reg_sched
 	if s != nil {
 		if s.started && intrinsics.atomic_load_explicit(&s.running, .Acquire) {

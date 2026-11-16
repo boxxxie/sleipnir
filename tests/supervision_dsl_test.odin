@@ -391,7 +391,7 @@ upon_faulting_with_abort_hooks :: proc(
 }
 
 upon_sending_org_delta :: proc(w: ^Supervision_World, org_id: u64, delta: i64) {
-	actor.send_to_tenant(&w.part_sup, org_id, Test_Worker_Msg(Worker_Commit_Delta{delta = delta}))
+	actor.send_to_tenant(&w.part_sup, org_id, Test_Worker_Msg(Worker_Add{delta = delta}))
 	actor.wait_idle(&w.sched)
 }
 
@@ -415,7 +415,6 @@ upon_releasing_org_turn :: proc(w: ^Supervision_World, gate: ^Tenant_Gate) {
 
 upon_sweeping_idle_tenants :: proc(w: ^Supervision_World) {
 	_ = actor.sweep_idle_tenants(&w.part_sup)
-	actor.wait_idle(&w.sched)
 }
 
 upon_stopping_supervisor :: proc(w: ^Supervision_World, label: string, loc := #caller_location) {

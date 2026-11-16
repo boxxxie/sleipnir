@@ -759,6 +759,10 @@ monitor_pid :: proc(watcher: PID(Down_Event), target: PID($Msg)) -> Monitor_Ref 
 	if target.ref == nil {
 		return {}
 	}
+	ext := ensure_actor_ext(&target.ref.base)
+	sync.mutex_lock(&ext.monitors_mu)
+	ensure_ref_callbacks(ext, Msg)
+	sync.mutex_unlock(&ext.monitors_mu)
 	return monitor_impl(watcher, &target.ref.base, target.generation)
 }
 
@@ -1193,7 +1197,9 @@ reinit_child_entry_reset_only :: proc(entry: ^Child_Entry, sup: ^Supervisor) -> 
 
 	if cext != nil {
 		if !cext.keep_mailbox && cext.drain_proc != nil {
+			sync.mutex_lock(&cext.monitors_mu)
 			cext.drain_proc(c)
+			sync.mutex_unlock(&cext.monitors_mu)
 		}
 		if cext.use_arena && cext.arena_initialized {
 			vmem.arena_free_all(&cext.arena)
@@ -1267,6 +1273,9 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		if permanent_stop {
 			finalize_actor_stopped(&root.base, reason, crash_fault)
 		}
+		return
+	}
+	if intrinsics.atomic_load_explicit(&root_si.sup_state, .Acquire) == SUP_STOPPED {
 		return
 	}
 	alloc := root.allocator
@@ -1384,7 +1393,9 @@ stop_supervisor_subtree_iterative :: proc(root: ^Supervisor, reason: Exit_Reason
 		} else {
 			if cext != nil {
 				if !cext.keep_mailbox && cext.drain_proc != nil {
+					sync.mutex_lock(&cext.monitors_mu)
 					cext.drain_proc(c)
+					sync.mutex_unlock(&cext.monitors_mu)
 				}
 				if cext.use_arena && cext.arena_initialized {
 					vmem.arena_free_all(&cext.arena)
@@ -2154,9 +2165,65 @@ supervisor_which_children :: proc(sup: ^Supervisor, allocator := context.allocat
 }
 
 // -----------------------------------------------------------------------------
-// Named `Registry($Key)` & Sharded Multi-Tenant `Partitioned_Supervisor`
-// (Implemented in Track 4)
+// Live Actor Reclamation (`actor_base_destroy`), Named `Registry($Key)` &
+// Sharded Multi-Tenant `Partitioned_Supervisor`
 // -----------------------------------------------------------------------------
+
+actor_base_destroy_sched :: proc(s: ^Scheduler, base: ^Actor_Base) {
+	if base == nil {
+		return
+	}
+	if ext := get_actor_ext(base); ext != nil {
+		if ext.sup_internal != nil {
+			if intrinsics.atomic_load_explicit(&ext.sup_internal.sup_state, .Acquire) != SUP_STOPPED {
+				stop_supervisor_subtree_iterative(cast(^Supervisor)base, .Supervisor_Shutdown, -1, {}, permanent_stop = true)
+			} else {
+				finalize_actor_stopped(base, .Supervisor_Shutdown, {})
+			}
+		} else {
+			finalize_actor_stopped(base, .Supervisor_Shutdown, {})
+		}
+	} else {
+		intrinsics.atomic_store_explicit(&base.status, u32(Actor_Status.Stopped), .Seq_Cst)
+	}
+
+	eff_s := s if s != nil else base.reg_sched
+	if eff_s != nil && eff_s.started && intrinsics.atomic_load_explicit(&eff_s.running, .Acquire) {
+		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != base {
+			for intrinsics.atomic_load_explicit(&base.scheduled, .Acquire) != 0 ||
+			    intrinsics.atomic_load_explicit(&base.in_step, .Acquire) != 0 {
+				intrinsics.cpu_relax()
+			}
+		}
+	}
+
+	if reg_s := base.reg_sched; reg_s != nil {
+		sync.mutex_lock(&reg_s.registry_mu)
+		for i := 0; i < len(reg_s.owned_actors); i += 1 {
+			if reg_s.owned_actors[i] == base {
+				unordered_remove(&reg_s.owned_actors, i)
+				break
+			}
+		}
+		sync.mutex_unlock(&reg_s.registry_mu)
+		base.reg_sched = nil
+	}
+
+	if base.destroy_proc != nil {
+		destroy_fn := base.destroy_proc
+		base.destroy_proc = nil
+		destroy_fn(base)
+	}
+}
+
+actor_base_destroy_single :: proc(base: ^Actor_Base) {
+	actor_base_destroy_sched(nil, base)
+}
+
+actor_base_destroy :: proc {
+	actor_base_destroy_single,
+	actor_base_destroy_sched,
+}
 
 Registry_Entry :: struct {
 	ref:      ^Actor_Base,
@@ -2172,28 +2239,156 @@ Registry :: struct($Key: typeid) {
 default_registry: Registry(u64)
 
 registry_init :: proc(r: ^Registry($Key), allocator := context.allocator) {
+	if r == nil {
+		return
+	}
 	r.allocator = allocator
 	r.entries   = make(map[Key]Registry_Entry, 16, allocator)
 }
 
 registry_destroy :: proc(r: ^Registry($Key)) {
+	if r == nil {
+		return
+	}
 	sync.rw_mutex_lock(&r.mu)
-	delete(r.entries)
+	if r.entries != nil {
+		delete(r.entries)
+		r.entries = nil
+	}
 	sync.rw_mutex_unlock(&r.mu)
 }
 
+@(private)
+registry_cleanup_for_key :: proc($Key: typeid) -> proc(reg_ptr: rawptr, base: ^Actor_Base) {
+	return proc(reg_ptr: rawptr, base: ^Actor_Base) {
+		r := cast(^Registry(Key))reg_ptr
+		if r == nil || base == nil {
+			return
+		}
+		sync.rw_mutex_lock(&r.mu)
+		defer sync.rw_mutex_unlock(&r.mu)
+		if r.entries == nil {
+			return
+		}
+		for {
+			found_key: Key
+			has_match := false
+			for k, v in r.entries {
+				if v.ref == base {
+					found_key = k
+					has_match = true
+					break
+				}
+			}
+			if !has_match {
+				break
+			}
+			delete_key(&r.entries, found_key)
+		}
+	}
+}
+
+@(private)
+ensure_ref_callbacks :: proc(ext: ^Actor_Extension, $Msg: typeid) {
+	if ext == nil {
+		return
+	}
+	if ext.drain_proc == nil {
+		ext.drain_proc = proc(base: ^Actor_Base) {
+			ref := cast(^Actor_Ref(Msg))base
+			actor_ref_drain_mailbox(ref)
+		}
+	}
+	if ext.has_messages_proc == nil {
+		ext.has_messages_proc = proc(base: ^Actor_Base) -> bool {
+			ref := cast(^Actor_Ref(Msg))base
+			return !mpsc_is_empty(&ref.mailbox)
+		}
+	}
+}
+
+@(private)
+registry_register_raw :: proc(
+	r: ^Registry($Key),
+	key: Key,
+	base: ^Actor_Base,
+	msg_type: typeid,
+	expected_gen: u32 = 0,
+) -> bool {
+	if r == nil || base == nil {
+		return false
+	}
+	if intrinsics.atomic_load_explicit(&base.status, .Acquire) == u32(Actor_Status.Stopped) {
+		return false
+	}
+	if expected_gen != 0 && intrinsics.atomic_load_explicit(&base.generation, .Acquire) != expected_gen {
+		return false
+	}
+
+	sync.rw_mutex_lock(&r.mu)
+	if r.entries == nil {
+		alloc := r.allocator if r.allocator.procedure != nil else resolve_ext_allocator(base, context.allocator)
+		r.allocator = alloc
+		r.entries   = make(map[Key]Registry_Entry, 16, alloc)
+	}
+	if existing, found := r.entries[key]; found && existing.ref != nil {
+		if existing.ref != base &&
+		   intrinsics.atomic_load_explicit(&existing.ref.status, .Acquire) != u32(Actor_Status.Stopped) {
+			sync.rw_mutex_unlock(&r.mu)
+			return false
+		}
+	}
+	r.entries[key] = Registry_Entry{
+		ref      = base,
+		msg_type = msg_type,
+	}
+	sync.rw_mutex_unlock(&r.mu)
+
+	ext := ensure_actor_ext(base)
+	cleanup_fn := registry_cleanup_for_key(Key)
+	sync.mutex_lock(&ext.monitors_mu)
+	if ext.finalized != 0 || intrinsics.atomic_load_explicit(&base.status, .Acquire) == u32(Actor_Status.Stopped) {
+		sync.mutex_unlock(&ext.monitors_mu)
+		cleanup_fn(rawptr(r), base)
+		return false
+	}
+	hook_present := false
+	for h in ext.reg_hooks {
+		if h.reg_ptr == rawptr(r) {
+			hook_present = true
+			break
+		}
+	}
+	if !hook_present {
+		append(&ext.reg_hooks, Registry_Cleanup_Hook{
+			reg_ptr      = rawptr(r),
+			cleanup_proc = cleanup_fn,
+		})
+	}
+	sync.mutex_unlock(&ext.monitors_mu)
+	return true
+}
+
 registry_register_actor :: proc(r: ^Registry($Key), key: Key, a: ^Actor($State, $Msg)) -> bool {
-	_ = r
-	_ = key
-	_ = a
-	return false
+	if a == nil {
+		return false
+	}
+	ext := ensure_actor_ext(&a.base)
+	sync.mutex_lock(&ext.monitors_mu)
+	ensure_ref_callbacks(ext, Msg)
+	sync.mutex_unlock(&ext.monitors_mu)
+	return registry_register_raw(r, key, &a.base, typeid_of(Msg), 0)
 }
 
 registry_register_pid :: proc(r: ^Registry($Key), key: Key, p: PID($Msg)) -> bool {
-	_ = r
-	_ = key
-	_ = p
-	return false
+	if p.ref == nil {
+		return false
+	}
+	ext := ensure_actor_ext(&p.ref.base)
+	sync.mutex_lock(&ext.monitors_mu)
+	ensure_ref_callbacks(ext, Msg)
+	sync.mutex_unlock(&ext.monitors_mu)
+	return registry_register_raw(r, key, &p.ref.base, typeid_of(Msg), p.generation)
 }
 
 registry_register :: proc {
@@ -2202,15 +2397,37 @@ registry_register :: proc {
 }
 
 registry_unregister :: proc(r: ^Registry($Key), key: Key) {
-	_ = r
-	_ = key
+	if r == nil {
+		return
+	}
+	sync.rw_mutex_lock(&r.mu)
+	if r.entries != nil {
+		delete_key(&r.entries, key)
+	}
+	sync.rw_mutex_unlock(&r.mu)
 }
 
 @(require_results)
 registry_lookup :: proc(r: ^Registry($Key), key: Key, $Msg: typeid) -> (PID(Msg), bool) {
-	_ = r
-	_ = key
-	return {}, false
+	if r == nil {
+		return {}, false
+	}
+	sync.rw_mutex_shared_lock(&r.mu)
+	if r.entries == nil {
+		sync.rw_mutex_shared_unlock(&r.mu)
+		return {}, false
+	}
+	entry, found := r.entries[key]
+	sync.rw_mutex_shared_unlock(&r.mu)
+
+	if !found || entry.ref == nil || entry.msg_type != typeid_of(Msg) {
+		return {}, false
+	}
+	if intrinsics.atomic_load_explicit(&entry.ref.status, .Acquire) == u32(Actor_Status.Stopped) {
+		return {}, false
+	}
+	gen := intrinsics.atomic_load_explicit(&entry.ref.generation, .Acquire)
+	return PID(Msg){ref = cast(^Actor_Ref(Msg))entry.ref, generation = gen}, true
 }
 
 register_name_actor :: proc(key: u64, a: ^Actor($State, $Msg)) -> bool {
@@ -2235,6 +2452,7 @@ whereis_name :: proc(key: u64, $Msg: typeid) -> (PID(Msg), bool) {
 	return registry_lookup(&default_registry, key, Msg)
 }
 
+DEFAULT_PARTITIONS  :: 64
 MAX_TENANT_CHILDREN :: 8
 
 Tenant_Subtree :: struct {
@@ -2261,14 +2479,246 @@ Partitioned_Supervisor_Config :: struct {
 	clock_data:     rawptr,
 }
 
+@(private)
+Tenant_Entry :: struct {
+	org_id:         u64,
+	subtree:        Tenant_Subtree,
+	last_active_ns: i64,
+	in_flight:      i32,
+	evicting:       bool,
+}
+
+@(private)
+Tenant_Partition :: struct #align(64) {
+	mu:      sync.RW_Mutex,
+	tenants: map[u64]^Tenant_Entry,
+}
+
 Partitioned_Supervisor :: struct {
-	sched:         ^Scheduler,
-	cfg:           Partitioned_Supervisor_Config,
-	evicted_count: int,
-	allocator:     mem.Allocator,
+	sched:          ^Scheduler,
+	cfg:            Partitioned_Supervisor_Config,
+	partitions:     []Tenant_Partition,
+	active_tenants: int,
+	evicted_count:  int,
+	allocator:      mem.Allocator,
 }
 
 Dynamic_Supervisor :: Partitioned_Supervisor
+
+@(private)
+partitioned_supervisor_now :: #force_inline proc(ps: ^Partitioned_Supervisor) -> time.Tick {
+	if ps.cfg.now_proc != nil {
+		return ps.cfg.now_proc(ps.cfg.clock_data)
+	}
+	if ps.cfg.clock != nil {
+		return ps.cfg.clock()
+	}
+	return time.tick_now()
+}
+
+@(private)
+partition_index :: #force_inline proc(ps: ^Partitioned_Supervisor, org_id: u64) -> int {
+	n := len(ps.partitions)
+	if n <= 0 {
+		return 0
+	}
+	return int(org_id % u64(n))
+}
+
+@(private)
+actor_base_is_busy :: #force_inline proc(b: ^Actor_Base) -> bool {
+	if b == nil {
+		return false
+	}
+	return intrinsics.atomic_load_explicit(&b.scheduled, .Acquire) != 0 ||
+	       intrinsics.atomic_load_explicit(&b.in_step, .Acquire) != 0
+}
+
+@(private)
+tenant_entry_is_busy :: proc(entry: ^Tenant_Entry) -> bool {
+	if entry == nil {
+		return false
+	}
+	if intrinsics.atomic_load_explicit(&entry.in_flight, .Acquire) > 0 {
+		return true
+	}
+	if actor_base_is_busy(entry.subtree.router) {
+		return true
+	}
+	for c in entry.subtree.children {
+		if actor_base_is_busy(c) {
+			return true
+		}
+	}
+	if entry.subtree.sup != nil {
+		if actor_base_is_busy(&entry.subtree.sup.base) {
+			return true
+		}
+		if si := get_sup_internal(entry.subtree.sup); si != nil {
+			sync.mutex_lock(&si.mu)
+			for ce in si.children {
+				if actor_base_is_busy(ce.base) {
+					sync.mutex_unlock(&si.mu)
+					return true
+				}
+			}
+			sync.mutex_unlock(&si.mu)
+		}
+	}
+	return false
+}
+
+@(private)
+tenant_entry_is_dead :: proc(entry: ^Tenant_Entry) -> bool {
+	if entry == nil || entry.evicting {
+		return false
+	}
+	if intrinsics.atomic_load_explicit(&entry.in_flight, .Acquire) > 0 {
+		return false
+	}
+	router_stopped := entry.subtree.router == nil ||
+		intrinsics.atomic_load_explicit(&entry.subtree.router.status, .Acquire) == u32(Actor_Status.Stopped)
+	if !router_stopped {
+		return false
+	}
+	if entry.subtree.sup == nil {
+		return true
+	}
+	if intrinsics.atomic_load_explicit(&entry.subtree.sup.base.status, .Acquire) == u32(Actor_Status.Stopped) {
+		return true
+	}
+	return supervisor_count_children(entry.subtree.sup).active == 0
+}
+
+@(private)
+detach_actor_from_scheduler :: proc(s: ^Scheduler, base: ^Actor_Base) {
+	if s == nil || base == nil {
+		return
+	}
+	for i := 0; i < len(s.owned_actors); i += 1 {
+		if s.owned_actors[i] == base {
+			unordered_remove(&s.owned_actors, i)
+			return
+		}
+	}
+}
+
+@(private)
+detach_tenant_from_scheduler :: proc(s: ^Scheduler, subtree: ^Tenant_Subtree) {
+	if s == nil || subtree == nil {
+		return
+	}
+	sync.mutex_lock(&s.registry_mu)
+	if subtree.sup != nil {
+		detach_actor_from_scheduler(s, &subtree.sup.base)
+		if si := get_sup_internal(subtree.sup); si != nil {
+			sync.mutex_lock(&si.mu)
+			for ce in si.children {
+				detach_actor_from_scheduler(s, ce.base)
+			}
+			sync.mutex_unlock(&si.mu)
+		}
+	}
+	detach_actor_from_scheduler(s, subtree.router)
+	for c in subtree.children {
+		detach_actor_from_scheduler(s, c)
+	}
+	sync.mutex_unlock(&s.registry_mu)
+}
+
+@(private)
+already_in_ptr_list :: proc(list: ^[dynamic]^Actor_Base, ptr: ^Actor_Base) -> bool {
+	for p in list^ {
+		if p == ptr {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+destroy_tenant_entry :: proc(ps: ^Partitioned_Supervisor, entry: ^Tenant_Entry) {
+	if entry == nil {
+		return
+	}
+	extra_children: [dynamic]^Actor_Base
+	defer delete(extra_children)
+
+	if entry.subtree.sup != nil {
+		if si := get_sup_internal(entry.subtree.sup); si != nil {
+			sync.mutex_lock(&si.mu)
+			extra_children = make([dynamic]^Actor_Base, 0, len(si.children), ps.allocator)
+			for ce in si.children {
+				if ce.base != nil {
+					append(&extra_children, ce.base)
+				}
+			}
+			sync.mutex_unlock(&si.mu)
+		}
+		stop_supervisor(entry.subtree.sup)
+	}
+
+	destroyed := make([dynamic]^Actor_Base, 0, len(entry.subtree.children) + len(extra_children) + 2, ps.allocator)
+	defer delete(destroyed)
+
+	for i := len(entry.subtree.children) - 1; i >= 0; i -= 1 {
+		c := entry.subtree.children[i]
+		if c != nil && !already_in_ptr_list(&destroyed, c) {
+			append(&destroyed, c)
+			actor_base_destroy(ps.sched, c)
+		}
+	}
+	for i := len(extra_children) - 1; i >= 0; i -= 1 {
+		c := extra_children[i]
+		if c != nil && !already_in_ptr_list(&destroyed, c) {
+			append(&destroyed, c)
+			actor_base_destroy(ps.sched, c)
+		}
+	}
+	if entry.subtree.router != nil && !already_in_ptr_list(&destroyed, entry.subtree.router) {
+		append(&destroyed, entry.subtree.router)
+		actor_base_destroy(ps.sched, entry.subtree.router)
+	}
+	if entry.subtree.sup != nil && !already_in_ptr_list(&destroyed, &entry.subtree.sup.base) {
+		append(&destroyed, &entry.subtree.sup.base)
+		actor_base_destroy(ps.sched, &entry.subtree.sup.base)
+	}
+	free(entry, ps.allocator)
+}
+
+@(private)
+cleanup_tenant_registry_entry :: proc(ps: ^Partitioned_Supervisor, entry: ^Tenant_Entry) {
+	if ps == nil || ps.cfg.registry == nil || entry == nil {
+		return
+	}
+	if entry.subtree.router != nil {
+		registry_cleanup_for_key(u64)(rawptr(ps.cfg.registry), entry.subtree.router)
+	}
+	registry_unregister(ps.cfg.registry, entry.org_id)
+}
+
+@(private)
+try_reserve_tenant_slot :: proc(ps: ^Partitioned_Supervisor) -> bool {
+	if ps.cfg.max_children <= 0 {
+		intrinsics.atomic_add_explicit(&ps.active_tenants, 1, .Acq_Rel)
+		return true
+	}
+	for {
+		cur := intrinsics.atomic_load_explicit(&ps.active_tenants, .Acquire)
+		if cur >= ps.cfg.max_children {
+			return false
+		}
+		if _, ok := intrinsics.atomic_compare_exchange_weak_explicit(
+			&ps.active_tenants,
+			cur,
+			cur + 1,
+			.Acq_Rel,
+			.Acquire,
+		); ok {
+			return true
+		}
+	}
+}
 
 partitioned_supervisor_init :: proc(
 	ps: ^Partitioned_Supervisor,
@@ -2276,14 +2726,157 @@ partitioned_supervisor_init :: proc(
 	cfg: Partitioned_Supervisor_Config,
 	allocator := context.allocator,
 ) {
-	ps.sched         = s if s != nil else current_scheduler()
-	ps.cfg           = cfg
-	ps.evicted_count = 0
-	ps.allocator     = allocator
+	eff_sched := s if s != nil else current_scheduler()
+	eff_alloc := resolve_spawn_allocator(eff_sched, allocator)
+	num_parts := cfg.num_partitions if cfg.num_partitions > 0 else DEFAULT_PARTITIONS
+	ps.sched          = eff_sched
+	ps.cfg            = cfg
+	ps.partitions     = make([]Tenant_Partition, num_parts, eff_alloc)
+	for i := 0; i < num_parts; i += 1 {
+		ps.partitions[i].tenants = make(map[u64]^Tenant_Entry, 8, eff_alloc)
+	}
+	ps.active_tenants = 0
+	ps.evicted_count  = 0
+	ps.allocator      = eff_alloc
 }
 
 partitioned_supervisor_destroy :: proc(ps: ^Partitioned_Supervisor) {
-	_ = ps
+	if ps == nil || ps.partitions == nil {
+		return
+	}
+	for i := 0; i < len(ps.partitions); i += 1 {
+		part := &ps.partitions[i]
+		sync.rw_mutex_lock(&part.mu)
+		entries := make([dynamic]^Tenant_Entry, 0, len(part.tenants), ps.allocator)
+		for _, entry in part.tenants {
+			if entry != nil {
+				entry.evicting = true
+				append(&entries, entry)
+			}
+		}
+		delete(part.tenants)
+		part.tenants = nil
+		sync.rw_mutex_unlock(&part.mu)
+
+		for entry in entries {
+			cleanup_tenant_registry_entry(ps, entry)
+			destroy_tenant_entry(ps, entry)
+		}
+		delete(entries)
+	}
+	delete(ps.partitions, ps.allocator)
+	ps.partitions = nil
+	intrinsics.atomic_store_explicit(&ps.active_tenants, 0, .Release)
+}
+
+@(private)
+reap_dead_on_partition_locked :: proc(
+	ps: ^Partitioned_Supervisor,
+	part: ^Tenant_Partition,
+	reap_list: ^[dynamic]^Tenant_Entry,
+) {
+	if part.tenants == nil {
+		return
+	}
+	for _, entry in part.tenants {
+		if entry != nil && !entry.evicting && tenant_entry_is_dead(entry) && !tenant_entry_is_busy(entry) {
+			entry.evicting = true
+			append(reap_list, entry)
+		}
+	}
+	for e in reap_list^ {
+		delete_key(&part.tenants, e.org_id)
+	}
+	if len(reap_list^) > 0 {
+		intrinsics.atomic_sub_explicit(&ps.active_tenants, len(reap_list^), .Acq_Rel)
+	}
+}
+
+@(private, require_results)
+acquire_tenant_entry :: proc(
+	ps: ^Partitioned_Supervisor,
+	org_id: u64,
+	factory_proc: Tenant_Factory_Proc,
+	user_ctx: rawptr,
+	inc_in_flight: bool,
+) -> (^Tenant_Entry, Supervisor_Error) {
+	if ps == nil || ps.partitions == nil {
+		return nil, .Supervisor_Stopping
+	}
+	now  := partitioned_supervisor_now(ps)
+	part := &ps.partitions[partition_index(ps, org_id)]
+
+	// Fast path under shared lock
+	sync.rw_mutex_shared_lock(&part.mu)
+	if part.tenants != nil {
+		if entry, found := part.tenants[org_id]; found && entry != nil && !entry.evicting && !tenant_entry_is_dead(entry) {
+			intrinsics.atomic_store_explicit(&entry.last_active_ns, now._nsec, .Relaxed)
+			if inc_in_flight {
+				intrinsics.atomic_add_explicit(&entry.in_flight, 1, .Acq_Rel)
+			}
+			sync.rw_mutex_shared_unlock(&part.mu)
+			return entry, .None
+		}
+	}
+	sync.rw_mutex_shared_unlock(&part.mu)
+
+	// Slow path under exclusive partition lock
+	reap_list := make([dynamic]^Tenant_Entry, 0, 4, ps.allocator)
+	defer {
+		for dead in reap_list {
+			cleanup_tenant_registry_entry(ps, dead)
+			destroy_tenant_entry(ps, dead)
+		}
+		delete(reap_list)
+	}
+
+	sync.rw_mutex_lock(&part.mu)
+	if part.tenants == nil {
+		sync.rw_mutex_unlock(&part.mu)
+		return nil, .Supervisor_Stopping
+	}
+	if existing, found := part.tenants[org_id]; found && existing != nil {
+		if !existing.evicting && !tenant_entry_is_dead(existing) {
+			intrinsics.atomic_store_explicit(&existing.last_active_ns, now._nsec, .Relaxed)
+			if inc_in_flight {
+				intrinsics.atomic_add_explicit(&existing.in_flight, 1, .Acq_Rel)
+			}
+			sync.rw_mutex_unlock(&part.mu)
+			return existing, .None
+		}
+	}
+
+	reap_dead_on_partition_locked(ps, part, &reap_list)
+
+	if !try_reserve_tenant_slot(ps) {
+		sync.rw_mutex_unlock(&part.mu)
+		return nil, .Max_Children_Reached
+	}
+
+	eff_factory := factory_proc if factory_proc != nil else ps.cfg.factory
+	if eff_factory == nil {
+		intrinsics.atomic_sub_explicit(&ps.active_tenants, 1, .Acq_Rel)
+		sync.rw_mutex_unlock(&part.mu)
+		return nil, .Supervisor_Stopping
+	}
+	eff_ctx := user_ctx if user_ctx != nil else ps.cfg.user_data
+	subtree := eff_factory(ps.sched, org_id, eff_ctx)
+	detach_tenant_from_scheduler(ps.sched, &subtree)
+
+	entry := new(Tenant_Entry, ps.allocator)
+	entry^ = Tenant_Entry{
+		org_id         = org_id,
+		subtree        = subtree,
+		last_active_ns = now._nsec,
+		in_flight      = 1 if inc_in_flight else 0,
+		evicting       = false,
+	}
+	part.tenants[org_id] = entry
+	if ps.cfg.registry != nil && subtree.router != nil {
+		_ = registry_register_raw(ps.cfg.registry, org_id, subtree.router, subtree.msg_type, 0)
+	}
+	sync.rw_mutex_unlock(&part.mu)
+	return entry, .None
 }
 
 @(require_results)
@@ -2292,9 +2885,16 @@ get_or_spawn_tenant_cfg :: proc(
 	org_id: u64,
 	$Msg: typeid,
 ) -> (PID(Msg), Supervisor_Error) {
-	_ = ps
-	_ = org_id
-	return {}, .Supervisor_Stopping
+	entry, err := acquire_tenant_entry(ps, org_id, nil, nil, inc_in_flight = true)
+	if err != .None || entry == nil || entry.subtree.router == nil {
+		return {}, err if err != .None else .Supervisor_Stopping
+	}
+	defer intrinsics.atomic_sub_explicit(&entry.in_flight, 1, .Acq_Rel)
+	if entry.subtree.msg_type != typeid_of(Msg) {
+		return {}, .Supervisor_Stopping
+	}
+	gen := intrinsics.atomic_load_explicit(&entry.subtree.router.generation, .Acquire)
+	return PID(Msg){ref = cast(^Actor_Ref(Msg))entry.subtree.router, generation = gen}, .None
 }
 
 @(require_results)
@@ -2305,11 +2905,16 @@ get_or_spawn_tenant_with_factory :: proc(
 	factory_proc: Tenant_Factory_Proc,
 	user_ctx: rawptr = nil,
 ) -> (PID(Msg), Supervisor_Error) {
-	_ = ps
-	_ = org_id
-	_ = factory_proc
-	_ = user_ctx
-	return {}, .Supervisor_Stopping
+	entry, err := acquire_tenant_entry(ps, org_id, factory_proc, user_ctx, inc_in_flight = true)
+	if err != .None || entry == nil || entry.subtree.router == nil {
+		return {}, err if err != .None else .Supervisor_Stopping
+	}
+	defer intrinsics.atomic_sub_explicit(&entry.in_flight, 1, .Acq_Rel)
+	if entry.subtree.msg_type != typeid_of(Msg) {
+		return {}, .Supervisor_Stopping
+	}
+	gen := intrinsics.atomic_load_explicit(&entry.subtree.router.generation, .Acquire)
+	return PID(Msg){ref = cast(^Actor_Ref(Msg))entry.subtree.router, generation = gen}, .None
 }
 
 get_or_spawn_tenant :: proc {
@@ -2318,9 +2923,16 @@ get_or_spawn_tenant :: proc {
 }
 
 send_to_tenant :: proc(ps: ^Partitioned_Supervisor, org_id: u64, msg: $Msg) {
-	_ = ps
-	_ = org_id
-	_ = msg
+	entry, err := acquire_tenant_entry(ps, org_id, nil, nil, inc_in_flight = true)
+	if err != .None || entry == nil {
+		return
+	}
+	defer intrinsics.atomic_sub_explicit(&entry.in_flight, 1, .Acq_Rel)
+	router := entry.subtree.router
+	if router == nil || entry.subtree.msg_type != typeid_of(Msg) {
+		return
+	}
+	send_sched_auto_pid(ps.sched, PID(Msg){ref = cast(^Actor_Ref(Msg))router, generation = 0}, msg)
 }
 
 @(require_results)
@@ -2330,10 +2942,16 @@ try_call_tenant :: proc(
 	msg: $Msg,
 	$Res: typeid,
 ) -> (res: Res, err: Call_Error) {
-	_ = ps
-	_ = org_id
-	_ = msg
-	return {}, .Target_Stopped
+	entry, sup_err := acquire_tenant_entry(ps, org_id, nil, nil, inc_in_flight = true)
+	if sup_err != .None || entry == nil {
+		return {}, .Target_Stopped
+	}
+	defer intrinsics.atomic_sub_explicit(&entry.in_flight, 1, .Acq_Rel)
+	router := entry.subtree.router
+	if router == nil || entry.subtree.msg_type != typeid_of(Msg) {
+		return {}, .Target_Stopped
+	}
+	return try_call_sched_pid(ps.sched, PID(Msg){ref = cast(^Actor_Ref(Msg))router, generation = 0}, msg, Res)
 }
 
 @(require_results)
@@ -2348,15 +2966,97 @@ call_tenant :: proc(
 }
 
 sweep_idle_tenants :: proc(ps: ^Partitioned_Supervisor, now_override: time.Tick = {}) -> int {
-	_ = ps
-	_ = now_override
-	return 0
+	if ps == nil || ps.partitions == nil {
+		return 0
+	}
+	now := now_override if now_override._nsec != 0 else partitioned_supervisor_now(ps)
+	total_evicted := 0
+
+	for i := 0; i < len(ps.partitions); i += 1 {
+		part := &ps.partitions[i]
+		evict_list := make([dynamic]^Tenant_Entry, 0, 8, ps.allocator)
+
+		// Phase 1: Scan under partition lock, collect eligible entries, and erase after iteration.
+		sync.rw_mutex_lock(&part.mu)
+		if part.tenants != nil {
+			for _, entry in part.tenants {
+				if entry == nil || entry.evicting {
+					continue
+				}
+				if tenant_entry_is_busy(entry) {
+					continue
+				}
+				last_tick := time.Tick{_nsec = intrinsics.atomic_load_explicit(&entry.last_active_ns, .Acquire)}
+				idle_due  := ps.cfg.idle_timeout > 0 && time.tick_diff(last_tick, now) >= ps.cfg.idle_timeout
+				if idle_due || tenant_entry_is_dead(entry) {
+					entry.evicting = true
+					append(&evict_list, entry)
+				}
+			}
+			for e in evict_list {
+				delete_key(&part.tenants, e.org_id)
+			}
+			if len(evict_list) > 0 {
+				intrinsics.atomic_sub_explicit(&ps.active_tenants, len(evict_list), .Acq_Rel)
+				intrinsics.atomic_add_explicit(&ps.evicted_count, len(evict_list), .Acq_Rel)
+			}
+		}
+		sync.rw_mutex_unlock(&part.mu)
+
+		// Phase 2: Invoke eviction hooks and destroy evicted subtrees outside the partition lock.
+		for e in evict_list {
+			cleanup_tenant_registry_entry(ps, e)
+			if ps.cfg.on_evict != nil {
+				ps.cfg.on_evict(e.org_id, &e.subtree, ps.cfg.user_data)
+			}
+			destroy_tenant_entry(ps, e)
+		}
+		total_evicted += len(evict_list)
+		delete(evict_list)
+	}
+
+	return total_evicted
 }
 
 @(require_results)
 tenant_count :: proc(ps: ^Partitioned_Supervisor) -> int {
-	_ = ps
-	return 0
+	if ps == nil || ps.partitions == nil {
+		return 0
+	}
+	live_count := 0
+	saw_dead := false
+	for i := 0; i < len(ps.partitions); i += 1 {
+		part := &ps.partitions[i]
+		sync.rw_mutex_shared_lock(&part.mu)
+		if part.tenants != nil {
+			for _, entry in part.tenants {
+				if entry == nil || entry.evicting {
+					continue
+				}
+				if tenant_entry_is_dead(entry) {
+					saw_dead = true
+					continue
+				}
+				live_count += 1
+			}
+		}
+		sync.rw_mutex_shared_unlock(&part.mu)
+	}
+	if saw_dead {
+		for i := 0; i < len(ps.partitions); i += 1 {
+			part := &ps.partitions[i]
+			reap_list := make([dynamic]^Tenant_Entry, 0, 4, ps.allocator)
+			sync.rw_mutex_lock(&part.mu)
+			reap_dead_on_partition_locked(ps, part, &reap_list)
+			sync.rw_mutex_unlock(&part.mu)
+			for dead in reap_list {
+				cleanup_tenant_registry_entry(ps, dead)
+				destroy_tenant_entry(ps, dead)
+			}
+			delete(reap_list)
+		}
+	}
+	return live_count
 }
 
 dynamic_supervisor_init :: proc(
