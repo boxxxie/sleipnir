@@ -587,15 +587,15 @@ actor_drain_stopped_target :: proc(base: ^Actor_Base, wait_if_busy: bool = true)
 		for intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
-		for intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 &&
-		    intrinsics.atomic_load_explicit(&ext.stopped_drained, .Acquire) == 0 {
+		for intrinsics.atomic_load_explicit(&ext.finalized, .Seq_Cst) != 0 &&
+		    intrinsics.atomic_load_explicit(&ext.stopped_drained, .Seq_Cst) == 0 {
 			intrinsics.cpu_relax()
 		}
 	} else if !is_self_step && intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 		return
 	}
 	if intrinsics.atomic_load_explicit(&ext.stopped_drained, .Seq_Cst) == 0 {
-		if intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 {
+		if intrinsics.atomic_load_explicit(&ext.finalized, .Seq_Cst) != 0 {
 			// `finalize_actor_stopped` has not drained this target yet and will drain all
 			// already-pushed envelopes once the target exits its active turn.
 			return
@@ -665,7 +665,7 @@ finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fa
 	ext := ensure_actor_ext(base)
 
 	sync.mutex_lock(&ext.monitors_mu)
-	if intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 {
+	if intrinsics.atomic_load_explicit(&ext.finalized, .Seq_Cst) != 0 {
 		if ext.drain_proc != nil {
 			ext.drain_proc(base)
 		} else if base.drain_proc != nil {
@@ -674,7 +674,7 @@ finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fa
 		sync.mutex_unlock(&ext.monitors_mu)
 		return
 	}
-	intrinsics.atomic_store_explicit(&ext.finalized, 1, .Release)
+	intrinsics.atomic_store_explicit(&ext.finalized, 1, .Seq_Cst)
 	ext.last_exit_reason = reason
 	ext.last_fault       = fault
 	intrinsics.atomic_store_explicit(&base.status, u32(Actor_Status.Stopped), .Seq_Cst)
@@ -1465,8 +1465,8 @@ prepare_child_reset_unlocked :: proc(c: ^Actor_Base, skip_in_step_wait: bool = f
 	cext := get_actor_ext(c)
 	if cext != nil {
 		sync.mutex_lock(&cext.monitors_mu)
-		intrinsics.atomic_store_explicit(&cext.finalized, 0, .Release)
-		intrinsics.atomic_store_explicit(&cext.stopped_drained, 0, .Release)
+		intrinsics.atomic_store_explicit(&cext.finalized, 0, .Seq_Cst)
+		intrinsics.atomic_store_explicit(&cext.stopped_drained, 0, .Seq_Cst)
 		if !cext.keep_mailbox {
 			if cext.drain_proc != nil {
 				cext.drain_proc(c)
@@ -2688,8 +2688,8 @@ supervisor_restart_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_
 	if !ok {
 		if cext != nil && was_admin_stopped {
 			sync.mutex_lock(&cext.monitors_mu)
-			intrinsics.atomic_store_explicit(&cext.finalized, prev_finalized, .Release)
-			intrinsics.atomic_store_explicit(&cext.stopped_drained, prev_stopped_drained, .Release)
+			intrinsics.atomic_store_explicit(&cext.finalized, prev_finalized, .Seq_Cst)
+			intrinsics.atomic_store_explicit(&cext.stopped_drained, prev_stopped_drained, .Seq_Cst)
 			sync.mutex_unlock(&cext.monitors_mu)
 		}
 		return .Supervisor_Stopping
