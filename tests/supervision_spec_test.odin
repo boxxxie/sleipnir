@@ -964,7 +964,52 @@ spec_30_otp_audit_bugfix_regressions :: proc(t: ^testing.T) {
 
 			given_supervisor(&w, "sup", .One_For_One, max_restarts = 5)
 			given_supervised_worker(&w, "svc", under = "sup", policy = .Permanent, committed = 100)
-			then_multi_worker_cooperative_try_calls_succeed_and_isolate_faults(&w, "svc")
+			given_supervised_worker(&w, "svc_no_arena", under = "sup", policy = .Permanent, committed = 200, use_arena = false)
+			given_supervisor(&w, "caller_sup", .One_For_One, max_restarts = 10)
+			given_supervised_callers(&w, "callers", under = "caller_sup", count = 4, policy = .Permanent, use_arena = true)
+
+			// Phase A: 4-worker saturation against both arena and non-arena callees with caller arena preservation.
+			upon_concurrent_try_calls(&w, callers = "callers", to = "svc_no_arena", per_caller = 8)
+			upon_concurrent_try_calls(&w, callers = "callers", to = "svc", per_caller = 8)
+			then_caller_group_turns_succeeded(&w, callers = "callers", expected_hits = 16)
+
+			// Phase B1: Target crash isolation + permanent restart recovery.
+			upon_crashing_try_call(&w, callers = "callers", caller_idx = 0, to = "svc", value = 77)
+			then_caller_crash_isolation_succeeded(&w, callers = "callers", caller_idx = 0, expected_err = .Call_Target_Crashed)
+			then_worker_status_is(&w, "svc", .Running)
+			if svc, ok := viewing_worker(&w, "svc"); ok {
+				shows_value(&w, svc, 100)
+			}
+
+			// Phase B2: Cooperative `try_call` cycle (`callers[0] -> callers[1] -> callers[0]`).
+			upon_cyclic_try_call(&w, callers = "callers", caller_a = 0, caller_b = 1, service = "svc", value = 10)
+			then_cycle_try_call_errors_are(&w, callers = "callers", caller_idx = 0, outer = .None, inner = .Deadlock_Detected)
+
+			// Phase B3: Simultaneous cross-worker `try_call` cycle (`callers[2]` <-> `callers[3]`).
+			upon_simultaneous_cross_worker_try_call_cycle(&w, callers = "callers", caller_a = 2, caller_b = 3, service = "svc")
+			then_cross_worker_try_call_cycle_detected(&w, callers = "callers", caller_a = 2, caller_b = 3)
+
+			then_no_leaks(&w)
+		}
+
+		// 4. Same-supervisor `.One_For_All` crash during cooperative `try_call` defers caller reset
+		//    until the suspended caller unwinds cleanly.
+		{
+			w: Supervision_World
+			world_init(&w, t, num_workers = 2)
+			defer world_destroy(&w)
+
+			given_supervisor(&w, "ofa", .One_For_All, max_restarts = 5)
+			given_supervised_caller(&w, "ofa_caller", under = "ofa", policy = .Permanent, use_arena = true)
+			given_supervised_worker(&w, "ofa_svc", under = "ofa", policy = .Permanent, committed = 250)
+
+			upon_crashing_try_call(&w, caller_label = "ofa_caller", to = "ofa_svc", value = 88)
+			then_caller_crash_isolation_succeeded(&w, caller_label = "ofa_caller", expected_err = .Call_Target_Crashed)
+			then_caller_lifecycle_counts_are(&w, "ofa_caller", expected_stops = 1, expected_reinits = 1)
+			then_worker_status_is(&w, "ofa_svc", .Running)
+			if svc, ok := viewing_worker(&w, "ofa_svc"); ok {
+				shows_value(&w, svc, 250)
+			}
 			then_no_leaks(&w)
 		}
 	})

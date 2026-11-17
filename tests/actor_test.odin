@@ -4,7 +4,9 @@ import "base:intrinsics"
 import "base:runtime"
 import "core:c/libc"
 import "core:mem"
+import "core:sync"
 import "core:testing"
+import "core:time"
 import "../actor"
 
 // =============================================================================
@@ -1515,13 +1517,29 @@ test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^tes
 			})
 
 			Producer_State :: struct {
-				svc:   actor.PID(i64),
-				sum:   i64,
-				count: int,
+				id:            int,
+				svc:           actor.PID(i64),
+				start_barrier: ^sync.Barrier,
+				sum:           i64,
+				count:         int,
 			}
+			start_barrier: sync.Barrier
+			sync.barrier_init(&start_barrier, 4)
 			producers: [4]^actor.Actor(Producer_State, i64)
-			for i := 0; i < 4; i += 1 {
-				producers[i] = actor.spawn(&sched, Producer_State{svc = actor.pid(service)}, proc(ctx: ^actor.Context, st: ^Producer_State, x: ^i64) {
+			for i in 0 ..< 4 {
+				producers[i] = actor.spawn(&sched, Producer_State{
+					id            = i,
+					svc           = actor.pid(service),
+					start_barrier = &start_barrier,
+				}, proc(ctx: ^actor.Context, st: ^Producer_State, x: ^i64) {
+					if st.count == 0 {
+						sync.barrier_wait(st.start_barrier)
+						if st.id == 0 {
+							// Queue async work onto `service` only AFTER all 4 workers are active
+							// so `service.scheduled == 1` in a shard while all workers saturate `actor.call`.
+							actor.send(ctx.sched, st.svc, i64(7))
+						}
+					}
 					res := actor.call(ctx.sched, st.svc, x^, i64)
 					st.sum += res
 					st.count += 1
@@ -1529,13 +1547,10 @@ test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^tes
 				})
 			}
 
-			// Pre-queue async work onto `service` before starting workers so `service.scheduled == 1`
-			// inside `s.shards` while all 4 workers concurrently saturate `actor.call`.
-			actor.send(&sched, service, i64(7))
 			REQS_PER_PRODUCER :: 64
 			intrinsics.atomic_store_explicit(&sched.pending_tokens, i64(4 * REQS_PER_PRODUCER), .Release)
-			for m := 0; m < REQS_PER_PRODUCER; m += 1 {
-				for p := 0; p < 4; p += 1 {
+			for m in 0 ..< REQS_PER_PRODUCER {
+				for p in 0 ..< 4 {
 					actor.send(&sched, producers[p], i64(m + 1), shard_hint = p)
 				}
 			}
@@ -1546,14 +1561,14 @@ test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^tes
 
 			testing.expect_value(t, service.state.hits, 1 + 4 * REQS_PER_PRODUCER)
 			expected_sum := i64(REQS_PER_PRODUCER * (REQS_PER_PRODUCER + 1)) // 2 * sum(1..64)
-			for p := 0; p < 4; p += 1 {
+			for p in 0 ..< 4 {
 				testing.expect_value(t, producers[p].state.count, REQS_PER_PRODUCER)
 				testing.expect_value(t, producers[p].state.sum, expected_sum)
 			}
 		}
 
 		// 2. Acyclic `B -> A -> C` DAG under cooperative `actor.call` (1-worker & 2-worker)
-		//    plus concurrent `A -> C` while `C` is busy in `step_proc` and `B` calls `A`.
+		//    plus deterministic concurrent `A -> C` while `C` is busy in `step_proc` and `B` calls `A`.
 		for workers in ([2]int{1, 2}) {
 			dag_sched: actor.Scheduler
 			err := actor.init(&dag_sched, actor.Scheduler_Config{num_workers = workers, enable_parking = (workers > 1)})
@@ -1562,15 +1577,21 @@ test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^tes
 
 			C_State :: struct {
 				busy_flag: ^u32,
+				release_c: ^u32,
 				hits:      int,
 			}
 			busy_flag: u32 = 0
-			actor_c := actor.spawn(&dag_sched, C_State{busy_flag = &busy_flag}, proc(ctx: ^actor.Context, st: ^C_State, x: ^i64) {
+			release_c: u32 = 0
+			actor_c := actor.spawn(&dag_sched, C_State{busy_flag = &busy_flag, release_c = &release_c}, proc(ctx: ^actor.Context, st: ^C_State, x: ^i64) {
 				st.hits += 1
 				if x^ < 0 {
-					// Hold `C` briefly in `step_proc` while `A` starts and `B` is queued.
+					// Hold `C` in `step_proc` until `A` and `B` are queued on the scheduler.
 					intrinsics.atomic_store_explicit(st.busy_flag, 1, .Release)
-					for spin := 0; spin < 10_000; spin += 1 {
+					start_t := time.tick_now()
+					for intrinsics.atomic_load_explicit(st.release_c, .Acquire) == 0 {
+						if time.tick_since(start_t) > 500 * time.Millisecond {
+							break
+						}
 						intrinsics.cpu_relax()
 					}
 					return
@@ -1611,12 +1632,14 @@ test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^tes
 				actor_a.state.res = 0
 				actor_a.state.sum = 0
 				intrinsics.atomic_store_explicit(&busy_flag, 0, .Release)
+				intrinsics.atomic_store_explicit(&release_c, 0, .Release)
 				actor.send(&dag_sched, actor_c, i64(-1), shard_hint = 0)
 				for intrinsics.atomic_load_explicit(&busy_flag, .Acquire) == 0 {
 					intrinsics.cpu_relax()
 				}
 				actor.send(&dag_sched, actor_a, i64(20), shard_hint = 1)
 				actor.send(&dag_sched, actor_b, i64(5), shard_hint = 0)
+				intrinsics.atomic_store_explicit(&release_c, 1, .Release)
 				actor.wait_idle(&dag_sched)
 				testing.expect_value(t, actor_a.state.sum, i64(75))
 				testing.expect_value(t, actor_b.state.res, i64(16))
@@ -1666,6 +1689,707 @@ test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^tes
 
 			testing.expect(t, actor_b.state.caught)
 			testing.expect(t, actor_a.state.caught)
+		}
+	})
+}
+
+@(test)
+test_25_cooperative_call_dag_cross_worker_cycles_fan_in_and_temp_isolation :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. Acyclic `B -> A -> C` with Shard 0 = [A, B, C] (`C` queued behind `B` before start)
+		//    must NOT trigger a false-positive cycle panic via stack inversion (1-worker & 2-worker).
+		for workers in ([2]int{1, 2}) {
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = workers, num_shards = 1, enable_parking = (workers > 1)})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			C_State :: struct {
+				warmup_seen: bool,
+				sum:         i64,
+			}
+			actor_c := actor.spawn(&sched, C_State{}, proc(ctx: ^actor.Context, st: ^C_State, x: ^i64) {
+				if x^ == 0 {
+					st.warmup_seen = true
+					return
+				}
+				st.sum += x^
+				actor.reply(ctx, x^ * 10)
+			})
+
+			A_State :: struct {
+				c_pid: actor.PID(i64),
+				hits:  int,
+			}
+			actor_a := actor.spawn(&sched, A_State{c_pid = actor.pid(actor_c)}, proc(ctx: ^actor.Context, st: ^A_State, x: ^i64) {
+				st.hits += 1
+				val := actor.call(ctx.sched, st.c_pid, x^, i64)
+				actor.reply(ctx, val + 1)
+			})
+
+			B_State :: struct {
+				a_pid: actor.PID(i64),
+				res:   i64,
+			}
+			actor_b := actor.spawn(&sched, B_State{a_pid = actor.pid(actor_a)}, proc(ctx: ^actor.Context, st: ^B_State, x: ^i64) {
+				st.res = actor.call(ctx.sched, st.a_pid, x^, i64)
+			})
+
+			// Enqueue Shard 0 strictly in [A, B, C] order before starting workers.
+			actor.send(&sched, actor_a, i64(2), shard_hint = 0)
+			actor.send(&sched, actor_b, i64(7), shard_hint = 0)
+			actor.send(&sched, actor_c, i64(0), shard_hint = 0)
+
+			actor.scheduler_start(&sched)
+			actor.wait_idle(&sched)
+
+			testing.expect(t, actor_c.state.warmup_seen)
+			testing.expect_value(t, actor_c.state.sum, i64(9))
+			testing.expect_value(t, actor_a.state.hits, 2)
+			testing.expect_value(t, actor_b.state.res, i64(71))
+		}
+
+		// 2. Acyclic `D -> B -> A -> C` 2-worker DAG where `A` and `B` are active on workers
+		//    while `C` sits queued behind `D` in Shard 0 (`C.scheduled == 1, C.in_step == 0`).
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 2, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Gate_State :: struct {
+				barrier:  sync.Barrier,
+				d_pid:    actor.PID(i64),
+				c_pid:    actor.PID(i64),
+				a_pid:    actor.PID(i64),
+				b_pid:    actor.PID(i64),
+				a_sum:    i64,
+				b6_res:   i64,
+				d_res:    i64,
+				c_warmup: bool,
+			}
+
+			shared: Gate_State
+			sync.barrier_init(&shared.barrier, 2)
+
+			actor_c := actor.spawn(&sched, &shared, proc(ctx: ^actor.Context, st: ^^Gate_State, x: ^i64) {
+				if x^ == 0 {
+					st^.c_warmup = true
+					return
+				}
+				actor.reply(ctx, x^ * 5)
+			})
+
+			actor_a := actor.spawn(&sched, &shared, proc(ctx: ^actor.Context, st: ^^Gate_State, x: ^i64) {
+				if x^ == 4 {
+					sync.barrier_wait(&st^.barrier)
+					// Briefly yield so `B` enters `wait_for_call_slot` on `A` while `A` calls `C`.
+					for _ in 0 ..< 200 {
+						intrinsics.cpu_relax()
+					}
+				}
+				res := actor.call(ctx.sched, st^.c_pid, x^, i64)
+				intrinsics.atomic_add_explicit(&st^.a_sum, res, .Relaxed)
+				actor.reply(ctx, res + 1)
+			})
+
+			actor_b := actor.spawn(&sched, &shared, proc(ctx: ^actor.Context, st: ^^Gate_State, x: ^i64) {
+				if x^ == 6 {
+					sync.barrier_wait(&st^.barrier)
+				}
+				res := actor.call(ctx.sched, st^.a_pid, x^, i64)
+				if x^ == 6 {
+					st^.b6_res = res + 2
+				}
+				actor.reply(ctx, res + 2)
+			})
+
+			actor_d := actor.spawn(&sched, &shared, proc(ctx: ^actor.Context, st: ^^Gate_State, x: ^i64) {
+				st^.d_res = actor.call(ctx.sched, st^.b_pid, x^, i64)
+			})
+
+			shared.a_pid = actor.pid(actor_a)
+			shared.b_pid = actor.pid(actor_b)
+			shared.c_pid = actor.pid(actor_c)
+			shared.d_pid = actor.pid(actor_d)
+
+			actor.send(&sched, actor_a, i64(4), shard_hint = 0)
+			actor.send(&sched, actor_d, i64(9), shard_hint = 0)
+			actor.send(&sched, actor_c, i64(0), shard_hint = 0)
+			actor.send(&sched, actor_b, i64(6), shard_hint = 1)
+
+			actor.scheduler_start(&sched)
+			actor.wait_idle(&sched)
+
+			testing.expect(t, shared.c_warmup)
+			testing.expect_value(t, shared.a_sum, i64(95))
+			testing.expect_value(t, shared.b6_res, i64(33))
+			testing.expect_value(t, shared.d_res, i64(48))
+		}
+
+		// 3. Simultaneous cross-worker `A <-> B` `actor.call` cycle (both in `step_proc` on
+		//    distinct OS workers via `sync.Barrier`) must be detected without hanging.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 2, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Cross_Cycle_State :: struct {
+				barrier:  ^sync.Barrier,
+				peer_pid: actor.PID(i64),
+				caught:   bool,
+				replied:  bool,
+			}
+
+			bar: sync.Barrier
+			sync.barrier_init(&bar, 2)
+
+			proc_body :: proc(ctx: ^actor.Context, st: ^Cross_Cycle_State, x: ^i64) {
+				if x^ < 0 {
+					actor.reply(ctx, i64(-99))
+					return
+				}
+				sync.barrier_wait(st.barrier)
+				prev_proc := context.assertion_failure_proc
+				context.assertion_failure_proc = test22_trap_proc
+				jb: libc.jmp_buf
+				_test22_jmp = &jb
+				_test22_caught = 0
+				if libc.setjmp(&jb) == 0 {
+					res := actor.call(ctx.sched, st.peer_pid, i64(-1), i64)
+					st.replied = (res == -99)
+				} else {
+					st.caught = _test22_caught > 0
+				}
+				_test22_jmp = nil
+				context.assertion_failure_proc = prev_proc
+			}
+
+			a := actor.spawn(&sched, Cross_Cycle_State{barrier = &bar}, proc_body)
+			b := actor.spawn(&sched, Cross_Cycle_State{barrier = &bar}, proc_body)
+			a.state.peer_pid = actor.pid(b)
+			b.state.peer_pid = actor.pid(a)
+
+			actor.scheduler_start(&sched)
+			actor.send(&sched, a, i64(1), shard_hint = 0)
+			actor.send(&sched, b, i64(1), shard_hint = 1)
+			actor.wait_idle(&sched)
+
+			// By Dekker's theorem, at least one side MUST detect the simultaneous cross-worker cycle.
+			testing.expect(t, a.state.caught || b.state.caught)
+		}
+
+		// 4. N-to-1 fan-in exceeding `MAX_COOPERATIVE_CALL_DEPTH` (48 > 32 callers) on a 4-worker
+		//    scheduler with `service` pre-queued in `s.shards` must succeed without depth-limit panic.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 4, batch_quota = 16, enable_parking = true})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			svc := actor.spawn(&sched, 0, proc(ctx: ^actor.Context, hits: ^int, x: ^i64) {
+				hits^ += 1
+				actor.reply(ctx, x^ + 1)
+			})
+
+			NUM_CALLERS :: 48
+			Caller_State :: struct {
+				svc: actor.PID(i64),
+				res: i64,
+			}
+			callers: [NUM_CALLERS]^actor.Actor(Caller_State, i64)
+			for i in 0 ..< NUM_CALLERS {
+				callers[i] = actor.spawn(&sched, Caller_State{svc = actor.pid(svc)}, proc(ctx: ^actor.Context, st: ^Caller_State, x: ^i64) {
+					st.res = actor.call(ctx.sched, st.svc, x^, i64)
+				})
+			}
+
+			actor.send(&sched, svc, i64(0), shard_hint = 3)
+			for i in 0 ..< NUM_CALLERS {
+				actor.send(&sched, callers[i], i64(i + 1), shard_hint = i % 4)
+			}
+
+			actor.scheduler_start(&sched)
+			actor.wait_idle(&sched)
+
+			testing.expect_value(t, svc.state, 1 + NUM_CALLERS)
+			for i in 0 ..< NUM_CALLERS {
+				testing.expect_value(t, callers[i].state.res, i64(i + 2))
+			}
+		}
+
+		// 5. Cooperative `context.temp_allocator` isolation: callee calling `free_all(context.temp_allocator)`
+		//    must NOT clobber temporary slices held by suspended outer callers.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			callee := actor.spawn(&sched, 0, proc(ctx: ^actor.Context, hits: ^int, x: ^i64) {
+				hits^ += 1
+				scratch := make([]u8, 128, context.temp_allocator)
+				scratch[0] = 0xEE
+				free_all(context.temp_allocator)
+				actor.reply(ctx, x^ * 3)
+			})
+
+			Temp_Caller_State :: struct {
+				callee_pid: actor.PID(i64),
+				intact:     bool,
+				res:        i64,
+			}
+			caller := actor.spawn(&sched, Temp_Caller_State{callee_pid = actor.pid(callee)}, proc(ctx: ^actor.Context, st: ^Temp_Caller_State, x: ^i64) {
+				buf := make([]u8, 128, context.temp_allocator)
+				for j in 0 ..< len(buf) {
+					buf[j] = 0x5A
+				}
+				st.res = actor.call(ctx.sched, st.callee_pid, x^, i64)
+				ok := true
+				for b in buf {
+					if b != 0x5A {
+						ok = false
+						break
+					}
+				}
+				st.intact = ok
+			})
+
+			actor.scheduler_start(&sched)
+			actor.send(&sched, caller, i64(11))
+			actor.wait_idle(&sched)
+
+			testing.expect_value(t, caller.state.res, i64(33))
+			testing.expect(t, caller.state.intact)
+		}
+
+		// 6. Cross-scheduler `actor.call(ctx.sched, remote_pid, ...)` must route to `remote_pid`'s scheduler.
+		{
+			s1: actor.Scheduler
+			s2: actor.Scheduler
+			err1 := actor.init(&s1, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+			err2 := actor.init(&s2, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+			testing.expect_value(t, err1, mem.Allocator_Error.None)
+			testing.expect_value(t, err2, mem.Allocator_Error.None)
+			defer actor.destroy(&s1)
+			defer actor.destroy(&s2)
+
+			Remote_State :: struct {
+				bad_sched: bool,
+				hits:      int,
+			}
+			remote_svc := actor.spawn(&s2, Remote_State{}, proc(ctx: ^actor.Context, st: ^Remote_State, x: ^i64) {
+				st.hits += 1
+				if ctx.sched != actor.current_context().sched || ctx.sched == nil {
+					st.bad_sched = true
+				}
+				actor.reply(ctx, x^ * 4)
+			})
+
+			Local_State :: struct {
+				remote_pid: actor.PID(i64),
+				res:        i64,
+			}
+			local_caller := actor.spawn(&s1, Local_State{remote_pid = actor.pid(remote_svc)}, proc(ctx: ^actor.Context, st: ^Local_State, x: ^i64) {
+				// Intentionally pass caller's `ctx.sched` (`&s1`) targeting an actor on `&s2`.
+				st.res = actor.call(ctx.sched, st.remote_pid, x^, i64)
+			})
+
+			actor.scheduler_start(&s2)
+			actor.scheduler_start(&s1)
+			actor.send(&s1, local_caller, i64(9))
+			actor.wait_idle(&s1)
+			actor.wait_idle(&s2)
+
+			testing.expect_value(t, local_caller.state.res, i64(36))
+			testing.expect_value(t, remote_svc.state.hits, 1)
+			testing.expect(t, !remote_svc.state.bad_sched)
+		}
+
+		// 7. 1-worker same-supervisor `.One_For_All` suspended-caller deferred restart:
+		//    `ofa_caller` calls `proxy` -> `proxy` crashes `ofa_svc` -> `sup` runs on the SAME
+		//    worker stack while `ofa_caller` is in `_tls_call_stack[0]`. `ofa_caller`'s arena
+		//    must remain intact until `ofa_caller` unwinds, then `ofa_caller` restarts cleanly.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Ofa_Trace :: struct {
+				arena_intact: bool,
+				call_err:     actor.Call_Error,
+				stop_count:   int,
+				reinit_count: int,
+			}
+			trace: Ofa_Trace
+
+			sup := actor.spawn_supervisor(&sched, actor.Supervisor_Config{
+				strategy     = .One_For_All,
+				max_restarts = 5,
+			})
+
+			Ofa_Svc_State :: struct {
+				hits: int,
+			}
+			ofa_svc := actor.spawn(&sched, Ofa_Svc_State{}, proc(ctx: ^actor.Context, st: ^Ofa_Svc_State, x: ^i64) {
+				st.hits += 1
+				if x^ < 0 {
+					assert(false, "injected svc crash")
+				}
+				actor.reply(ctx, x^ * 2)
+			})
+			testing.expect_value(t, actor.supervise(sup, ofa_svc, Ofa_Svc_State{}, .Permanent, actor.Child_Hooks(Ofa_Svc_State){
+				use_arena = true,
+			}, 1), actor.Supervisor_Error.None)
+
+			Proxy_State :: struct {
+				svc_pid: actor.PID(i64),
+			}
+			proxy := actor.spawn(&sched, Proxy_State{svc_pid = actor.pid(ofa_svc)}, proc(ctx: ^actor.Context, st: ^Proxy_State, x: ^i64) {
+				actor.send(ctx, st.svc_pid, i64(-1))
+				val, cerr := actor.try_call(ctx.sched, st.svc_pid, x^, i64)
+				_ = cerr
+				actor.reply(ctx, val)
+			})
+
+			Ofa_Caller_State :: struct {
+				trace:     ^Ofa_Trace,
+				proxy_pid: actor.PID(i64),
+			}
+			ofa_caller_init := Ofa_Caller_State{
+				trace     = &trace,
+				proxy_pid = actor.pid(proxy),
+			}
+			ofa_caller := actor.spawn(&sched, ofa_caller_init, proc(ctx: ^actor.Context, st: ^Ofa_Caller_State, x: ^i64) {
+				buf := make([]u8, 64)
+				for j in 0 ..< len(buf) {
+					buf[j] = 0x42
+				}
+				_, cerr := actor.try_call(ctx.sched, st.proxy_pid, x^, i64)
+				ok := true
+				for b in buf {
+					if b != 0x42 {
+						ok = false
+						break
+					}
+				}
+				st.trace.arena_intact = ok
+				st.trace.call_err = cerr
+			})
+			testing.expect_value(t, actor.supervise(sup, ofa_caller, ofa_caller_init, .Permanent, actor.Child_Hooks(Ofa_Caller_State){
+				on_stop = proc(st: ^Ofa_Caller_State, _reason: actor.Exit_Reason) {
+					st.trace.stop_count += 1
+				},
+				on_reinit = proc(st: ^Ofa_Caller_State, _arena: mem.Allocator) {
+					st.trace.reinit_count += 1
+				},
+				use_arena = true,
+			}, 2), actor.Supervisor_Error.None)
+
+			actor.scheduler_start(&sched)
+			actor.send(&sched, ofa_caller, i64(5))
+			actor.wait_idle(&sched)
+
+			testing.expect(t, trace.arena_intact)
+			testing.expect_value(t, trace.call_err, actor.Call_Error.Call_Target_Crashed)
+			testing.expect_value(t, trace.stop_count, 1)
+			testing.expect_value(t, trace.reinit_count, 1)
+			testing.expect_value(t, actor.actor_status(ofa_caller), actor.Actor_Status.Running)
+			testing.expect_value(t, actor.actor_status(ofa_svc), actor.Actor_Status.Running)
+		}
+
+		// 8. Unsupervised stopped target (without `Actor_Extension`) must drain cleanly and
+		//    never hang `actor.call` or `actor.try_call`.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			victim := actor.spawn(&sched, 0, proc(ctx: ^actor.Context, st: ^int, x: ^i64) {
+				st^ += 1
+				actor.reply(ctx, x^)
+			})
+			actor.scheduler_start(&sched)
+			intrinsics.atomic_store_explicit(&victim.base.status, u32(actor.Actor_Status.Stopped), .Seq_Cst)
+
+			res := actor.call(&sched, victim, i64(123), i64)
+			testing.expect_value(t, res, i64(0))
+			_, terr := actor.try_call(&sched, victim, i64(456), i64)
+			testing.expect_value(t, terr, actor.Call_Error.Target_Stopped)
+			actor.wait_idle(&sched)
+		}
+	})
+}
+
+@(test)
+test_26_suspended_caller_terminate_runtime_ctx_and_destroy_after_reply :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. Permanent `supervisor_terminate_child` on a suspended caller in `_tls_call_stack`
+		//    must defer `on_stop` and `Down_Event` delivery until the caller unwinds.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Term_Trace :: struct {
+				stop_during_mgr:   int,
+				downs_during_mgr:  int,
+				after_call_ok:     bool,
+				call_err:          actor.Call_Error,
+				stop_after_unwind: int,
+				down_count:        int,
+			}
+			trace: Term_Trace
+
+			watcher := actor.spawn(&sched, &trace, proc(st: ^^Term_Trace, _ev: actor.Down_Event) {
+				st^.down_count += 1
+			})
+
+			sup := actor.spawn_supervisor(&sched, actor.Supervisor_Config{
+				strategy     = .One_For_One,
+				max_restarts = 3,
+			})
+
+			Mgr_State :: struct {
+				sup:      ^actor.Supervisor,
+				child_id: u64,
+				trace:    ^Term_Trace,
+			}
+			mgr := actor.spawn(&sched, Mgr_State{sup = sup, child_id = 42, trace = &trace}, proc(ctx: ^actor.Context, st: ^Mgr_State, _x: ^i64) {
+				_ = actor.supervisor_terminate_child(st.sup, st.child_id)
+				st.trace.stop_during_mgr = st.trace.stop_after_unwind
+				st.trace.downs_during_mgr = st.trace.down_count
+				actor.reply(ctx, i64(1))
+			})
+
+			Caller_State :: struct {
+				mgr:   ^actor.Actor(Mgr_State, i64),
+				trace: ^Term_Trace,
+			}
+			caller_init := Caller_State{mgr = mgr, trace = &trace}
+			caller := actor.spawn(&sched, caller_init, proc(ctx: ^actor.Context, st: ^Caller_State, x: ^i64) {
+				buf := make([]u8, 32)
+				buf[0] = 0x77
+				buf[31] = 0x88
+				_, cerr := actor.try_call(ctx.sched, st.mgr, x^, i64)
+				st.trace.call_err = cerr
+				st.trace.after_call_ok = (buf[0] == 0x77 && buf[31] == 0x88)
+			})
+			testing.expect_value(t, actor.supervise(sup, caller, caller_init, .Permanent, actor.Child_Hooks(Caller_State){
+				on_stop = proc(st: ^Caller_State, _reason: actor.Exit_Reason) {
+					st.trace.stop_after_unwind += 1
+				},
+				use_arena = true,
+			}, 42), actor.Supervisor_Error.None)
+			_ = actor.monitor(actor.pid(watcher), caller)
+
+			actor.scheduler_start(&sched)
+			actor.send(&sched, caller, i64(1))
+			actor.wait_idle(&sched)
+
+			testing.expect_value(t, trace.stop_during_mgr, 0)
+			testing.expect_value(t, trace.downs_during_mgr, 0)
+			testing.expect(t, trace.after_call_ok)
+			testing.expect_value(t, trace.call_err, actor.Call_Error.Call_Target_Crashed)
+			testing.expect_value(t, trace.stop_after_unwind, 1)
+			testing.expect_value(t, trace.down_count, 1)
+			testing.expect_value(t, actor.actor_status(caller), actor.Actor_Status.Stopped)
+		}
+
+		// 2. Full `runtime.Context` isolation and `call_sched_actor` (`^Actor`) overload coverage.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Callee_State :: struct {
+				seen_user_index: int,
+				seen_user_ptr:   rawptr,
+			}
+			callee := actor.spawn(&sched, Callee_State{}, proc(ctx: ^actor.Context, st: ^Callee_State, x: ^i64) {
+				st.seen_user_index = context.user_index
+				st.seen_user_ptr   = context.user_ptr
+				context.user_index = 999
+				context.user_ptr   = rawptr(st)
+				actor.reply(ctx, x^ * 5)
+			})
+
+			Caller_Ctx_State :: struct {
+				callee:             ^actor.Actor(Callee_State, i64),
+				base_user_index:    int,
+				base_user_ptr:      rawptr,
+				preserved_ctx:      bool,
+				res:                i64,
+			}
+			caller := actor.spawn(&sched, Caller_Ctx_State{callee = callee}, proc(ctx: ^actor.Context, st: ^Caller_Ctx_State, x: ^i64) {
+				saved_idx := context.user_index
+				saved_ptr := context.user_ptr
+				st.base_user_index = saved_idx
+				st.base_user_ptr   = saved_ptr
+				context.user_index = saved_idx + 12345
+				context.user_ptr   = rawptr(st)
+				// Exercise `call_sched_actor` (`^Actor`) directly.
+				st.res = actor.call(ctx.sched, st.callee, x^, i64)
+				st.preserved_ctx = (context.user_index == saved_idx + 12345 && context.user_ptr == rawptr(st))
+				context.user_index = saved_idx
+				context.user_ptr   = saved_ptr
+			})
+
+			actor.scheduler_start(&sched)
+			actor.send(&sched, caller, i64(8))
+			actor.wait_idle(&sched)
+
+			testing.expect_value(t, callee.state.seen_user_index, caller.state.base_user_index)
+			testing.expect_value(t, callee.state.seen_user_ptr, caller.state.base_user_ptr)
+			testing.expect(t, caller.state.preserved_ctx)
+			testing.expect_value(t, caller.state.res, i64(40))
+		}
+
+		// 3. Immediate `actor.destroy(target)` after `actor.call` wakes must never race with
+		//    the final `quota == 0` peek in `scheduler_worker_proc` or `scheduler_run_claimed_actor_cooperative`.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 2, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+			actor.scheduler_start(&sched)
+
+			for i in 0 ..< 50 {
+				transient := actor.spawn(&sched, 0, proc(ctx: ^actor.Context, hits: ^int, x: ^i64) {
+					hits^ += 1
+					actor.reply(ctx, x^ + 1)
+				})
+				res := actor.call(&sched, transient, i64(i), i64)
+				testing.expect_value(t, res, i64(i + 1))
+				actor.destroy(transient)
+			}
+			actor.wait_idle(&sched)
+		}
+
+		// 4. Ambient cross-scheduler `actor.call(remote_pid, ...)` must execute on target's scheduler
+		//    without migrating `reg_sched` or corrupting `active_actors`.
+		{
+			s1: actor.Scheduler
+			s2: actor.Scheduler
+			err1 := actor.init(&s1, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+			err2 := actor.init(&s2, actor.Scheduler_Config{num_workers = 2, enable_parking = true})
+			testing.expect_value(t, err1, mem.Allocator_Error.None)
+			testing.expect_value(t, err2, mem.Allocator_Error.None)
+			defer actor.destroy(&s1)
+			defer actor.destroy(&s2)
+
+			Remote_State2 :: struct {
+				ran_on_s2: bool,
+				s2_ptr:    ^actor.Scheduler,
+			}
+			remote := actor.spawn(&s2, Remote_State2{s2_ptr = &s2}, proc(ctx: ^actor.Context, st: ^Remote_State2, x: ^i64) {
+				st.ran_on_s2 = (ctx.sched == st.s2_ptr)
+				actor.reply(ctx, x^ * 7)
+			})
+
+			Local_State2 :: struct {
+				remote_pid: actor.PID(i64),
+				res:        i64,
+			}
+			local := actor.spawn(&s1, Local_State2{remote_pid = actor.pid(remote)}, proc(_ctx: ^actor.Context, st: ^Local_State2, x: ^i64) {
+				// Ambient 3-arg `actor.call` resolves `_tls_active_sched == &s1` unless `resolve_target_scheduler` checks `target`.
+				st.res = actor.call(st.remote_pid, x^, i64)
+			})
+
+			actor.scheduler_start(&s2)
+			actor.scheduler_start(&s1)
+			actor.send(&s1, local, i64(6))
+			actor.wait_idle(&s1)
+			actor.wait_idle(&s2)
+
+			testing.expect_value(t, local.state.res, i64(42))
+			testing.expect(t, remote.state.ran_on_s2)
+			testing.expect_value(t, remote.base.reg_sched, &s2)
+		}
+
+		// 5. Cross-scheduler `try_call` at `MAX_COOPERATIVE_CALL_DEPTH` must succeed (not fail with
+		//    spurious `.Deadlock_Detected`), and calling/try_calling a `.Faulted` actor must fail fast.
+		{
+			s1: actor.Scheduler
+			s2: actor.Scheduler
+			err1 := actor.init(&s1, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+			err2 := actor.init(&s2, actor.Scheduler_Config{num_workers = 1, enable_parking = true})
+			testing.expect_value(t, err1, mem.Allocator_Error.None)
+			testing.expect_value(t, err2, mem.Allocator_Error.None)
+			defer actor.destroy(&s1)
+			defer actor.destroy(&s2)
+
+			Remote_Leaf_State :: struct {
+				hits: int,
+			}
+			remote_leaf := actor.spawn(&s2, Remote_Leaf_State{}, proc(ctx: ^actor.Context, st: ^Remote_Leaf_State, x: ^i64) {
+				st.hits += 1
+				actor.reply(ctx, x^ * 3)
+			})
+
+			Chain_Msg :: struct {
+				hop: int,
+				val: i64,
+			}
+			Chain_Node_State :: struct {
+				next:        rawptr,
+				remote_leaf: actor.PID(i64),
+				res:         i64,
+				err:         actor.Call_Error,
+			}
+			CHAIN_LEN :: actor.MAX_COOPERATIVE_CALL_DEPTH + 1
+			chain: [CHAIN_LEN]^actor.Actor(Chain_Node_State, Chain_Msg)
+			for i := CHAIN_LEN - 1; i >= 0; i -= 1 {
+				nxt := rawptr(chain[i + 1]) if i + 1 < CHAIN_LEN else nil
+				chain[i] = actor.spawn(&s1, Chain_Node_State{
+					next        = nxt,
+					remote_leaf = actor.pid(remote_leaf),
+				}, proc(ctx: ^actor.Context, st: ^Chain_Node_State, m: ^Chain_Msg) {
+					if st.next != nil {
+						nxt_actor := cast(^actor.Actor(Chain_Node_State, Chain_Msg))st.next
+						res, cerr := actor.try_call(ctx.sched, nxt_actor, Chain_Msg{hop = m.hop + 1, val = m.val}, i64)
+						if m.hop == 0 {
+							st.res = res
+							st.err = cerr
+						} else {
+							actor.reply(ctx, res)
+						}
+						return
+					}
+					// At depth == MAX_COOPERATIVE_CALL_DEPTH, cross-scheduler `try_call` to `remote_leaf` on `&s2` must succeed.
+					res, cerr := actor.try_call(st.remote_leaf, m.val, i64)
+					st.err = cerr
+					actor.reply(ctx, res)
+				})
+			}
+
+			// `.Faulted` target fast-fail for both `try_call` and `call`.
+			faulted := actor.spawn(&s1, 0, proc(ctx: ^actor.Context, _st: ^int, x: ^i64) {
+				actor.reply(ctx, x^)
+			})
+			intrinsics.atomic_store_explicit(&faulted.base.status, u32(actor.Actor_Status.Faulted), .Seq_Cst)
+
+			actor.scheduler_start(&s2)
+			actor.scheduler_start(&s1)
+
+			f_val, f_err := actor.try_call(&s1, faulted, i64(11), i64)
+			testing.expect_value(t, f_err, actor.Call_Error.Call_Target_Crashed)
+			testing.expect_value(t, f_val, i64(0))
+			testing.expect_value(t, actor.call(&s1, faulted, i64(22), i64), i64(0))
+
+			actor.send(&s1, chain[0], Chain_Msg{hop = 0, val = 14})
+			actor.wait_idle(&s1)
+			actor.wait_idle(&s2)
+
+			testing.expect_value(t, chain[CHAIN_LEN - 1].state.err, actor.Call_Error.None)
+			testing.expect_value(t, chain[0].state.err, actor.Call_Error.None)
+			testing.expect_value(t, chain[0].state.res, i64(42))
+			testing.expect_value(t, remote_leaf.state.hits, 1)
 		}
 	})
 }

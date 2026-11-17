@@ -83,8 +83,9 @@ Worker_Delegate_Forward :: struct {
 }
 
 Worker_Delegate_Compute :: struct {
-	value:      i64,
-	do_crash:   bool,
+	value:           i64,
+	do_crash:        bool,
+	forbidden_alloc: rawptr,
 }
 
 Worker_Self_Flood_Panic :: struct {
@@ -163,6 +164,9 @@ Supervision_World :: struct {
 	last_call_val:     i64,
 	last_call_err:     actor.Call_Error,
 	last_reg_ok:       bool,
+	caller_groups:     map[string][]^Multi_Caller_Actor,
+	multi_callers:     map[string]^Multi_Caller_Actor,
+	caller_barriers:   [dynamic]^sync.Barrier,
 }
 
 // -----------------------------------------------------------------------------
@@ -323,6 +327,18 @@ test_worker_receive :: proc(ctx: ^actor.Context, self_actor: ^Supervised_Test_Wo
 			actor.reply(ctx, i64(-1))
 			return
 		}
+		if m.forbidden_alloc != nil && context.allocator.data == m.forbidden_alloc {
+			actor.reply(ctx, i64(-999))
+			return
+		}
+		// Exercise both `context.allocator` and `context.temp_allocator` inside the callee turn
+		// so any caller-allocator/temp leakage or cross-contamination fails isolation checks.
+		buf := make([]byte, 64)
+		defer delete(buf)
+		buf[0] = byte(m.value & 0xff)
+		buf[63] = 0x42
+		tmp := fmt.tprintf("callee-%d", m.value)
+		_ = tmp
 		actor.reply(ctx, m.value * 2)
 
 	case Worker_Self_Flood_Panic:
@@ -385,6 +401,7 @@ driver_spawn_supervised_worker :: proc(
 	explicit_pools: []actor.Envelope_Pool(Test_Worker_Msg),
 	fail_stop_attempts: int = 0,
 	fail_stop_mode: actor.Exit_Reason = .Panic,
+	use_arena: bool = true,
 ) -> (worker: ^Supervised_Test_Worker, child_id: u64, err: actor.Supervisor_Error) {
 	arena_alloc := vmem.arena_allocator(&w.arena)
 	slot := new(Worker_Slot, arena_alloc)
@@ -413,7 +430,7 @@ driver_spawn_supervised_worker :: proc(
 	err = actor.supervise(sup, worker, init_state, policy, actor.Child_Hooks(Test_Worker_State){
 		on_reinit    = test_worker_on_reinit,
 		on_stop      = test_worker_on_stop,
-		use_arena    = true,
+		use_arena    = use_arena,
 		keep_mailbox = false,
 	}, child_id)
 	slot.fail_reinit_left = fail_reinit_attempts
@@ -802,23 +819,51 @@ driver_run_linearizability_seed :: proc(t: ^testing.T, seed: u64, loc := #caller
 
 @(private = "file")
 Multi_Caller_Cmd :: struct {
-	kind:    u8, // 0 = normal try_call, 1 = crash try_call, 2 = cycle_a, 3 = cycle_b
+	kind:    u8, // 0 = normal try_call, 1 = crash try_call, 2 = cycle_a, 3 = cycle_b, 4 = barrier_cycle
 	service: ^Supervised_Test_Worker,
 	peer:    rawptr,
+	barrier: ^sync.Barrier,
 	value:   i64,
 }
 
-@(private = "file")
+Multi_Caller_Trace :: struct {
+	normal_hits:     int,
+	arena_intact:    bool,
+	crash_err:       actor.Call_Error,
+	cycle_outer_err: actor.Call_Error,
+	cycle_inner_err: actor.Call_Error,
+	barrier_err:     actor.Call_Error,
+	stop_count:      int,
+	reinit_count:    int,
+}
+
 Multi_Caller_State :: struct {
+	trace:           ^Multi_Caller_Trace,
 	normal_hits:     int,
 	all_ok:          bool,
 	crash_err:       actor.Call_Error,
 	cycle_outer_err: actor.Call_Error,
 	cycle_inner_err: actor.Call_Error,
+	barrier_err:     actor.Call_Error,
+}
+
+Multi_Caller_Actor :: actor.Actor(Multi_Caller_State, Multi_Caller_Cmd)
+
+@(private = "file")
+multi_caller_on_stop :: proc(state: ^Multi_Caller_State, reason: actor.Exit_Reason) {
+	_ = reason
+	if state.trace != nil {
+		state.trace.stop_count += 1
+	}
 }
 
 @(private = "file")
-Multi_Caller_Actor :: actor.Actor(Multi_Caller_State, Multi_Caller_Cmd)
+multi_caller_on_reinit :: proc(state: ^Multi_Caller_State, arena_alloc: mem.Allocator) {
+	_ = arena_alloc
+	if state.trace != nil {
+		state.trace.reinit_count += 1
+	}
+}
 
 @(private = "file")
 multi_caller_receive :: proc(ctx: ^actor.Context, self_actor: ^Multi_Caller_Actor, msg: ^Multi_Caller_Cmd) {
@@ -832,8 +877,9 @@ multi_caller_receive :: proc(ctx: ^actor.Context, self_actor: ^Multi_Caller_Acto
 		scratch := fmt.tprintf("w%d", msg.value)
 
 		val, err := actor.try_call(ctx.sched, msg.service, Test_Worker_Msg(Worker_Delegate_Compute{
-			value    = msg.value,
-			do_crash = false,
+			value           = msg.value,
+			do_crash        = false,
+			forbidden_alloc = entry_alloc_data,
 		}), i64)
 		intact := entry_alloc_data != nil &&
 			context.allocator.data == entry_alloc_data &&
@@ -845,8 +891,14 @@ multi_caller_receive :: proc(ctx: ^actor.Context, self_actor: ^Multi_Caller_Acto
 			val == msg.value * 2
 		if !intact {
 			st.all_ok = false
+			if st.trace != nil {
+				st.trace.arena_intact = false
+			}
 		}
 		st.normal_hits += 1
+		if st.trace != nil {
+			st.trace.normal_hits += 1
+		}
 
 	case 1:
 		entry_alloc_data := context.allocator.data
@@ -869,6 +921,10 @@ multi_caller_receive :: proc(ctx: ^actor.Context, self_actor: ^Multi_Caller_Acto
 		if !intact {
 			st.all_ok = false
 		}
+		if st.trace != nil {
+			st.trace.crash_err = err
+			st.trace.arena_intact = intact
+		}
 
 	case 2:
 		peer_b := cast(^Multi_Caller_Actor)msg.peer
@@ -880,6 +936,10 @@ multi_caller_receive :: proc(ctx: ^actor.Context, self_actor: ^Multi_Caller_Acto
 		}, actor.Call_Error)
 		st.cycle_outer_err = outer_err
 		st.cycle_inner_err = inner_err
+		if st.trace != nil {
+			st.trace.cycle_outer_err = outer_err
+			st.trace.cycle_inner_err = inner_err
+		}
 
 	case 3:
 		peer_a := cast(^Multi_Caller_Actor)msg.peer
@@ -889,43 +949,56 @@ multi_caller_receive :: proc(ctx: ^actor.Context, self_actor: ^Multi_Caller_Acto
 			value   = 1,
 		}, i64)
 		actor.reply(ctx, cerr)
+
+	case 4:
+		peer := cast(^Multi_Caller_Actor)msg.peer
+		sync.barrier_wait(msg.barrier)
+		_, cerr := actor.try_call(ctx.sched, peer, Multi_Caller_Cmd{
+			kind    = 0,
+			service = msg.service,
+			value   = msg.value,
+		}, i64)
+		st.barrier_err = cerr
+		if st.trace != nil {
+			st.trace.barrier_err = cerr
+		}
 	}
 }
 
-@(require_results)
-driver_verify_multi_worker_cooperative_try_call_saturation :: proc(
+driver_spawn_supervised_caller :: proc(
 	w: ^Supervision_World,
-	service: ^Supervised_Test_Worker,
-) -> bool {
-	caller_sup := actor.spawn_supervisor(&w.sched, actor.Supervisor_Config{
-		strategy      = .One_For_One,
-		max_restarts  = 10,
-		max_window    = 10 * time.Second,
-		within_window = 10 * time.Second,
-		now_proc      = world_clock_proc,
-		clock_data    = w,
-	})
-
-	callers: [4]^Multi_Caller_Actor
-	for idx in 0 ..< 4 {
-		init_st := Multi_Caller_State{all_ok = true}
-		c, _ := actor.spawn(&w.sched, init_st, multi_caller_receive, u32(idx + 1))
-		if actor.supervise(caller_sup, c, init_st, .Permanent, actor.Child_Hooks(Multi_Caller_State){
-			use_arena    = true,
-			keep_mailbox = false,
-		}, u64(idx + 1)) != .None {
-			actor.stop_supervisor(caller_sup)
-			actor.wait_idle(&w.sched)
-			return false
-		}
-		callers[idx] = c
+	sup: ^actor.Supervisor,
+	policy: actor.Restart_Policy,
+	use_arena: bool,
+	id_hint: u32 = 0,
+) -> (^Multi_Caller_Actor, actor.Supervisor_Error) {
+	world_alloc := vmem.arena_allocator(&w.arena)
+	trace := new(Multi_Caller_Trace, world_alloc)
+	trace.arena_intact = true
+	init_st := Multi_Caller_State{
+		trace  = trace,
+		all_ok = true,
 	}
+	c, _ := actor.spawn(&w.sched, init_st, multi_caller_receive, id_hint)
+	w.next_child_id += 1
+	sup_err := actor.supervise(sup, c, init_st, policy, actor.Child_Hooks(Multi_Caller_State){
+		on_reinit    = multi_caller_on_reinit,
+		on_stop      = multi_caller_on_stop,
+		use_arena    = use_arena,
+		keep_mailbox = false,
+	}, w.next_child_id)
+	return c, sup_err
+}
 
-	// Phase A: Saturate all 4 workers concurrently calling the shared supervised service.
-	MSGS_PER_CALLER :: 16
-	for m in 0 ..< MSGS_PER_CALLER {
-		for idx in 0 ..< 4 {
-			actor.send(&w.sched, callers[idx], Multi_Caller_Cmd{
+driver_send_concurrent_try_calls :: proc(
+	w: ^Supervision_World,
+	callers: []^Multi_Caller_Actor,
+	service: ^Supervised_Test_Worker,
+	per_caller: int,
+) {
+	for m in 0 ..< per_caller {
+		for c, idx in callers {
+			actor.send(&w.sched, c, Multi_Caller_Cmd{
 				kind    = 0,
 				service = service,
 				value   = i64(idx * 100 + m + 1),
@@ -933,53 +1006,60 @@ driver_verify_multi_worker_cooperative_try_call_saturation :: proc(
 		}
 	}
 	actor.wait_idle(&w.sched)
+}
 
-	for idx in 0 ..< 4 {
-		if !callers[idx].state.all_ok || callers[idx].state.normal_hits != MSGS_PER_CALLER {
-			actor.stop_supervisor(caller_sup)
-			actor.wait_idle(&w.sched)
-			return false
-		}
-	}
-
-	// Phase B1: Crash the shared service via `try_call` and verify caller isolation + restart.
-	actor.send(&w.sched, callers[0], Multi_Caller_Cmd{
+driver_send_crashing_try_call :: proc(
+	w: ^Supervision_World,
+	caller: ^Multi_Caller_Actor,
+	service: ^Supervised_Test_Worker,
+	value: i64,
+) {
+	actor.send(&w.sched, caller, Multi_Caller_Cmd{
 		kind    = 1,
 		service = service,
-		value   = 77,
+		value   = value,
 	})
 	actor.wait_idle(&w.sched)
+}
 
-	if !callers[0].state.all_ok || callers[0].state.crash_err != .Call_Target_Crashed {
-		actor.stop_supervisor(caller_sup)
-		actor.wait_idle(&w.sched)
-		return false
-	}
-	if actor.actor_status(service) != .Running {
-		actor.stop_supervisor(caller_sup)
-		actor.wait_idle(&w.sched)
-		return false
-	}
-	restarted_val, read_err := actor.try_call(&w.sched, service, Test_Worker_Msg(Worker_Read{}), i64)
-	if read_err != .None || restarted_val != service.state.slot.committed {
-		actor.stop_supervisor(caller_sup)
-		actor.wait_idle(&w.sched)
-		return false
-	}
-
-	// Phase B2: Cooperative `try_call` cycle (`caller[0] -> caller[1] -> caller[0]`) on 4-worker scheduler.
-	actor.send(&w.sched, callers[0], Multi_Caller_Cmd{
+driver_send_cyclic_try_call :: proc(
+	w: ^Supervision_World,
+	caller_a: ^Multi_Caller_Actor,
+	caller_b: ^Multi_Caller_Actor,
+	service: ^Supervised_Test_Worker,
+	value: i64,
+) {
+	actor.send(&w.sched, caller_a, Multi_Caller_Cmd{
 		kind    = 2,
 		service = service,
-		peer    = callers[1],
-		value   = 10,
+		peer    = caller_b,
+		value   = value,
 	})
 	actor.wait_idle(&w.sched)
+}
 
-	cycle_ok := callers[0].state.cycle_outer_err == .None &&
-		callers[0].state.cycle_inner_err == .Deadlock_Detected
-
-	actor.stop_supervisor(caller_sup)
+driver_send_simultaneous_cross_worker_try_call_cycle :: proc(
+	w: ^Supervision_World,
+	caller_a: ^Multi_Caller_Actor,
+	caller_b: ^Multi_Caller_Actor,
+	service: ^Supervised_Test_Worker,
+) {
+	bar := new(sync.Barrier)
+	sync.barrier_init(bar, 2)
+	append(&w.caller_barriers, bar)
+	actor.send(&w.sched, caller_a, Multi_Caller_Cmd{
+		kind    = 4,
+		service = service,
+		peer    = caller_b,
+		barrier = bar,
+		value   = 1,
+	}, shard_hint = 0)
+	actor.send(&w.sched, caller_b, Multi_Caller_Cmd{
+		kind    = 4,
+		service = service,
+		peer    = caller_a,
+		barrier = bar,
+		value   = 2,
+	}, shard_hint = 1)
 	actor.wait_idle(&w.sched)
-	return cycle_ok
 }
