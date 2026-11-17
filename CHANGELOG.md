@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.1.3] - 2026-11-17
+
 ### Fixed
 - **Cooperative Shard-Drain Wait in `actor_destroy` & `actor_base_destroy_sched` (`actor/actor.odin`, `actor/supervision.odin`):**
   - Extracted `scheduler_wait_actor_unscheduled` and updated `scheduler_step_one_cooperative` to iterate shards from a rotating offset, skip busy (`in_step != 0`) entries across peer shards, and retire non-runnable (`status != .Running`) shard entries immediately.
@@ -83,7 +87,8 @@ Initial pre-OTP release of **Sleipnir** (`package actor`) at commit [`90d94f5`](
 ### Fixed
 - Prevented lost worker wakeups and false-empty MPSC runqueue observations in `scheduler_worker_proc` (`90d94f5`).
 
-[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.3...HEAD
+[1.1.3]: https://github.com/boxxxie/sleipnir/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/boxxxie/sleipnir/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/boxxxie/sleipnir/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/boxxxie/sleipnir/compare/v1.0.0...v1.1.0
