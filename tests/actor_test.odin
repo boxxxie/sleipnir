@@ -2391,5 +2391,73 @@ test_26_suspended_caller_terminate_runtime_ctx_and_destroy_after_reply :: proc(t
 			testing.expect_value(t, chain[0].state.res, i64(42))
 			testing.expect_value(t, remote_leaf.state.hits, 1)
 		}
+
+		// 6. 1-worker same-scheduler `actor.destroy` / `actor_base_destroy` after `send` + `call`:
+		//    `actor.call` steps an already-queued target in-place (`owns_scheduled = false`), leaving
+		//    `target.base.scheduled == 1` in `s.shards` when `call` returns. Calling `actor.destroy`
+		//    or `actor_base_destroy` inside the same 1-worker turn must cooperatively drain `s.shards`
+		//    (including any runnable bystander queued ahead of the target) instead of deadlocking.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 1, enable_parking = false})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Target_State :: struct {
+				seen_sum: i64,
+			}
+			target_body :: proc(ctx: ^actor.Context, st: ^Target_State, x: ^i64) {
+				st.seen_sum += x^
+				if x^ < 0 {
+					actor.reply(ctx, st.seen_sum)
+				}
+			}
+			target1 := actor.spawn(&sched, Target_State{}, target_body)
+			target2 := actor.spawn(&sched, Target_State{}, target_body)
+
+			bystander_hits := 0
+			bystander := actor.spawn(&sched, &bystander_hits, proc(hits: ^^int, _x: ^i64) {
+				hits^^ += 1
+			})
+
+			Driver_State :: struct {
+				target1:   ^actor.Actor(Target_State, i64),
+				target2:   ^actor.Actor(Target_State, i64),
+				bystander: ^actor.Actor(^int, i64),
+				res1:      i64,
+				res2:      i64,
+				done:      bool,
+			}
+			driver := actor.spawn(&sched, Driver_State{
+				target1   = target1,
+				target2   = target2,
+				bystander = bystander,
+			}, proc(ctx: ^actor.Context, st: ^Driver_State, _x: ^i64) {
+				// Queue `bystander` ahead of `target1` and `target2` in `s.shards[0]` (`scheduled = 1`).
+				actor.send(ctx.sched, st.bystander, i64(1))
+				actor.send(ctx.sched, st.target1, i64(10))
+				actor.send(ctx.sched, st.target2, i64(20))
+
+				// `actor.call` steps `target1` and `target2` directly while they remain queued in `s.shards[0]`.
+				st.res1 = actor.call(ctx.sched, st.target1, i64(-1), i64)
+				st.res2 = actor.call(ctx.sched, st.target2, i64(-1), i64)
+
+				// Both `actor.destroy` and `actor_base_destroy` must drain `s.shards[0]` rather than spinning forever.
+				actor.destroy(st.target1)
+				actor.actor_base_destroy(ctx.sched, &st.target2.base)
+				st.target1 = nil
+				st.target2 = nil
+				st.done = true
+			})
+
+			actor.scheduler_start(&sched)
+			actor.send(&sched, driver, i64(1))
+			actor.wait_idle(&sched)
+
+			testing.expect(t, driver.state.done)
+			testing.expect_value(t, driver.state.res1, i64(9))
+			testing.expect_value(t, driver.state.res2, i64(19))
+			testing.expect_value(t, bystander_hits, 1)
+		}
 	})
 }
