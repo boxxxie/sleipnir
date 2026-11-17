@@ -52,6 +52,25 @@ _tls_active_sched: ^Scheduler
 @(thread_local)
 _tls_call_depth: int
 
+@(thread_local)
+_tls_call_stack: [MAX_COOPERATIVE_CALL_DEPTH]^Actor_Base
+
+@(private)
+tls_is_actor_in_step_on_current_thread :: #force_inline proc(base: ^Actor_Base) -> bool {
+	if base == nil || _tls_active_ctx == nil {
+		return false
+	}
+	if _tls_active_ctx.current_actor == base {
+		return true
+	}
+	for i := 0; i < _tls_call_depth; i += 1 {
+		if _tls_call_stack[i] == base {
+			return true
+		}
+	}
+	return false
+}
+
 // Count of live initialized Schedulers so `default_registry` is destroyed only when the last exits.
 _active_scheduler_count: i32
 
@@ -1106,7 +1125,7 @@ actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 	}
 	s := a.base.reg_sched
 	if s != nil {
-		if s.started && intrinsics.atomic_load_explicit(&s.running, .Acquire) {
+		if s.started && intrinsics.atomic_load_explicit(&s.running, .Acquire) && !tls_is_actor_in_step_on_current_thread(&a.base) {
 			for intrinsics.atomic_load_explicit(&a.base.scheduled, .Acquire) != 0 ||
 			    intrinsics.atomic_load_explicit(&a.base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
@@ -2010,29 +2029,38 @@ reply :: proc {
 	reply_ambient,
 }
 
-// Cooperatively execute one runnable actor turn while a worker thread is waiting inside `actor.call`.
+// Execute an already-claimed/scheduled `Actor_Base` cooperatively on the calling worker thread.
 @(private)
-scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> bool {
+scheduler_run_claimed_actor_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context, a: ^Actor_Base) -> bool {
 	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
 		panic("actor.call cooperative recursion depth limit exceeded")
 	}
-	wid := caller_ctx.worker_id
-	num_shards := s.num_shards
-	a := shard_pop_or_steal(&s.shards[wid % num_shards])
-	if a == nil && num_shards > 1 {
-		for i := 1; i < num_shards; i += 1 {
-			peer := (wid + i) % num_shards
-			a = shard_pop_or_steal(&s.shards[peer])
-			if a != nil { break }
-		}
-	}
-	if a == nil { return false }
 
-	saved_ctx := caller_ctx^
-	saved_tls := _tls_active_ctx
-	_tls_call_depth += 1
+	wid        := caller_ctx.worker_id
+	num_shards := s.num_shards
+	saved_ctx  := caller_ctx^
+	saved_tls  := _tls_active_ctx
+	saved_trap := _tls_trap_frame
+	saved_alloc  := context.allocator
+	saved_assert := context.assertion_failure_proc
+	prev_depth := _tls_call_depth
+	_tls_call_stack[prev_depth] = saved_ctx.current_actor
+	_tls_call_depth = prev_depth + 1
+	if saved_trap != nil {
+		root_trap := saved_trap
+		for root_trap.prev != nil {
+			root_trap = root_trap.prev
+		}
+		_tls_trap_frame = nil
+		context.allocator = root_trap.saved_alloc
+		context.assertion_failure_proc = root_trap.saved_assert
+	}
 	defer {
-		_tls_call_depth -= 1
+		_tls_call_depth = prev_depth
+		_tls_call_stack[prev_depth] = nil
+		_tls_trap_frame = saved_trap
+		context.allocator = saved_alloc
+		context.assertion_failure_proc = saved_assert
 		caller_ctx^ = saved_ctx
 		_tls_active_ctx = saved_tls
 	}
@@ -2055,6 +2083,13 @@ scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> b
 		if still_has_more {
 			if intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
 				shard_push(&s.shards[wid % num_shards], a)
+				if s.enable_parking {
+					intrinsics.atomic_thread_fence(.Seq_Cst)
+					if intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
+						intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
+						sync.futex_signal(&s.wake_futex)
+					}
+				}
 			} else {
 				intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Seq_Cst)
 			}
@@ -2068,16 +2103,63 @@ scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> b
 	return true
 }
 
+// Attempt to claim an idle target `Actor_Base` directly and execute one cooperative turn.
 @(private)
-wait_for_call_slot :: proc(s: ^Scheduler, slot: ^Call_Slot($Res), caller_ctx: ^Context) -> u32 {
+scheduler_try_claim_and_step_cooperative :: proc(
+	s: ^Scheduler,
+	caller_ctx: ^Context,
+	a: ^Actor_Base,
+) -> bool {
+	if s == nil || caller_ctx == nil || a == nil {
+		return false
+	}
+	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+		panic("actor.call cooperative recursion depth limit exceeded")
+	}
+	if intrinsics.atomic_load_explicit(&a.status, .Seq_Cst) != u32(Actor_Status.Running) {
+		return false
+	}
+	if intrinsics.atomic_load_explicit(&a.scheduled, .Seq_Cst) == 0 {
+		if intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
+			intrinsics.atomic_add_explicit(&s.active_actors, 1, .Acq_Rel)
+			return scheduler_run_claimed_actor_cooperative(s, caller_ctx, a)
+		}
+	}
+	return false
+}
+
+// Cooperatively execute one runnable actor turn while a worker thread is waiting inside `actor.call`.
+@(private)
+scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> bool {
+	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+		panic("actor.call cooperative recursion depth limit exceeded")
+	}
+	wid := caller_ctx.worker_id
+	num_shards := s.num_shards
+	a := shard_pop_or_steal(&s.shards[wid % num_shards])
+	if a == nil && num_shards > 1 {
+		for i := 1; i < num_shards; i += 1 {
+			peer := (wid + i) % num_shards
+			a = shard_pop_or_steal(&s.shards[peer])
+			if a != nil { break }
+		}
+	}
+	if a == nil { return false }
+
+	return scheduler_run_claimed_actor_cooperative(s, caller_ctx, a)
+}
+
+@(private)
+wait_for_call_slot :: proc(s: ^Scheduler, slot: ^Call_Slot($Res), caller_ctx: ^Context, target_base: ^Actor_Base = nil) -> u32 {
 	spin := 0
 	for {
 		state := intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire)
 		if state >= CALL_STATE_REPLIED {
 			return state
 		}
-		if caller_ctx != nil && caller_ctx.sched == s && s.num_workers == 1 {
-			if state == CALL_STATE_PENDING {
+		if caller_ctx != nil && caller_ctx.sched == s {
+			if state == CALL_STATE_PENDING &&
+			   (target_base == nil || intrinsics.atomic_load_explicit(&target_base.in_step, .Seq_Cst) == 0) {
 				if !scheduler_step_one_cooperative(s, caller_ctx) {
 					intrinsics.cpu_relax()
 				}
@@ -2107,7 +2189,7 @@ wait_for_call_slot :: proc(s: ^Scheduler, slot: ^Call_Slot($Res), caller_ctx: ^C
 
 // Synchronous request/reply (`GenServer.call` / Akka `ask`): sends `msg` to `target`,
 // waits for `target` to call `actor.reply(res)` (cooperatively stepping actors if called
-// from a 1-worker thread), and returns `res` of type `$Res`.
+// from a worker thread on the same scheduler), and returns `res` of type `$Res`.
 @(require_results)
 call_sched_pid :: proc(
 	s: ^Scheduler,
@@ -2127,8 +2209,9 @@ call_sched_pid :: proc(
 		if caller_ctx.current_actor == &target.ref.base {
 			panic("actor.call self-call deadlock detected")
 		}
-		if s.num_workers == 1 && intrinsics.atomic_load_explicit(&target.ref.base.in_step, .Seq_Cst) != 0 {
-			panic("actor.call cycle detected on single-worker scheduler")
+		if tls_is_actor_in_step_on_current_thread(&target.ref.base) ||
+		   (s.num_workers == 1 && intrinsics.atomic_load_explicit(&target.ref.base.in_step, .Seq_Cst) != 0) {
+			panic("actor.call cycle detected on cooperative worker stack")
 		}
 		if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
 			panic("actor.call cooperative recursion depth limit exceeded")
@@ -2143,9 +2226,24 @@ call_sched_pid :: proc(
 	env.flags |= ENVELOPE_FLAG_CALL
 	env.reply_slot = &slot
 	env.msg = msg
-	send_envelope_pid(s, target, env, hint)
+	if caller_ctx != nil && caller_ctx.sched == s {
+		if !actor_base_can_accept(&target.ref.base, target.generation) {
+			actor_recycle_single_envelope(target.ref, env)
+			return {}
+		}
+		mpsc_push(&target.ref.mailbox, env)
+		if !scheduler_try_claim_and_step_cooperative(s, caller_ctx, &target.ref.base) {
+			scheduler_schedule_actor(s, &target.ref.base, hint)
+		}
+		if intrinsics.atomic_load_explicit(&target.ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) &&
+		   intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) < CALL_STATE_REPLIED {
+			actor_drain_stopped_target(&target.ref.base, false)
+		}
+	} else {
+		send_envelope_pid(s, target, env, hint)
+	}
 
-	_ = wait_for_call_slot(s, &slot, caller_ctx)
+	_ = wait_for_call_slot(s, &slot, caller_ctx, &target.ref.base)
 	return slot.result
 }
 

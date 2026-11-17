@@ -955,5 +955,17 @@ spec_30_otp_audit_bugfix_regressions :: proc(t: ^testing.T) {
 			then_worker_status_is(&w, "ok_w", .Running)
 			then_worker_status_is(&w, "flaky_w", .Running)
 		}
+
+		// 3. Multi-worker cooperative `try_call` saturation, caller arena isolation, and cycle detection.
+		{
+			w: Supervision_World
+			world_init(&w, t, num_workers = 4)
+			defer world_destroy(&w)
+
+			given_supervisor(&w, "sup", .One_For_One, max_restarts = 5)
+			given_supervised_worker(&w, "svc", under = "sup", policy = .Permanent, committed = 100)
+			then_multi_worker_cooperative_try_calls_succeed_and_isolate_faults(&w, "svc")
+			then_no_leaks(&w)
+		}
 	})
 }

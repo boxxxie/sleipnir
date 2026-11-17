@@ -1494,3 +1494,178 @@ test_23_dekker_wait_idle_heap_fallback_pool_id_and_cross_scheduler_send :: proc(
 		testing.expect_value(t, dekker_sink.state, i64(EXPECTED_ITER))
 	})
 }
+
+@(test)
+test_24_multi_worker_cooperative_call_saturation_and_cycle_guard :: proc(t: ^testing.T) {
+	with_leak_check(t, proc(t: ^testing.T) {
+		// 1. 4-worker N-to-1 `actor.call` saturation when the shared target already has
+		//    pre-queued async work in `s.shards` and all 4 workers concurrently enter `actor.call`.
+		{
+			sched: actor.Scheduler
+			err := actor.init(&sched, actor.Scheduler_Config{num_workers = 4, batch_quota = 64, enable_parking = true})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&sched)
+
+			Service_State :: struct {
+				hits: int,
+			}
+			service := actor.spawn(&sched, Service_State{}, proc(ctx: ^actor.Context, st: ^Service_State, x: ^i64) {
+				st.hits += 1
+				actor.reply(ctx, x^ * 2)
+			})
+
+			Producer_State :: struct {
+				svc:   actor.PID(i64),
+				sum:   i64,
+				count: int,
+			}
+			producers: [4]^actor.Actor(Producer_State, i64)
+			for i := 0; i < 4; i += 1 {
+				producers[i] = actor.spawn(&sched, Producer_State{svc = actor.pid(service)}, proc(ctx: ^actor.Context, st: ^Producer_State, x: ^i64) {
+					res := actor.call(ctx.sched, st.svc, x^, i64)
+					st.sum += res
+					st.count += 1
+					actor.complete_token(ctx, 1)
+				})
+			}
+
+			// Pre-queue async work onto `service` before starting workers so `service.scheduled == 1`
+			// inside `s.shards` while all 4 workers concurrently saturate `actor.call`.
+			actor.send(&sched, service, i64(7))
+			REQS_PER_PRODUCER :: 64
+			intrinsics.atomic_store_explicit(&sched.pending_tokens, i64(4 * REQS_PER_PRODUCER), .Release)
+			for m := 0; m < REQS_PER_PRODUCER; m += 1 {
+				for p := 0; p < 4; p += 1 {
+					actor.send(&sched, producers[p], i64(m + 1), shard_hint = p)
+				}
+			}
+
+			actor.scheduler_start(&sched)
+			actor.wait_tokens(&sched)
+			actor.wait_idle(&sched)
+
+			testing.expect_value(t, service.state.hits, 1 + 4 * REQS_PER_PRODUCER)
+			expected_sum := i64(REQS_PER_PRODUCER * (REQS_PER_PRODUCER + 1)) // 2 * sum(1..64)
+			for p := 0; p < 4; p += 1 {
+				testing.expect_value(t, producers[p].state.count, REQS_PER_PRODUCER)
+				testing.expect_value(t, producers[p].state.sum, expected_sum)
+			}
+		}
+
+		// 2. Acyclic `B -> A -> C` DAG under cooperative `actor.call` (1-worker & 2-worker)
+		//    plus concurrent `A -> C` while `C` is busy in `step_proc` and `B` calls `A`.
+		for workers in ([2]int{1, 2}) {
+			dag_sched: actor.Scheduler
+			err := actor.init(&dag_sched, actor.Scheduler_Config{num_workers = workers, enable_parking = (workers > 1)})
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			defer actor.destroy(&dag_sched)
+
+			C_State :: struct {
+				busy_flag: ^u32,
+				hits:      int,
+			}
+			busy_flag: u32 = 0
+			actor_c := actor.spawn(&dag_sched, C_State{busy_flag = &busy_flag}, proc(ctx: ^actor.Context, st: ^C_State, x: ^i64) {
+				st.hits += 1
+				if x^ < 0 {
+					// Hold `C` briefly in `step_proc` while `A` starts and `B` is queued.
+					intrinsics.atomic_store_explicit(st.busy_flag, 1, .Release)
+					for spin := 0; spin < 10_000; spin += 1 {
+						intrinsics.cpu_relax()
+					}
+					return
+				}
+				actor.reply(ctx, x^ * 3)
+			})
+
+			A_State :: struct {
+				c_pid: actor.PID(i64),
+				res:   i64,
+				sum:   i64,
+			}
+			actor_a := actor.spawn(&dag_sched, A_State{c_pid = actor.pid(actor_c)}, proc(ctx: ^actor.Context, st: ^A_State, x: ^i64) {
+				val := actor.call(ctx.sched, st.c_pid, x^, i64)
+				st.res = val
+				st.sum += val
+				actor.reply(ctx, val + 1)
+			})
+
+			B_State :: struct {
+				a_pid: actor.PID(i64),
+				res:   i64,
+			}
+			actor_b := actor.spawn(&dag_sched, B_State{a_pid = actor.pid(actor_a)}, proc(ctx: ^actor.Context, st: ^B_State, x: ^i64) {
+				st.res = actor.call(ctx.sched, st.a_pid, x^, i64)
+			})
+
+			actor.scheduler_start(&dag_sched)
+
+			// Direct `B -> A -> C` cooperative DAG chain.
+			actor.send(&dag_sched, actor_b, i64(10))
+			actor.wait_idle(&dag_sched)
+			testing.expect_value(t, actor_b.state.res, i64(31))
+
+			// Concurrent `A -> C` while `C` is actively executing on a peer worker and `B` calls `A`.
+			if workers == 2 {
+				actor_b.state.res = 0
+				actor_a.state.res = 0
+				actor_a.state.sum = 0
+				intrinsics.atomic_store_explicit(&busy_flag, 0, .Release)
+				actor.send(&dag_sched, actor_c, i64(-1), shard_hint = 0)
+				for intrinsics.atomic_load_explicit(&busy_flag, .Acquire) == 0 {
+					intrinsics.cpu_relax()
+				}
+				actor.send(&dag_sched, actor_a, i64(20), shard_hint = 1)
+				actor.send(&dag_sched, actor_b, i64(5), shard_hint = 0)
+				actor.wait_idle(&dag_sched)
+				testing.expect_value(t, actor_a.state.sum, i64(75))
+				testing.expect_value(t, actor_b.state.res, i64(16))
+			}
+		}
+
+		// 3. Multi-worker cooperative `A -> B -> A` cycle detection must abort cleanly without hanging.
+		{
+			sched2: actor.Scheduler
+			err2 := actor.init(&sched2, actor.Scheduler_Config{num_workers = 2, enable_parking = false})
+			testing.expect_value(t, err2, mem.Allocator_Error.None)
+			defer actor.destroy(&sched2)
+
+			Mutual_State_2W :: struct {
+				peer_pid: actor.PID(i64),
+				caught:   bool,
+			}
+			actor_a: ^actor.Actor(Mutual_State_2W, i64)
+			actor_b := actor.spawn(&sched2, Mutual_State_2W{}, proc(ctx: ^actor.Context, st: ^Mutual_State_2W, x: ^i64) {
+				prev_proc := context.assertion_failure_proc
+				context.assertion_failure_proc = test22_trap_proc
+				jb: libc.jmp_buf
+				_test22_jmp = &jb
+				_test22_caught = 0
+				if libc.setjmp(&jb) == 0 {
+					_ = actor.call(st.peer_pid, x^ + 1, i64)
+				} else {
+					st.caught = _test22_caught > 0
+				}
+				_test22_jmp = nil
+				context.assertion_failure_proc = prev_proc
+				actor.reply(ctx, i64(-7))
+			})
+			actor_a = actor.spawn(&sched2, Mutual_State_2W{peer_pid = actor.pid(actor_b)}, proc(st: ^Mutual_State_2W, x: i64) {
+				if x == 10 {
+					res := actor.call(st.peer_pid, x, i64)
+					st.caught = res == -7
+				} else {
+					actor.reply(x)
+				}
+			})
+			actor_b.state.peer_pid = actor.pid(actor_a)
+
+			actor.scheduler_start(&sched2)
+			actor.send(&sched2, actor_a, i64(10))
+			actor.wait_idle(&sched2)
+
+			testing.expect(t, actor_b.state.caught)
+			testing.expect(t, actor_a.state.caught)
+		}
+	})
+}

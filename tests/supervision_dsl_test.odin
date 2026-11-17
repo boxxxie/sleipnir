@@ -846,3 +846,15 @@ then_no_leaks :: proc(w: ^Supervision_World, loc := #caller_location) {
 	_ = intrinsics.atomic_load_explicit(&w.clock_ns, .Relaxed)
 	testing.expect(w.t, w.sched.active_actors == 0, loc = loc)
 }
+
+then_multi_worker_cooperative_try_calls_succeed_and_isolate_faults :: proc(
+	w: ^Supervision_World,
+	service_label: string,
+	loc := #caller_location,
+) {
+	service, ok := w.workers[service_label]
+	if !testing.expectf(w.t, ok, "unknown service worker %q", service_label, loc = loc) {
+		return
+	}
+	testing.expect(w.t, driver_verify_multi_worker_cooperative_try_call_saturation(w, service), loc = loc)
+}
