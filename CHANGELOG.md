@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.2] - 2026-11-17
+
+### Fixed
+- **Multi-Worker Cooperative `call` / `try_call` Stepping & Isolation (`actor/actor.odin`, `actor/supervision.odin`):**
+  - Enabled cooperative target claiming and stepping (`scheduler_run_claimed_actor_cooperative`, `scheduler_try_claim_and_step_cooperative`, and multi-worker `wait_for_call_slot`) so `N` concurrent caller actors on an `N`-worker scheduler cannot park in `sync.futex_wait` while a shared same-scheduler target sits queued with zero awake workers.
+  - Added per-thread cooperative call-stack tracking (`_tls_call_stack`, `tls_is_actor_in_step_on_current_thread`, `tls_is_current_actor`, `MAX_COOPERATIVE_CALL_DEPTH`) and `Actor_Base.calling_target` tracking so synchronous call-cycle detection and leaf wait tracing avoid false-positive cycle panics on acyclic DAGs and concurrent fan-in, while deferring `.One_For_All` / `.Rest_For_One` / `terminate_child` teardown until suspended callers unwind.
+  - Isolated `_tls_trap_frame`, `context.allocator`, `context.temp_allocator`, and `context.assertion_failure_proc` across cooperative steps, held `in_step` across the Dekker worker tail and post-reply peek with `.Seq_Cst` ordering, woke parked workers on `has_more` reschedules, and enforced `.Seq_Cst` ordering on `finalized` / `stopped_drained` alongside safe stopped and `.Faulted` drains (`actor_drain_stopped_target`, `finalize_actor_stopped`).
+- **Regression Coverage (`tests/actor_test.odin`, `tests/supervision_*_test.odin`):**
+  - Expanded [`test_24_multi_worker_cooperative_call_saturation_and_cycle_guard`](tests/actor_test.odin) and [`spec_30_otp_audit_bugfix_regressions`](tests/supervision_spec_test.odin) (63 tests in `./tests`) covering 4-worker `N`-to-`1` saturation, acyclic `B -> A -> C` DAGs, cross-worker cycles, arena/temp isolation, deferred `.One_For_All` / `terminate_child` resets, cross-scheduler calls, and `MAX_COOPERATIVE_CALL_DEPTH`.
+
+---
+
 ## [1.1.1] - 2026-11-16
 
 ### Fixed
@@ -64,7 +76,8 @@ Initial pre-OTP release of **Sleipnir** (`package actor`) at commit [`90d94f5`](
 ### Fixed
 - Prevented lost worker wakeups and false-empty MPSC runqueue observations in `scheduler_worker_proc` (`90d94f5`).
 
-[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/boxxxie/sleipnir/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/boxxxie/sleipnir/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/boxxxie/sleipnir/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/boxxxie/sleipnir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/boxxxie/sleipnir/releases/tag/v1.0.0
