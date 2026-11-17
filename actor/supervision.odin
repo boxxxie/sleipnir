@@ -407,35 +407,49 @@ Registry_Cleanup_Hook :: struct {
 }
 
 @(private)
+Deferred_Sup_Op :: enum u8 {
+	None             = 0,
+	Restart_Child    = 1,
+	Finalize_Stopped = 2,
+	Drain_Faulted    = 3,
+}
+
+@(private)
 Actor_Extension :: struct {
-	allocator:         mem.Allocator,
-	is_supervised:     bool,
-	sup:               ^Supervisor,
-	child_id:          u64,
-	state_offset:      uintptr,
-	state_size:        int,
-	init_state_copy:   rawptr,
-	use_arena:         bool,
-	keep_mailbox:      bool,
-	arena_initialized: bool,
-	arena:             vmem.Arena,
-	arena_alloc:       mem.Allocator,
-	user_on_reinit:    rawptr,
-	user_on_stop:      rawptr,
-	reinit_proc:       proc(base: ^Actor_Base, fn_ptr: rawptr, arena_alloc: mem.Allocator),
-	stop_proc:         proc(base: ^Actor_Base, fn_ptr: rawptr, reason: Exit_Reason),
-	drain_proc:        proc(base: ^Actor_Base),
-	has_messages_proc: proc(base: ^Actor_Base) -> bool,
-	calling_target:    ^Actor_Base,
-	monitors_mu:       sync.Mutex,
-	monitors:          [dynamic]Monitor_Link,
-	next_monitor_id:   u64,
-	finalized:         u32,
-	stopped_drained:   u32,
-	last_exit_reason:  Exit_Reason,
-	last_fault:        Fault_Info,
-	reg_hooks:         [dynamic]Registry_Cleanup_Hook,
-	sup_internal:      ^Supervisor_Internal,
+	allocator:             mem.Allocator,
+	is_supervised:         bool,
+	sup:                   ^Supervisor,
+	child_id:              u64,
+	state_offset:          uintptr,
+	state_size:            int,
+	init_state_copy:       rawptr,
+	use_arena:             bool,
+	keep_mailbox:          bool,
+	arena_initialized:     bool,
+	arena:                 vmem.Arena,
+	arena_alloc:           mem.Allocator,
+	user_on_reinit:        rawptr,
+	user_on_stop:          rawptr,
+	reinit_proc:           proc(base: ^Actor_Base, fn_ptr: rawptr, arena_alloc: mem.Allocator),
+	stop_proc:             proc(base: ^Actor_Base, fn_ptr: rawptr, reason: Exit_Reason),
+	drain_proc:            proc(base: ^Actor_Base),
+	has_messages_proc:     proc(base: ^Actor_Base) -> bool,
+	monitors_mu:           sync.Mutex,
+	monitors:              [dynamic]Monitor_Link,
+	next_monitor_id:       u64,
+	finalized:             u32,
+	stopped_drained:       u32,
+	last_exit_reason:      Exit_Reason,
+	last_fault:            Fault_Info,
+	reg_hooks:             [dynamic]Registry_Cleanup_Hook,
+	sup_internal:          ^Supervisor_Internal,
+	deferred_op:           Deferred_Sup_Op,
+	deferred_sup:          ^Supervisor,
+	deferred_child_id:     u64,
+	deferred_reason:       Exit_Reason,
+	deferred_fault:        Fault_Info,
+	deferred_prev_running: bool,
+	deferred_free_res:     bool,
 }
 
 @(private)
@@ -543,54 +557,130 @@ actor_drain_stopped_target :: proc(base: ^Actor_Base, wait_if_busy: bool = true)
 	if base == nil {
 		return
 	}
+	is_self_step := tls_is_actor_in_step_on_current_thread(base)
 	ext := get_actor_ext(base)
 	if ext == nil {
+		if base.drain_proc == nil {
+			return
+		}
+		if !is_self_step {
+			for {
+				if intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) == 0 {
+					_, cas_ok := intrinsics.atomic_compare_exchange_strong_explicit(&base.in_step, 0, 1, .Seq_Cst, .Seq_Cst)
+					if cas_ok {
+						break
+					}
+				}
+				if !wait_if_busy {
+					return
+				}
+				intrinsics.cpu_relax()
+			}
+			defer intrinsics.atomic_store_explicit(&base.in_step, 0, .Seq_Cst)
+			base.drain_proc(base)
+		} else {
+			base.drain_proc(base)
+		}
 		return
 	}
-	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == base
 	if wait_if_busy && !is_self_step {
 		for intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
-		for intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 &&
-		    intrinsics.atomic_load_explicit(&ext.stopped_drained, .Acquire) == 0 {
+		for intrinsics.atomic_load_explicit(&ext.finalized, .Seq_Cst) != 0 &&
+		    intrinsics.atomic_load_explicit(&ext.stopped_drained, .Seq_Cst) == 0 {
 			intrinsics.cpu_relax()
 		}
+	} else if !is_self_step && intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
+		return
 	}
 	if intrinsics.atomic_load_explicit(&ext.stopped_drained, .Seq_Cst) == 0 {
-		// `finalize_actor_stopped` has not drained this target yet and will drain all
-		// already-pushed envelopes once the target exits its active turn.
+		if intrinsics.atomic_load_explicit(&ext.finalized, .Seq_Cst) != 0 {
+			// `finalize_actor_stopped` has not drained this target yet and will drain all
+			// already-pushed envelopes once the target exits its active turn.
+			return
+		}
+		// Unfinalized stopped actor with an `Actor_Extension` (e.g. from `monitor` or `try_call`):
+		// serialize drain under `monitors_mu` once `in_step == 0`.
+		sync.mutex_lock(&ext.monitors_mu)
+		if ext.drain_proc != nil {
+			ext.drain_proc(base)
+		} else if base.drain_proc != nil {
+			base.drain_proc(base)
+		}
+		sync.mutex_unlock(&ext.monitors_mu)
 		return
 	}
 	sync.mutex_lock(&ext.monitors_mu)
 	if ext.drain_proc != nil {
 		ext.drain_proc(base)
+	} else if base.drain_proc != nil {
+		base.drain_proc(base)
 	}
 	sync.mutex_unlock(&ext.monitors_mu)
 }
 
 @(private)
-finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fault_Info) {
+actor_drain_non_running_call_target :: proc(base: ^Actor_Base) {
+	if base == nil {
+		return
+	}
+	st := intrinsics.atomic_load_explicit(&base.status, .Seq_Cst)
+	if st == u32(Actor_Status.Running) {
+		return
+	}
+	if st == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(base, true)
+		return
+	}
+	ext := get_actor_ext(base)
+	if ext == nil {
+		actor_drain_stopped_target(base, true)
+		return
+	}
+	if ext.keep_mailbox {
+		return
+	}
+	if !tls_is_actor_in_step_on_current_thread(base) {
+		for intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
+			intrinsics.cpu_relax()
+		}
+	}
+	sync.mutex_lock(&ext.monitors_mu)
+	if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) && !ext.keep_mailbox {
+		if ext.drain_proc != nil {
+			ext.drain_proc(base)
+		} else if base.drain_proc != nil {
+			base.drain_proc(base)
+		}
+	}
+	sync.mutex_unlock(&ext.monitors_mu)
+}
+
+@(private)
+finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fault_Info, skip_in_step_wait: bool = false) {
 	if base == nil {
 		return
 	}
 	ext := ensure_actor_ext(base)
 
 	sync.mutex_lock(&ext.monitors_mu)
-	if intrinsics.atomic_load_explicit(&ext.finalized, .Acquire) != 0 {
+	if intrinsics.atomic_load_explicit(&ext.finalized, .Seq_Cst) != 0 {
 		if ext.drain_proc != nil {
 			ext.drain_proc(base)
+		} else if base.drain_proc != nil {
+			base.drain_proc(base)
 		}
 		sync.mutex_unlock(&ext.monitors_mu)
 		return
 	}
-	intrinsics.atomic_store_explicit(&ext.finalized, 1, .Release)
+	intrinsics.atomic_store_explicit(&ext.finalized, 1, .Seq_Cst)
 	ext.last_exit_reason = reason
 	ext.last_fault       = fault
 	intrinsics.atomic_store_explicit(&base.status, u32(Actor_Status.Stopped), .Seq_Cst)
 	sync.mutex_unlock(&ext.monitors_mu)
 
-	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == base
+	is_self_step := skip_in_step_wait || tls_is_current_actor(base)
 	if !is_self_step {
 		for intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
@@ -603,6 +693,8 @@ finalize_actor_stopped :: proc(base: ^Actor_Base, reason: Exit_Reason, fault: Fa
 	intrinsics.atomic_store_explicit(&ext.stopped_drained, 1, .Seq_Cst)
 	if ext.drain_proc != nil {
 		ext.drain_proc(base)
+	} else if base.drain_proc != nil {
+		base.drain_proc(base)
 	}
 	local_mons  := ext.monitors
 	local_hooks := ext.reg_hooks
@@ -813,25 +905,15 @@ try_call_would_deadlock :: proc(s: ^Scheduler, caller_ctx: ^Context, target_base
 	if caller == target_base {
 		return true
 	}
-	if caller_ctx.sched == s && s != nil && s.num_workers == 1 && intrinsics.atomic_load_explicit(&target_base.in_step, .Seq_Cst) != 0 {
-		return true
-	}
-	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
-		return true
-	}
-	cur := target_base
-	for steps := 0; cur != nil && steps < MAX_COOPERATIVE_CALL_DEPTH; steps += 1 {
-		ext := get_actor_ext(cur)
-		if ext == nil {
-			break
-		}
-		nxt := intrinsics.atomic_load_explicit(&ext.calling_target, .Acquire)
-		if nxt == caller {
+	if caller_ctx.sched == s && s != nil {
+		if tls_is_actor_in_step_on_current_thread(target_base) || (s.num_workers == 1 && intrinsics.atomic_load_explicit(&target_base.in_step, .Seq_Cst) != 0) {
 			return true
 		}
-		cur = nxt
+		if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+			return true
+		}
 	}
-	return false
+	return actor_call_chain_has_cycle(caller, target_base)
 }
 
 @(require_results)
@@ -845,8 +927,11 @@ try_call_sched_pid :: proc(
 		return {}, .Target_Stopped
 	}
 	target_base := &target.ref.base
-	if intrinsics.atomic_load_explicit(&target_base.status, .Acquire) == u32(Actor_Status.Stopped) {
-		return {}, .Target_Stopped
+	if st := intrinsics.atomic_load_explicit(&target_base.status, .Acquire); st != u32(Actor_Status.Running) {
+		if st == u32(Actor_Status.Stopped) {
+			return {}, .Target_Stopped
+		}
+		return {}, .Call_Target_Crashed
 	}
 	if target.generation != 0 && intrinsics.atomic_load_explicit(&target_base.generation, .Acquire) != target.generation {
 		return {}, .Stale_Generation
@@ -858,7 +943,27 @@ try_call_sched_pid :: proc(
 	}
 
 	caller_ctx := _tls_active_ctx
-	if try_call_would_deadlock(eff_sched, caller_ctx, target_base) {
+	caller_actor: ^Actor_Base
+	if caller_ctx != nil && caller_ctx.current_actor != nil {
+		caller_actor = caller_ctx.current_actor
+		if caller_actor == target_base {
+			return {}, .Deadlock_Detected
+		}
+		if caller_ctx.sched == eff_sched {
+			if tls_is_actor_in_step_on_current_thread(target_base) || (eff_sched.num_workers == 1 && intrinsics.atomic_load_explicit(&target_base.in_step, .Seq_Cst) != 0) {
+				return {}, .Deadlock_Detected
+			}
+			if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+				return {}, .Deadlock_Detected
+			}
+		}
+		intrinsics.atomic_store_explicit(&caller_actor.calling_target, target_base, .Seq_Cst)
+	}
+	defer if caller_actor != nil {
+		intrinsics.atomic_store_explicit(&caller_actor.calling_target, nil, .Seq_Cst)
+	}
+
+	if caller_actor != nil && actor_call_chain_has_cycle(caller_actor, target_base) {
 		return {}, .Deadlock_Detected
 	}
 
@@ -872,11 +977,14 @@ try_call_sched_pid :: proc(
 	env.msg = msg
 
 	// Double-check lifecycle before pushing into the mailbox.
-	if intrinsics.atomic_load_explicit(&target_base.status, .Acquire) == u32(Actor_Status.Stopped) {
+	if st := intrinsics.atomic_load_explicit(&target_base.status, .Acquire); st != u32(Actor_Status.Running) {
 		env.reply_slot = nil
 		env.flags &~= ENVELOPE_FLAG_CALL
 		actor_recycle_single_envelope(target.ref, env)
-		return {}, .Target_Stopped
+		if st == u32(Actor_Status.Stopped) {
+			return {}, .Target_Stopped
+		}
+		return {}, .Call_Target_Crashed
 	}
 	if target.generation != 0 && intrinsics.atomic_load_explicit(&target_base.generation, .Acquire) != target.generation {
 		env.reply_slot = nil
@@ -885,26 +993,34 @@ try_call_sched_pid :: proc(
 		return {}, .Stale_Generation
 	}
 
-	var_caller_ext: ^Actor_Extension
-	if caller_ctx != nil && caller_ctx.current_actor != nil {
-		var_caller_ext = ensure_actor_ext(caller_ctx.current_actor)
-		if var_caller_ext != nil {
-			intrinsics.atomic_store_explicit(&var_caller_ext.calling_target, target_base, .Release)
-		}
+	if caller_actor != nil {
+		intrinsics.atomic_store_explicit(&caller_actor.active_call_slot, rawptr(&slot), .Release)
 	}
-	defer if var_caller_ext != nil {
-		intrinsics.atomic_store_explicit(&var_caller_ext.calling_target, nil, .Release)
+	defer if caller_actor != nil {
+		intrinsics.atomic_store_explicit(&caller_actor.active_call_slot, nil, .Release)
 	}
 
+	// Disarm supervision `Trap_Frame` once `&slot` is queued so `longjmp` cannot
+	// unwind past a stack-allocated `Call_Slot` or bypass `calling_target` cleanup.
+	saved_call_trap := _tls_trap_frame
+	_tls_trap_frame = nil
+	defer _tls_trap_frame = saved_call_trap
+
 	mpsc_push(&target.ref.mailbox, env)
-	scheduler_schedule_actor(eff_sched, target_base, hint)
+	if caller_ctx != nil && caller_ctx.sched == eff_sched {
+		if scheduler_try_claim_and_step_cooperative(eff_sched, caller_ctx, target_base, allow_scheduled = true) != .Stepped {
+			scheduler_schedule_actor(eff_sched, target_base, hint)
+		}
+	} else {
+		scheduler_schedule_actor(eff_sched, target_base, hint)
+	}
 
 	if intrinsics.atomic_load_explicit(&target_base.status, .Seq_Cst) == u32(Actor_Status.Stopped) &&
 	   intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) < CALL_STATE_REPLIED {
-		actor_drain_stopped_target(target_base, caller_ctx == nil)
+		actor_drain_stopped_target(target_base, true)
 	}
 
-	final_state := wait_for_call_slot(eff_sched, &slot, caller_ctx)
+	final_state := wait_for_call_slot(eff_sched, &slot, caller_ctx, target_base)
 	if final_state == CALL_STATE_REPLIED {
 		return slot.result, .None
 	}
@@ -1200,11 +1316,146 @@ run_trapped_reinit_hook :: #force_no_inline proc(ext: ^Actor_Extension, base: ^A
 }
 
 @(private)
-prepare_child_reset_unlocked :: proc(c: ^Actor_Base) {
+fail_suspended_caller_for_supervision :: #force_inline proc(c: ^Actor_Base) {
 	if c == nil {
 		return
 	}
-	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == c
+	if slot := intrinsics.atomic_load_explicit(&c.active_call_slot, .Acquire); slot != nil {
+		complete_call_slot(slot, CALL_STATE_FAULTED)
+	}
+}
+
+@(private)
+defer_suspended_caller_supervision :: proc(
+	c: ^Actor_Base,
+	op: Deferred_Sup_Op,
+	reason: Exit_Reason,
+	fault: Fault_Info,
+	prev_running: bool,
+	free_res: bool,
+	sup: ^Supervisor = nil,
+	child_id: u64 = 0,
+) {
+	fail_suspended_caller_for_supervision(c)
+	cext := ensure_actor_ext(c)
+	if cext == nil {
+		return
+	}
+	cext.deferred_op           = op
+	cext.deferred_sup          = sup
+	cext.deferred_child_id     = child_id
+	cext.deferred_reason       = reason
+	cext.deferred_fault        = fault
+	cext.deferred_prev_running = prev_running
+	cext.deferred_free_res     = free_res
+}
+
+@(private)
+execute_deferred_supervision_action :: proc(base: ^Actor_Base) {
+	ext := get_actor_ext(base)
+	if ext == nil || ext.deferred_op == .None {
+		return
+	}
+	op           := ext.deferred_op
+	sup          := ext.deferred_sup
+	cid          := ext.deferred_child_id
+	reason       := ext.deferred_reason
+	fault        := ext.deferred_fault
+	prev_running := ext.deferred_prev_running
+	free_res     := ext.deferred_free_res
+
+	ext.deferred_op           = .None
+	ext.deferred_sup          = nil
+	ext.deferred_child_id     = 0
+	ext.deferred_reason       = .Normal
+	ext.deferred_fault        = {}
+	ext.deferred_prev_running = false
+	ext.deferred_free_res     = false
+
+	switch op {
+	case .None:
+		return
+	case .Finalize_Stopped:
+		if prev_running {
+			run_trapped_stop_hook(ext, base, reason)
+		}
+		finalize_actor_stopped(base, reason, fault, skip_in_step_wait = true)
+		if free_res {
+			free_actor_reset_resources(ext)
+		}
+	case .Drain_Faulted:
+		if prev_running {
+			run_trapped_stop_hook(ext, base, reason)
+		}
+		if !ext.keep_mailbox {
+			sync.mutex_lock(&ext.monitors_mu)
+			if ext.drain_proc != nil {
+				ext.drain_proc(base)
+			} else if base.drain_proc != nil {
+				base.drain_proc(base)
+			}
+			sync.mutex_unlock(&ext.monitors_mu)
+		}
+		if ext.use_arena && ext.arena_initialized {
+			vmem.arena_free_all(&ext.arena)
+		}
+	case .Restart_Child:
+		if prev_running {
+			run_trapped_stop_hook(ext, base, reason)
+		}
+		prepare_child_reset_unlocked(base, skip_in_step_wait = true)
+		if sup != nil {
+			si := get_sup_internal(sup)
+			if si != nil {
+				sync.mutex_lock(&si.mu)
+				if intrinsics.atomic_load_explicit(&si.sup_state, .Acquire) != SUP_RUNNING {
+					sync.mutex_unlock(&si.mu)
+					return
+				}
+				c_idx := -1
+				for e, i in si.children {
+					if e.id == cid {
+						c_idx = i
+						break
+					}
+				}
+				if c_idx < 0 || si.children[c_idx].admin_stopped || si.children[c_idx].policy == .Temporary {
+					sync.mutex_unlock(&si.mu)
+					return
+				}
+				c_entry := &si.children[c_idx]
+				new_gen := intrinsics.atomic_add_explicit(&base.generation, 1, .Acq_Rel) + 1
+				c_entry.expected_gen = new_gen
+				c_entry.restarts += 1
+				sup.state.stats.children_restarted += 1
+				sup.state.stats.total_restarts += 1
+				sync.mutex_unlock(&si.mu)
+
+				ok, rfault := run_trapped_reinit_hook(ext, base)
+				if !ok {
+					s := resolve_target_scheduler(nil, &sup.ref)
+					if s != nil {
+						send_sched_auto(s, sup, Supervisor_Msg(Child_Down{
+							child_id   = cid,
+							generation = new_gen,
+							reason     = .Panic,
+							fault      = rfault,
+						}))
+					}
+					return
+				}
+			}
+		}
+		activate_restarted_child(base)
+	}
+}
+
+@(private)
+prepare_child_reset_unlocked :: proc(c: ^Actor_Base, skip_in_step_wait: bool = false) {
+	if c == nil {
+		return
+	}
+	is_self_step := skip_in_step_wait || tls_is_current_actor(c)
 	if !is_self_step {
 		for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
@@ -1214,10 +1465,14 @@ prepare_child_reset_unlocked :: proc(c: ^Actor_Base) {
 	cext := get_actor_ext(c)
 	if cext != nil {
 		sync.mutex_lock(&cext.monitors_mu)
-		intrinsics.atomic_store_explicit(&cext.finalized, 0, .Release)
-		intrinsics.atomic_store_explicit(&cext.stopped_drained, 0, .Release)
-		if !cext.keep_mailbox && cext.drain_proc != nil {
-			cext.drain_proc(c)
+		intrinsics.atomic_store_explicit(&cext.finalized, 0, .Seq_Cst)
+		intrinsics.atomic_store_explicit(&cext.stopped_drained, 0, .Seq_Cst)
+		if !cext.keep_mailbox {
+			if cext.drain_proc != nil {
+				cext.drain_proc(c)
+			} else if c.drain_proc != nil {
+				c.drain_proc(c)
+			}
 		}
 		sync.mutex_unlock(&cext.monitors_mu)
 		if cext.use_arena && cext.arena_initialized {
@@ -1232,8 +1487,17 @@ prepare_child_reset_unlocked :: proc(c: ^Actor_Base) {
 
 @(private)
 activate_restarted_child :: proc(c: ^Actor_Base) {
-	intrinsics.atomic_store_explicit(&c.status, u32(Actor_Status.Running), .Seq_Cst)
 	cext := get_actor_ext(c)
+	if cext != nil && !cext.keep_mailbox {
+		sync.mutex_lock(&cext.monitors_mu)
+		if cext.drain_proc != nil {
+			cext.drain_proc(c)
+		} else if c.drain_proc != nil {
+			c.drain_proc(c)
+		}
+		sync.mutex_unlock(&cext.monitors_mu)
+	}
+	intrinsics.atomic_store_explicit(&c.status, u32(Actor_Status.Running), .Seq_Cst)
 	if cext != nil && cext.has_messages_proc != nil && cext.has_messages_proc(c) {
 		s := c.reg_sched
 		if s != nil {
@@ -1258,8 +1522,19 @@ stop_live_child_for_restart_unlocked :: proc(c: ^Actor_Base, policy: Restart_Pol
 	}
 	target_status := u32(Actor_Status.Stopped) if policy == .Temporary else u32(Actor_Status.Faulted)
 	prev := intrinsics.atomic_exchange_explicit(&c.status, target_status, .Seq_Cst)
-	is_self_step := _tls_active_ctx != nil && _tls_active_ctx.current_actor == c
-	if !is_self_step {
+	if tls_is_suspended_caller(c) {
+		op: Deferred_Sup_Op = .Finalize_Stopped if policy == .Temporary else .Restart_Child
+		defer_suspended_caller_supervision(
+			c,
+			op,
+			.Supervisor_Shutdown,
+			{},
+			prev == u32(Actor_Status.Running),
+			free_res = (policy == .Temporary),
+		)
+		return
+	}
+	if !tls_is_current_actor(c) {
 		for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 			intrinsics.cpu_relax()
 		}
@@ -1342,7 +1617,9 @@ stop_supervisor_subtree_iterative :: proc(
 		} else if cur != root {
 			intrinsics.atomic_store_explicit(&cur.base.status, u32(Actor_Status.Faulted), .Seq_Cst)
 		}
-		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != &cur.base {
+		if tls_is_suspended_caller(&cur.base) {
+			fail_suspended_caller_for_supervision(&cur.base)
+		} else if !tls_is_current_actor(&cur.base) {
 			for intrinsics.atomic_load_explicit(&cur.base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
@@ -1383,7 +1660,9 @@ stop_supervisor_subtree_iterative :: proc(
 				// Clean temporary bystanders from inner supervisors if melting down under parent
 				for i := len(tsi.children) - 1; i >= 0; i -= 1 {
 					if tsi.children[i].policy == .Temporary {
-						free_actor_reset_resources(get_actor_ext(tsi.children[i].base))
+						if !tls_is_suspended_caller(tsi.children[i].base) {
+							free_actor_reset_resources(get_actor_ext(tsi.children[i].base))
+						}
 						ordered_remove(&tsi.children, i)
 					}
 				}
@@ -1395,7 +1674,19 @@ stop_supervisor_subtree_iterative :: proc(
 					intrinsics.atomic_store_explicit(&tsi.sup_state, SUP_STOPPED, .Seq_Cst)
 				}
 				sup_reason := Exit_Reason.Escalated if (done_sup == root && crashed_root_child_idx >= 0) else reason
-				finalize_actor_stopped(&done_sup.base, sup_reason, crash_fault if done_sup == root else {})
+				sup_fault := crash_fault if done_sup == root else Fault_Info{}
+				if tls_is_suspended_caller(&done_sup.base) {
+					defer_suspended_caller_supervision(
+						&done_sup.base,
+						.Finalize_Stopped,
+						sup_reason,
+						sup_fault,
+						false,
+						free_res = false,
+					)
+				} else {
+					finalize_actor_stopped(&done_sup.base, sup_reason, sup_fault)
+				}
 			}
 			continue
 		}
@@ -1427,14 +1718,39 @@ stop_supervisor_subtree_iterative :: proc(
 		}
 		target_status := u32(Actor_Status.Stopped) if (cur_perm || mark_stopped || entry.policy == .Temporary) else u32(Actor_Status.Faulted)
 		prev := intrinsics.atomic_exchange_explicit(&c.status, target_status, .Seq_Cst)
-		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != c {
+		is_crashed_child := (top.sup == root && idx == crashed_root_child_idx)
+		prev_running := !is_crashed_child && prev == u32(Actor_Status.Running) && !entry.admin_stopped
+		if tls_is_suspended_caller(c) {
+			if cur_perm || mark_stopped || entry.policy == .Temporary {
+				eff_reason := reason if !is_crashed_child else crash_fault.reason
+				eff_fault  := crash_fault if is_crashed_child else Fault_Info{}
+				defer_suspended_caller_supervision(
+					c,
+					.Finalize_Stopped,
+					eff_reason,
+					eff_fault,
+					prev_running,
+					free_res = (cur_perm || entry.policy == .Temporary),
+				)
+			} else {
+				defer_suspended_caller_supervision(
+					c,
+					.Drain_Faulted,
+					reason,
+					{},
+					prev_running,
+					free_res = false,
+				)
+			}
+			continue
+		}
+		if !tls_is_current_actor(c) {
 			for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
 		}
 		cext := get_actor_ext(c)
-		is_crashed_child := (top.sup == root && idx == crashed_root_child_idx)
-		if !is_crashed_child && prev == u32(Actor_Status.Running) && !entry.admin_stopped {
+		if prev_running {
 			run_trapped_stop_hook(cext, c, reason)
 		}
 		if cur_perm || mark_stopped || entry.policy == .Temporary {
@@ -1781,6 +2097,13 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 				continue
 			}
 			c_base := c_entry.base
+			if tls_is_suspended_caller(c_base) {
+				if cext := get_actor_ext(c_base); cext != nil && cext.deferred_op == .Restart_Child {
+					cext.deferred_sup      = sup
+					cext.deferred_child_id = cid
+				}
+				continue
+			}
 			sync.mutex_unlock(&si.mu)
 
 			prepare_child_reset_unlocked(c_base)
@@ -1839,9 +2162,11 @@ supervisor_handle_down :: proc(sup: ^Supervisor, down: Child_Down) {
 					continue
 				}
 				if si.children[i].policy == .Temporary {
-					free_actor_reset_resources(get_actor_ext(si.children[i].base))
+					if !tls_is_suspended_caller(si.children[i].base) {
+						free_actor_reset_resources(get_actor_ext(si.children[i].base))
+					}
 					ordered_remove(&si.children, i)
-				} else if !si.children[i].admin_stopped {
+				} else if !si.children[i].admin_stopped && !tls_is_suspended_caller(si.children[i].base) {
 					append(&reinit_bases, si.children[i].base)
 				}
 				break
@@ -2242,16 +2567,27 @@ supervisor_terminate_child :: proc(sup: ^Supervisor, child_id: u64) -> Superviso
 			)
 		} else if c != nil {
 			prev := intrinsics.atomic_exchange_explicit(&c.status, u32(Actor_Status.Stopped), .Seq_Cst)
-			if _tls_active_ctx == nil || _tls_active_ctx.current_actor != c {
-				for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
-					intrinsics.cpu_relax()
+			if tls_is_suspended_caller(c) {
+				defer_suspended_caller_supervision(
+					c,
+					.Finalize_Stopped,
+					.Supervisor_Shutdown,
+					{},
+					prev == u32(Actor_Status.Running),
+					free_res = (policy == .Temporary),
+				)
+			} else {
+				if !tls_is_current_actor(c) {
+					for intrinsics.atomic_load_explicit(&c.in_step, .Seq_Cst) != 0 {
+						intrinsics.cpu_relax()
+					}
 				}
+				cext := get_actor_ext(c)
+				if prev == u32(Actor_Status.Running) {
+					run_trapped_stop_hook(cext, c, .Supervisor_Shutdown)
+				}
+				finalize_actor_stopped(c, .Supervisor_Shutdown, {})
 			}
-			cext := get_actor_ext(c)
-			if prev == u32(Actor_Status.Running) {
-				run_trapped_stop_hook(cext, c, .Supervisor_Shutdown)
-			}
-			finalize_actor_stopped(c, .Supervisor_Shutdown, {})
 		}
 
 		sync.mutex_lock(&si.mu)
@@ -2265,7 +2601,9 @@ supervisor_terminate_child :: proc(sup: ^Supervisor, child_id: u64) -> Superviso
 	}
 
 	if idx >= 0 && si.children[idx].policy == .Temporary {
-		free_subtree_reset_resources(si.children[idx].base, sup.allocator)
+		if !tls_is_suspended_caller(si.children[idx].base) {
+			free_subtree_reset_resources(si.children[idx].base, sup.allocator)
+		}
 		ordered_remove(&si.children, idx)
 	}
 	sync.mutex_unlock(&si.mu)
@@ -2301,7 +2639,7 @@ supervisor_restart_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_
 
 	entry := &si.children[idx]
 	cur_status := intrinsics.atomic_load_explicit(&entry.base.status, .Acquire)
-	if !entry.admin_stopped && cur_status != u32(Actor_Status.Stopped) {
+	if (!entry.admin_stopped && cur_status != u32(Actor_Status.Stopped)) || tls_is_suspended_caller(entry.base) {
 		sync.mutex_unlock(&si.mu)
 		return .Child_Still_Running
 	}
@@ -2350,8 +2688,8 @@ supervisor_restart_child :: proc(sup: ^Supervisor, child_id: u64) -> Supervisor_
 	if !ok {
 		if cext != nil && was_admin_stopped {
 			sync.mutex_lock(&cext.monitors_mu)
-			intrinsics.atomic_store_explicit(&cext.finalized, prev_finalized, .Release)
-			intrinsics.atomic_store_explicit(&cext.stopped_drained, prev_stopped_drained, .Release)
+			intrinsics.atomic_store_explicit(&cext.finalized, prev_finalized, .Seq_Cst)
+			intrinsics.atomic_store_explicit(&cext.stopped_drained, prev_stopped_drained, .Seq_Cst)
 			sync.mutex_unlock(&cext.monitors_mu)
 		}
 		return .Supervisor_Stopping
@@ -2460,6 +2798,9 @@ actor_base_destroy_sched :: proc(s: ^Scheduler, base: ^Actor_Base) {
 	if base == nil {
 		return
 	}
+	if tls_is_suspended_caller(base) {
+		panic("actor_base_destroy called on suspended caller in active cooperative call stack")
+	}
 	if ext := get_actor_ext(base); ext != nil {
 		if ext.sup_internal != nil {
 			if intrinsics.atomic_load_explicit(&ext.sup_internal.sup_state, .Acquire) != SUP_STOPPED {
@@ -2476,8 +2817,8 @@ actor_base_destroy_sched :: proc(s: ^Scheduler, base: ^Actor_Base) {
 
 	eff_s := s if s != nil else base.reg_sched
 	if eff_s != nil && eff_s.started && intrinsics.atomic_load_explicit(&eff_s.running, .Acquire) {
-		if _tls_active_ctx == nil || _tls_active_ctx.current_actor != base {
-			for intrinsics.atomic_load_explicit(&base.scheduled, .Acquire) != 0 ||
+		if !tls_is_current_actor(base) {
+			for intrinsics.atomic_load_explicit(&base.scheduled, .Seq_Cst) != 0 ||
 			    intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}

@@ -48,6 +48,9 @@ world_init :: proc(
 	w.reinit_trace      = make([dynamic]string, 0, 16)
 	w.abort_hook_log    = make([dynamic]int, 0, 8)
 	w.evicted_orgs      = make([dynamic]u64, 0, 8)
+	w.caller_groups     = make(map[string][]^Multi_Caller_Actor, 4)
+	w.multi_callers     = make(map[string]^Multi_Caller_Actor, 8)
+	w.caller_barriers   = make([dynamic]^sync.Barrier, 0, 4)
 }
 
 world_destroy :: proc(w: ^Supervision_World) {
@@ -59,6 +62,15 @@ world_destroy :: proc(w: ^Supervision_World) {
 	}
 	actor.destroy(&w.sched)
 
+	for b in w.caller_barriers {
+		free(b)
+	}
+	delete(w.caller_barriers)
+	for _, grp in w.caller_groups {
+		delete(grp)
+	}
+	delete(w.caller_groups)
+	delete(w.multi_callers)
 	for pool_slice in w.tiny_pools {
 		for i := 0; i < len(pool_slice); i += 1 {
 			actor.destroy(&pool_slice[i])
@@ -130,13 +142,14 @@ given_supervised_worker :: proc(
 	under: string,
 	policy: actor.Restart_Policy,
 	committed: i64,
+	use_arena: bool = true,
 	loc := #caller_location,
 ) {
 	sup, ok := w.supervisors[under]
 	if !testing.expectf(w.t, ok, "unknown supervisor %q", under, loc = loc) {
 		return
 	}
-	wk, cid, err := driver_spawn_supervised_worker(w, sup, label, policy, committed, 0, nil)
+	wk, cid, err := driver_spawn_supervised_worker(w, sup, label, policy, committed, 0, nil, use_arena = use_arena)
 	w.workers[label] = wk
 	w.worker_ids[label] = cid
 	w.last_sup_err = err
@@ -545,6 +558,7 @@ shows_value :: proc(
 	loc := #caller_location,
 ) {
 	val, err := actor.try_call(&w.sched, worker, Test_Worker_Msg(Worker_Read{}), i64)
+	actor.wait_idle(&w.sched)
 	testing.expect_value(w.t, err, actor.Call_Error.None, loc = loc)
 	testing.expect_value(w.t, val, expected, loc = loc)
 }
@@ -845,4 +859,226 @@ then_which_children_excludes :: proc(
 then_no_leaks :: proc(w: ^Supervision_World, loc := #caller_location) {
 	_ = intrinsics.atomic_load_explicit(&w.clock_ns, .Relaxed)
 	testing.expect(w.t, w.sched.active_actors == 0, loc = loc)
+}
+
+given_supervised_caller :: proc(
+	w: ^Supervision_World,
+	label: string,
+	under: string,
+	policy: actor.Restart_Policy = .Permanent,
+	use_arena: bool = true,
+	loc := #caller_location,
+) {
+	sup, ok := w.supervisors[under]
+	if !testing.expectf(w.t, ok, "unknown supervisor %q", under, loc = loc) {
+		return
+	}
+	c, sup_err := driver_spawn_supervised_caller(w, sup, policy, use_arena)
+	testing.expect_value(w.t, sup_err, actor.Supervisor_Error.None, loc = loc)
+	w.multi_callers[label] = c
+}
+
+given_supervised_callers :: proc(
+	w: ^Supervision_World,
+	group_label: string,
+	under: string,
+	count: int,
+	policy: actor.Restart_Policy = .Permanent,
+	use_arena: bool = true,
+	loc := #caller_location,
+) {
+	sup, ok := w.supervisors[under]
+	if !testing.expectf(w.t, ok, "unknown supervisor %q", under, loc = loc) {
+		return
+	}
+	grp := make([]^Multi_Caller_Actor, count)
+	for idx in 0 ..< count {
+		c, sup_err := driver_spawn_supervised_caller(w, sup, policy, use_arena, u32(idx + 1))
+		testing.expect_value(w.t, sup_err, actor.Supervisor_Error.None, loc = loc)
+		grp[idx] = c
+	}
+	w.caller_groups[group_label] = grp
+}
+
+upon_concurrent_try_calls :: proc(
+	w: ^Supervision_World,
+	callers: string,
+	to: string,
+	per_caller: int,
+	loc := #caller_location,
+) {
+	grp, grp_ok := w.caller_groups[callers]
+	if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+		return
+	}
+	svc, svc_ok := w.workers[to]
+	if !testing.expectf(w.t, svc_ok, "unknown service worker %q", to, loc = loc) {
+		return
+	}
+	driver_send_concurrent_try_calls(w, grp, svc, per_caller)
+}
+
+then_caller_group_turns_succeeded :: proc(
+	w: ^Supervision_World,
+	callers: string,
+	expected_hits: int,
+	loc := #caller_location,
+) {
+	grp, grp_ok := w.caller_groups[callers]
+	if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+		return
+	}
+	for c in grp {
+		testing.expect(w.t, c.state.all_ok, loc = loc)
+		testing.expect_value(w.t, c.state.normal_hits, expected_hits, loc = loc)
+	}
+}
+
+upon_crashing_try_call :: proc(
+	w: ^Supervision_World,
+	callers: string = "",
+	caller_idx: int = 0,
+	caller_label: string = "",
+	to: string,
+	value: i64,
+	loc := #caller_location,
+) {
+	svc, svc_ok := w.workers[to]
+	if !testing.expectf(w.t, svc_ok, "unknown service worker %q", to, loc = loc) {
+		return
+	}
+	target_caller: ^Multi_Caller_Actor
+	if len(caller_label) > 0 {
+		c, ok := w.multi_callers[caller_label]
+		if !testing.expectf(w.t, ok, "unknown caller %q", caller_label, loc = loc) {
+			return
+		}
+		target_caller = c
+	} else {
+		grp, grp_ok := w.caller_groups[callers]
+		if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+			return
+		}
+		if !testing.expectf(w.t, caller_idx >= 0 && caller_idx < len(grp), "caller_idx %d out of range", caller_idx, loc = loc) {
+			return
+		}
+		target_caller = grp[caller_idx]
+	}
+	driver_send_crashing_try_call(w, target_caller, svc, value)
+}
+
+then_caller_crash_isolation_succeeded :: proc(
+	w: ^Supervision_World,
+	callers: string = "",
+	caller_idx: int = 0,
+	caller_label: string = "",
+	expected_err: actor.Call_Error = .Call_Target_Crashed,
+	loc := #caller_location,
+) {
+	target_caller: ^Multi_Caller_Actor
+	if len(caller_label) > 0 {
+		c, ok := w.multi_callers[caller_label]
+		if !testing.expectf(w.t, ok, "unknown caller %q", caller_label, loc = loc) {
+			return
+		}
+		target_caller = c
+	} else {
+		grp, grp_ok := w.caller_groups[callers]
+		if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+			return
+		}
+		if !testing.expectf(w.t, caller_idx >= 0 && caller_idx < len(grp), "caller_idx %d out of range", caller_idx, loc = loc) {
+			return
+		}
+		target_caller = grp[caller_idx]
+	}
+	testing.expect(w.t, target_caller.state.trace.arena_intact, loc = loc)
+	testing.expect_value(w.t, target_caller.state.trace.crash_err, expected_err, loc = loc)
+}
+
+then_caller_lifecycle_counts_are :: proc(
+	w: ^Supervision_World,
+	caller_label: string,
+	expected_stops: int,
+	expected_reinits: int,
+	loc := #caller_location,
+) {
+	c, ok := w.multi_callers[caller_label]
+	if !testing.expectf(w.t, ok, "unknown caller %q", caller_label, loc = loc) {
+		return
+	}
+	testing.expect_value(w.t, actor.actor_status(c), actor.Actor_Status.Running, loc = loc)
+	testing.expect_value(w.t, c.state.trace.stop_count, expected_stops, loc = loc)
+	testing.expect_value(w.t, c.state.trace.reinit_count, expected_reinits, loc = loc)
+}
+
+upon_cyclic_try_call :: proc(
+	w: ^Supervision_World,
+	callers: string,
+	caller_a: int,
+	caller_b: int,
+	service: string,
+	value: i64,
+	loc := #caller_location,
+) {
+	grp, grp_ok := w.caller_groups[callers]
+	if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+		return
+	}
+	svc, svc_ok := w.workers[service]
+	if !testing.expectf(w.t, svc_ok, "unknown service worker %q", service, loc = loc) {
+		return
+	}
+	driver_send_cyclic_try_call(w, grp[caller_a], grp[caller_b], svc, value)
+}
+
+then_cycle_try_call_errors_are :: proc(
+	w: ^Supervision_World,
+	callers: string,
+	caller_idx: int,
+	outer: actor.Call_Error,
+	inner: actor.Call_Error,
+	loc := #caller_location,
+) {
+	grp, grp_ok := w.caller_groups[callers]
+	if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+		return
+	}
+	testing.expect_value(w.t, grp[caller_idx].state.cycle_outer_err, outer, loc = loc)
+	testing.expect_value(w.t, grp[caller_idx].state.cycle_inner_err, inner, loc = loc)
+}
+
+upon_simultaneous_cross_worker_try_call_cycle :: proc(
+	w: ^Supervision_World,
+	callers: string,
+	caller_a: int,
+	caller_b: int,
+	service: string,
+	loc := #caller_location,
+) {
+	grp, grp_ok := w.caller_groups[callers]
+	if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+		return
+	}
+	svc, svc_ok := w.workers[service]
+	if !testing.expectf(w.t, svc_ok, "unknown service worker %q", service, loc = loc) {
+		return
+	}
+	driver_send_simultaneous_cross_worker_try_call_cycle(w, grp[caller_a], grp[caller_b], svc)
+}
+
+then_cross_worker_try_call_cycle_detected :: proc(
+	w: ^Supervision_World,
+	callers: string,
+	caller_a: int,
+	caller_b: int,
+	loc := #caller_location,
+) {
+	grp, grp_ok := w.caller_groups[callers]
+	if !testing.expectf(w.t, grp_ok, "unknown caller group %q", callers, loc = loc) {
+		return
+	}
+	err_a := grp[caller_a].state.barrier_err
+	err_b := grp[caller_b].state.barrier_err
+	testing.expect(w.t, err_a == .Deadlock_Detected || err_b == .Deadlock_Detected, loc = loc)
 }
