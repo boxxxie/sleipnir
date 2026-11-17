@@ -2816,14 +2816,7 @@ actor_base_destroy_sched :: proc(s: ^Scheduler, base: ^Actor_Base) {
 	}
 
 	eff_s := s if s != nil else base.reg_sched
-	if eff_s != nil && eff_s.started && intrinsics.atomic_load_explicit(&eff_s.running, .Acquire) {
-		if !tls_is_current_actor(base) {
-			for intrinsics.atomic_load_explicit(&base.scheduled, .Seq_Cst) != 0 ||
-			    intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
-				intrinsics.cpu_relax()
-			}
-		}
-	}
+	scheduler_wait_actor_unscheduled(eff_s, base)
 
 	if reg_s := base.reg_sched; reg_s != nil {
 		sync.mutex_lock(&reg_s.registry_mu)

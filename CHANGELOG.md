@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Cooperative Shard-Drain Wait in `actor_destroy` & `actor_base_destroy_sched` (`actor/actor.odin`, `actor/supervision.odin`):**
+  - Extracted `scheduler_wait_actor_unscheduled` and updated `scheduler_step_one_cooperative` to iterate shards from a rotating offset, skip busy (`in_step != 0`) entries across peer shards, and retire non-runnable (`status != .Running`) shard entries immediately.
+  - Prevents a 1-worker (or saturated multi-worker) actor turn from spinning forever in `actor_destroy` / `actor_base_destroy_sched` when destroying a same-scheduler actor whose `scheduled == 1` entry remains queued in `s.shards` after an in-place cooperative `actor.call`.
+- **Regression Coverage (`tests/actor_test.odin`):**
+  - Added 1-worker `send` + `call` + `actor.destroy` / `actor_base_destroy` shard-drain coverage (with a queued bystander actor) in `test_26_suspended_caller_terminate_runtime_ctx_and_destroy_after_reply`.
+
 ---
 
 ## [1.1.2] - 2026-11-17

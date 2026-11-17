@@ -1198,12 +1198,7 @@ actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 	intrinsics.atomic_store_explicit(&a.base.status, u32(Actor_Status.Stopped), .Seq_Cst)
 	s := a.base.reg_sched
 	if s != nil {
-		if s.started && intrinsics.atomic_load_explicit(&s.running, .Acquire) && !tls_is_current_actor(&a.base) {
-			for intrinsics.atomic_load_explicit(&a.base.scheduled, .Seq_Cst) != 0 ||
-			    intrinsics.atomic_load_explicit(&a.base.in_step, .Seq_Cst) != 0 {
-				intrinsics.cpu_relax()
-			}
-		}
+		scheduler_wait_actor_unscheduled(s, &a.base)
 		sync.mutex_lock(&s.registry_mu)
 		for i := 0; i < len(s.owned_actors); i += 1 {
 			if s.owned_actors[i] == &a.base {
@@ -2298,30 +2293,35 @@ scheduler_try_claim_and_step_cooperative :: proc(
 	return .Stepped
 }
 
-// Cooperatively execute one runnable actor turn while a worker thread is waiting inside `actor.call`.
+// Cooperatively execute one runnable actor turn (or retire a non-runnable shard entry)
+// while a worker thread is waiting inside `actor.call` or `actor.destroy`.
 @(private)
-scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> bool {
-	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
-		panic("actor.call cooperative recursion depth limit exceeded")
-	}
+scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context, shard_offset: int = 0) -> bool {
 	wid := caller_ctx.worker_id
 	num_shards := s.num_shards
-	a := shard_pop_or_steal(&s.shards[wid % num_shards])
-	if a == nil && num_shards > 1 {
-		for i in 1 ..< num_shards {
-			peer := (wid + i) % num_shards
-			a = shard_pop_or_steal(&s.shards[peer])
-			if a != nil { break }
+	for i in 0 ..< num_shards {
+		shard_idx := (wid + shard_offset + i) % num_shards
+		a := shard_pop_or_steal(&s.shards[shard_idx])
+		if a == nil {
+			continue
 		}
+		_, cas_ok := intrinsics.atomic_compare_exchange_strong_explicit(&a.in_step, 0, 1, .Seq_Cst, .Seq_Cst)
+		if !cas_ok {
+			shard_push(&s.shards[shard_idx], a)
+			continue
+		}
+		if intrinsics.atomic_load_explicit(&a.status, .Seq_Cst) != u32(Actor_Status.Running) {
+			scheduler_finish_worker_turn(s, a, caller_ctx, wid, 0, false)
+			return true
+		}
+		if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+			intrinsics.atomic_store_explicit(&a.in_step, 0, .Seq_Cst)
+			shard_push(&s.shards[shard_idx], a)
+			panic("actor.call cooperative recursion depth limit exceeded")
+		}
+		return scheduler_run_claimed_actor_cooperative(s, caller_ctx, a, owns_scheduled = true)
 	}
-	if a == nil { return false }
-
-	_, cas_ok := intrinsics.atomic_compare_exchange_strong_explicit(&a.in_step, 0, 1, .Seq_Cst, .Seq_Cst)
-	if !cas_ok {
-		shard_push(&s.shards[wid % num_shards], a)
-		return false
-	}
-	return scheduler_run_claimed_actor_cooperative(s, caller_ctx, a, owns_scheduled = true)
+	return false
 }
 
 @(private)
@@ -2332,6 +2332,40 @@ coop_spin_backoff :: #force_inline proc(spin: ^int) {
 	} else {
 		thread.yield()
 		spin^ = 0
+	}
+}
+
+// Wait until `base` is neither queued in `s.shards` (`scheduled != 0`) nor actively
+// executing `step_proc` (`in_step != 0`). When called from a worker thread of `s`,
+// cooperatively drains `s.shards` while `base.scheduled != 0 && base.in_step == 0`
+// so an actor that was stepped in-place via `allow_scheduled = true` in `actor.call`
+// cannot deadlock `actor.destroy` on a 1-worker (or saturated multi-worker) scheduler.
+@(private)
+scheduler_wait_actor_unscheduled :: proc(s: ^Scheduler, base: ^Actor_Base) {
+	if s == nil || base == nil {
+		return
+	}
+	if !s.started || !intrinsics.atomic_load_explicit(&s.running, .Acquire) || tls_is_current_actor(base) {
+		return
+	}
+	caller_ctx := current_context()
+	same_sched := caller_ctx != nil && caller_ctx.sched == s
+	spin := 0
+	shard_cursor := 0
+	for intrinsics.atomic_load_explicit(&base.scheduled, .Seq_Cst) != 0 ||
+	    intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) != 0 {
+		if same_sched &&
+		   intrinsics.atomic_load_explicit(&base.scheduled, .Seq_Cst) != 0 &&
+		   intrinsics.atomic_load_explicit(&base.in_step, .Seq_Cst) == 0 &&
+		   _tls_call_depth < MAX_COOPERATIVE_CALL_DEPTH {
+			offset := shard_cursor
+			shard_cursor += 1
+			if scheduler_step_one_cooperative(s, caller_ctx, offset) {
+				spin = 0
+				continue
+			}
+		}
+		coop_spin_backoff(&spin)
 	}
 }
 
