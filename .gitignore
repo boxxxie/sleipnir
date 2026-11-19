@@ -23,6 +23,8 @@ actor_test
 # Temporary & scratch files
 .tmp/
 *.patch
+*.hpk
+*.bpk
 
 # OS & Editor artifacts
 .DS_Store

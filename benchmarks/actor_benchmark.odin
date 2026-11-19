@@ -25,11 +25,14 @@
 package actor_benchmark
 
 import "../actor"
+import hugi "hugi:."
 import "base:intrinsics"
 import "core:c"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strconv"
+import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
@@ -2227,8 +2230,306 @@ when USE_LIBPONYRT {
 }
 
 // =============================================================================
-// Main Benchmark Runner
+// Main Benchmark Runner & hugi Packet Support
 // =============================================================================
+
+Bench_CLI_Config :: struct {
+	runs:            int,
+	warmup:          int,
+	groups_filter:   string,
+	name_filter:     string,
+	lang:            string,
+	commit:          string,
+	run_id:          string,
+	packet_out_path: string,
+	quiet:           bool,
+}
+
+_bench_cli_destroy :: proc(cfg: ^Bench_CLI_Config, allocator := context.allocator) {
+	delete(cfg.groups_filter, allocator)
+	delete(cfg.name_filter, allocator)
+	delete(cfg.lang, allocator)
+	delete(cfg.commit, allocator)
+	delete(cfg.run_id, allocator)
+	delete(cfg.packet_out_path, allocator)
+	cfg^ = {}
+}
+
+_replace_cli_str :: proc(dst: ^string, val: string, allocator := context.allocator) {
+	delete(dst^, allocator)
+	dst^ = strings.clone(val, allocator)
+}
+
+_print_bench_usage :: proc() {
+	fmt.println("Usage: actor_benchmark [options]")
+	fmt.println("  --packet-out PATH  Write hugi Run_Packet (.hpk) to PATH")
+	fmt.println("  --runs N           Measured runs per benchmark (default: 3 with --packet-out, 1 otherwise)")
+	fmt.println("  --warmup N         Warmup runs per benchmark (default: 1 with --packet-out, 0 otherwise)")
+	fmt.println("  --groups LIST      Comma/pipe-separated workload groups")
+	fmt.println("                     (workload_1_fan_in,workload_2_ping_pong,workload_3_large_payload,workload_4_swarm,workload_5_a2a)")
+	fmt.println("  --filter SUBSTR    Run only benchmarks matching substring (supports ',' or '|')")
+	fmt.println("  --commit SHA       Override git commit SHA")
+	fmt.println("  --lang NAME        Language tag in packet (default: odin)")
+	fmt.println("  --run-id ID        Override run ID")
+	fmt.println("  --quiet            Suppress terminal table output")
+}
+
+_parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg: Bench_CLI_Config, ok: bool, show_help: bool) {
+	cfg = Bench_CLI_Config{
+		lang = strings.clone("odin", allocator),
+	}
+	runs_explicit := false
+	warmup_explicit := false
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		i += 1
+		if arg == "-h" || arg == "--help" {
+			return cfg, true, true
+		}
+		if arg == "--quiet" || arg == "-quiet" {
+			cfg.quiet = true
+			continue
+		}
+		if !strings.has_prefix(arg, "-") {
+			_bench_cli_destroy(&cfg, allocator)
+			return {}, false, false
+		}
+		trimmed := strings.trim_left(arg, "-")
+		key := trimmed
+		val := ""
+		has_inline := false
+		if sep := strings.index_any(trimmed, "=:"); sep >= 0 {
+			key = trimmed[:sep]
+			val = trimmed[sep + 1:]
+			has_inline = true
+		}
+		switch key {
+		case "runs", "warmup", "groups", "group", "filter", "f", "lang", "commit", "run-id", "packet-out":
+		case:
+			_bench_cli_destroy(&cfg, allocator)
+			return {}, false, false
+		}
+		if !has_inline {
+			if i >= len(args) {
+				_bench_cli_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			val = args[i]
+			i += 1
+		}
+		switch key {
+		case "runs":
+			n, p_ok := strconv.parse_int(val)
+			if !p_ok || n < 1 {
+				_bench_cli_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			cfg.runs = n
+			runs_explicit = true
+		case "warmup":
+			n, p_ok := strconv.parse_int(val)
+			if !p_ok || n < 0 {
+				_bench_cli_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			cfg.warmup = n
+			warmup_explicit = true
+		case "groups", "group":
+			_replace_cli_str(&cfg.groups_filter, val, allocator)
+		case "filter", "f":
+			_replace_cli_str(&cfg.name_filter, val, allocator)
+		case "lang":
+			lower := strings.to_lower(val, context.temp_allocator)
+			_replace_cli_str(&cfg.lang, lower, allocator)
+		case "commit":
+			_replace_cli_str(&cfg.commit, val, allocator)
+		case "run-id":
+			_replace_cli_str(&cfg.run_id, val, allocator)
+		case "packet-out":
+			_replace_cli_str(&cfg.packet_out_path, val, allocator)
+		}
+	}
+
+	if !runs_explicit {
+		cfg.runs = 3 if cfg.packet_out_path != "" else 1
+	}
+	if !warmup_explicit {
+		cfg.warmup = 1 if cfg.packet_out_path != "" else 0
+	}
+	if cfg.commit == "" {
+		_replace_cli_str(&cfg.commit, hugi.resolve_git_commit(".", context.temp_allocator), allocator)
+	}
+	if cfg.run_id == "" {
+		_replace_cli_str(&cfg.run_id, hugi.default_run_id(context.temp_allocator), allocator)
+	}
+	return cfg, true, false
+}
+
+Workload_Section :: struct {
+	group:          string,
+	title:          string,
+	show_col_hdr:   bool,
+	header_printed: bool,
+}
+
+_workload_end :: proc(cfg: ^Bench_CLI_Config, sec: ^Workload_Section) {
+	if sec.header_printed && !cfg.quiet {
+		fmt.println("-----------------------------------------------------------------------------------------------------------")
+	}
+}
+
+Bench_Run_Ctx :: struct {
+	cfg:       ^Bench_CLI_Config,
+	records:   [dynamic]hugi.Record,
+	next_rank: int,
+}
+
+Bench_Loop :: struct {
+	ctx:              ^Bench_Run_Ctx,
+	rank:             int,
+	group:            string,
+	bench_name:       string,
+	full_name:        string,
+	display_label:    string,
+	msgs:             int,
+	bytes_per_op:     u64,
+	threads:          int,
+	has_threads:      bool,
+	active:           bool,
+	trial:            int,
+	total_trials:     int,
+	warmup:           int,
+	last_score:       i64,
+	samples_batch_ns: [dynamic]u64,
+}
+
+_matches_bench_filter :: proc(cfg: ^Bench_CLI_Config, group, full_name, display_label: string) -> bool {
+	if !hugi.should_run_group(cfg.groups_filter, group) {
+		return false
+	}
+	if cfg.name_filter == "" {
+		return true
+	}
+	return hugi.matches_name_filter(cfg.name_filter, full_name) || hugi.matches_name_filter(cfg.name_filter, display_label)
+}
+
+bench_begin :: proc(
+	bctx:          ^Bench_Run_Ctx,
+	sec:           ^Workload_Section,
+	bench_name:    string,
+	display_label: string,
+	msgs:          int,
+	bytes_per_op:  u64 = 0,
+	threads:       int = 0,
+	has_threads:   bool = false,
+) -> Bench_Loop {
+	bctx.next_rank += 1
+	rank := bctx.next_rank
+	full_name := fmt.tprintf("%s/%s", sec.group, bench_name)
+	if !_matches_bench_filter(bctx.cfg, sec.group, full_name, display_label) {
+		return {}
+	}
+
+	if !sec.header_printed && !bctx.cfg.quiet {
+		if sec.group != "workload_1_fan_in" {
+			fmt.println("")
+		}
+		fmt.println("===========================================================================================================")
+		fmt.println(sec.title)
+		fmt.println("===========================================================================================================")
+		if sec.show_col_hdr {
+			fmt.println("| Implementation                                   | Total Time  | Throughput    | Latency/Msg  | Checksum |")
+			fmt.println("|--------------------------------------------------|-------------|---------------|--------------|----------|")
+		}
+		sec.header_printed = true
+	}
+
+	return Bench_Loop{
+		ctx              = bctx,
+		rank             = rank,
+		group            = sec.group,
+		bench_name       = strings.clone(bench_name),
+		full_name        = strings.clone(full_name),
+		display_label    = strings.clone(display_label),
+		msgs             = msgs,
+		bytes_per_op     = bytes_per_op,
+		threads          = threads,
+		has_threads      = has_threads,
+		active           = true,
+		trial            = 0,
+		total_trials     = bctx.cfg.warmup + bctx.cfg.runs,
+		warmup           = bctx.cfg.warmup,
+		samples_batch_ns = make([dynamic]u64, 0, bctx.cfg.runs),
+	}
+}
+
+bench_sample :: #force_inline proc(b: ^Bench_Loop, elapsed: time.Duration, score: i64) {
+	if !b.active {
+		return
+	}
+	if b.trial >= b.warmup {
+		ns := time.duration_nanoseconds(elapsed)
+		append(&b.samples_batch_ns, u64(max(ns, 0)))
+	}
+	b.last_score = score
+	b.trial += 1
+}
+
+_bench_finish :: proc(b: ^Bench_Loop) {
+	defer {
+		delete(b.bench_name)
+		delete(b.full_name)
+		delete(b.display_label)
+		delete(b.samples_batch_ns)
+		b.active = false
+	}
+	if len(b.samples_batch_ns) == 0 {
+		return
+	}
+
+	rec := hugi.Record{
+		rank             = b.rank,
+		group_name       = strings.clone(b.group),
+		name             = strings.clone(b.bench_name),
+		full_name        = strings.clone(b.full_name),
+		threads          = b.threads,
+		has_threads      = b.has_threads,
+		ops_per_sample   = u64(max(b.msgs, 1)),
+		samples          = len(b.samples_batch_ns),
+		warmup           = b.warmup,
+		bytes_per_op     = b.bytes_per_op,
+		error            = strings.clone(""),
+		metrics          = make([dynamic]hugi.Metric),
+		samples_batch_ns = make([dynamic]u64, len(b.samples_batch_ns)),
+	}
+	copy(rec.samples_batch_ns[:], b.samples_batch_ns[:])
+	hugi.recompute_record_stats_from_samples(&rec)
+	hugi.refresh_record_throughput(&rec, overwrite = true)
+
+	if !b.ctx.cfg.quiet {
+		med_total_ns := (i128(rec.p50_fs) * i128(max(b.msgs, 1)) + 500_000) / 1_000_000
+		print_row(b.display_label, b.msgs, time.Duration(med_total_ns), b.last_score)
+	}
+
+	if b.ctx.cfg.packet_out_path != "" {
+		append(&b.ctx.records, rec)
+	} else {
+		hugi.record_destroy(&rec)
+	}
+}
+
+bench_next :: proc(b: ^Bench_Loop) -> bool {
+	if !b.active {
+		return false
+	}
+	if b.trial >= b.total_trials {
+		_bench_finish(b)
+		return false
+	}
+	return true
+}
 
 print_row :: proc(name: string, msgs: int, elapsed: time.Duration, score: i64) {
 	sec := time.duration_seconds(elapsed)
@@ -2248,154 +2549,227 @@ main :: proc() {
 	when USE_LIBPONYRT {
 		if len(os.args) > 1 {
 			mode := os.args[1]
-			switch mode {
-			case "--child-pony-w4":
-				run_child_ponyrt_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
-			case "--child-pony-w5-1":
-				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 1)
-			case "--child-pony-w5-2":
-				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 2)
-			case "--child-pony-w5-4":
-				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 4)
-			case "--child-pony-w5-8":
-				run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 8)
+			if strings.has_prefix(mode, "--child-pony-") {
+				switch mode {
+				case "--child-pony-w4":
+					run_child_ponyrt_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
+				case "--child-pony-w5-1":
+					run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 1)
+				case "--child-pony-w5-2":
+					run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 2)
+				case "--child-pony-w5-4":
+					run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 4)
+				case "--child-pony-w5-8":
+					run_child_ponyrt_a2a(A2A_TOTAL_HOPS, 8)
+				}
+				return
 			}
-			return
 		}
 	}
 
-	fmt.println("===========================================================================================================")
-	fmt.printfln("WORKLOAD 1: MPSC Fan-In Contention (%d messages, %d producers -> 1 actor)", TOTAL_MESSAGES, NUM_PRODUCERS)
-	fmt.println("===========================================================================================================")
-	fmt.println("| Implementation                                   | Total Time  | Throughput    | Latency/Msg  | Checksum |")
-	fmt.println("|--------------------------------------------------|-------------|---------------|--------------|----------|")
-
-	t1, s1 := bench_chan_actor_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS)
-	print_row("1. Traditional (core:sync/chan + thread)", TOTAL_MESSAGES, t1, s1)
-
-	t2a, s2a := bench_dod_single_thread(TOTAL_MESSAGES, NUM_SWARM_ACTORS)
-	print_row("2a. DOD Batch Array (Single-Thread)", TOTAL_MESSAGES, t2a, s2a)
-
-	t2b, s2b := bench_dod_multithread_tls(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
-	print_row("2b. DOD Multi-Thread (4 TLS Buffers + Drain)", TOTAL_MESSAGES, t2b, s2b)
-
-	t3b, s3b := bench_self_pony_recycled_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS)
-	print_row("3b. Self-Impl Pony MPSC (Per-Msg 8K Slab)", TOTAL_MESSAGES, t3b, s3b)
-
-	t3c, s3c := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false, false)
-	print_row("3c. Self-Impl Pony MPSC (Batched Watermark 8K)", TOTAL_MESSAGES, t3c, s3c)
-
-	t3d, s3d := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true, false)
-	print_row("3d. Self-Impl Pony MPSC (Chain=32 Splice 8K)", TOTAL_MESSAGES, t3d, s3d)
-
-	t3e, s3e := bench_sharded_spsc_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS)
-	print_row("3e. Sharded SPSC Ring Lanes (Zero RMW Atomics)", TOTAL_MESSAGES, t3e, s3e)
-
-	t3f, s3f := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false, true)
-	print_row("3f. Self-Impl Pony MPSC + Adaptive Futex Parker", TOTAL_MESSAGES, t3f, s3f)
-
-	when USE_LIBPONYRT {
-		t4a, s4a := bench_libponyrt_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false)
-		print_row("4a. Official Pony (`libponyrt` 0.77.2 Single)", TOTAL_MESSAGES, t4a, s4a)
-
-		t4b, s4b := bench_libponyrt_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true)
-		print_row("4b. Official Pony (`libponyrt` 0.77.2 Chain=32)", TOTAL_MESSAGES, t4b, s4b)
+	args := os.args[1:] if len(os.args) > 1 else nil
+	cfg, cli_ok, show_help := _parse_bench_cli(args)
+	if !cli_ok {
+		fmt.eprintln("actor_benchmark: invalid command-line arguments")
+		_print_bench_usage()
+		os.exit(1)
+	}
+	defer _bench_cli_destroy(&cfg)
+	if show_help {
+		_print_bench_usage()
+		return
 	}
 
-	t_lib1, s_lib1 := bench_library_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false)
-	print_row("5a. `package actor` (Envelope_Pool Single Send)", TOTAL_MESSAGES, t_lib1, s_lib1)
-
-	t_lib1c, s_lib1c := bench_library_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true)
-	print_row("5a. `package actor` (Envelope_Pool Chain=32)", TOTAL_MESSAGES, t_lib1c, s_lib1c)
-
-	fmt.println("-----------------------------------------------------------------------------------------------------------")
-	fmt.println("")
-	fmt.println("===========================================================================================================")
-	fmt.printfln("WORKLOAD 2: Cross-Thread 1-to-1 Ping-Pong Latency (%d round-trips = %d hops)", PING_PONG_TRIPS, PING_PONG_TRIPS * 2)
-	fmt.println("===========================================================================================================")
-
-	pp_t1, pp_s1 := bench_chan_ping_pong(PING_PONG_TRIPS)
-	print_row("1. Traditional (core:sync/chan) Ping-Pong", PING_PONG_TRIPS * 2, pp_t1, pp_s1)
-
-	pp_t3, pp_s3 := bench_self_pony_ping_pong(PING_PONG_TRIPS)
-	print_row("3. Self-Impl Pony MPSC Ping-Pong", PING_PONG_TRIPS * 2, pp_t3, pp_s3)
-
-	when USE_LIBPONYRT {
-		pp_t4, pp_s4 := bench_libponyrt_ping_pong(PING_PONG_TRIPS)
-		print_row("4. Official Pony (`libponyrt` 0.77.2) Ping-Pong", PING_PONG_TRIPS * 2, pp_t4, pp_s4)
+	bctx := Bench_Run_Ctx{
+		cfg     = &cfg,
+		records = make([dynamic]hugi.Record),
+	}
+	defer {
+		for &r in bctx.records {
+			hugi.record_destroy(&r)
+		}
+		delete(bctx.records)
 	}
 
-	fmt.println("-----------------------------------------------------------------------------------------------------------")
-	fmt.println("")
-	fmt.println("===========================================================================================================")
-	fmt.printfln("WORKLOAD 3: 512-Byte Large Payload Zero-Copy Crossover (%d messages)", LARGE_MESSAGES)
-	fmt.println("===========================================================================================================")
-
-	lp_t3, lp_s3 := bench_large_pony_zerocopy(LARGE_MESSAGES, NUM_PRODUCERS)
-	print_row("3c. Pony MPSC Zero-Copy `iso` Pointer (512B)", LARGE_MESSAGES, lp_t3, lp_s3)
-
-	when USE_LIBPONYRT {
-		lp_t4, lp_s4 := bench_libponyrt_large(LARGE_MESSAGES, NUM_PRODUCERS)
-		print_row("4c. Official Pony (`libponyrt` 0.77.2 512B Pool)", LARGE_MESSAGES, lp_t4, lp_s4)
+	// Workload 1: MPSC Fan-In Contention
+	w1 := Workload_Section{
+		group        = "workload_1_fan_in",
+		title        = fmt.tprintf("WORKLOAD 1: MPSC Fan-In Contention (%d messages, %d producers -> 1 actor)", TOTAL_MESSAGES, NUM_PRODUCERS),
+		show_col_hdr = true,
 	}
-
-	fmt.println("-----------------------------------------------------------------------------------------------------------")
-	fmt.println("")
-	fmt.println("===========================================================================================================")
-	fmt.printfln("WORKLOAD 4: 1,024-Actor Swarm Scaling (%d messages across %d actors)", TOTAL_MESSAGES, NUM_SWARM_ACTORS)
-	fmt.println("===========================================================================================================")
-
-	ws_t3, ws_s3 := bench_work_stealing_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
-	print_row("3g. Sharded Work-Stealing M:N Swarm (1,024)", TOTAL_MESSAGES, ws_t3, ws_s3)
-
-	when USE_LIBPONYRT {
-		spawn_self_mode("--child-pony-w4")
+	for b := bench_begin(&bctx, &w1, "1_chan_fan_in", "1. Traditional (core:sync/chan + thread)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_chan_actor_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS)
+		bench_sample(&b, d, s)
 	}
-
-	ws_lib_t, ws_lib_s := bench_library_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
-	print_row("5b. `package actor` M:N Swarm (Chain Return)", TOTAL_MESSAGES, ws_lib_t, ws_lib_s)
-
-	fmt.println("-----------------------------------------------------------------------------------------------------------")
-	fmt.println("")
-	fmt.println("===========================================================================================================")
-	fmt.printfln("WORKLOAD 5: Autonomous Actor-to-Actor Graph + CPU Work (%d hops, %d actors)", A2A_TOTAL_HOPS, NUM_SWARM_ACTORS)
-	fmt.println("===========================================================================================================")
-
-	a2a_t1, a2a_s1 := bench_pony_mn_a2a(A2A_TOTAL_HOPS, 1)
-	print_row("3h. Pony M:N Actor-to-Actor + CPU (1 Worker)", A2A_TOTAL_HOPS, a2a_t1, a2a_s1)
-
-	a2a_t2, a2a_s2 := bench_pony_mn_a2a(A2A_TOTAL_HOPS, 2)
-	print_row("3h. Pony M:N Actor-to-Actor + CPU (2 Workers)", A2A_TOTAL_HOPS, a2a_t2, a2a_s2)
-
-	a2a_t4, a2a_s4 := bench_pony_mn_a2a(A2A_TOTAL_HOPS, 4)
-	print_row("3h. Pony M:N Actor-to-Actor + CPU (4 Workers)", A2A_TOTAL_HOPS, a2a_t4, a2a_s4)
-
-	a2a_t8, a2a_s8 := bench_pony_mn_a2a(A2A_TOTAL_HOPS, 8)
-	print_row("3h. Pony M:N Actor-to-Actor + CPU (8 Workers)", A2A_TOTAL_HOPS, a2a_t8, a2a_s8)
-
-	a2a_t16, a2a_s16 := bench_pony_mn_a2a(A2A_TOTAL_HOPS, 16)
-	print_row("3h. Pony M:N Actor-to-Actor + CPU (16 Workers)", A2A_TOTAL_HOPS, a2a_t16, a2a_s16)
-
-	when USE_LIBPONYRT {
-		spawn_self_mode("--child-pony-w5-1")
-		spawn_self_mode("--child-pony-w5-2")
-		spawn_self_mode("--child-pony-w5-4")
-		spawn_self_mode("--child-pony-w5-8")
+	for b := bench_begin(&bctx, &w1, "2a_dod_single_thread", "2a. DOD Batch Array (Single-Thread)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_dod_single_thread(TOTAL_MESSAGES, NUM_SWARM_ACTORS)
+		bench_sample(&b, d, s)
 	}
+	for b := bench_begin(&bctx, &w1, "2b_dod_multithread_tls", "2b. DOD Multi-Thread (4 TLS Buffers + Drain)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_dod_multithread_tls(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w1, "3b_self_pony_recycled_fan_in", "3b. Self-Impl Pony MPSC (Per-Msg 8K Slab)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_self_pony_recycled_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w1, "3c_self_pony_batched_fan_in", "3c. Self-Impl Pony MPSC (Batched Watermark 8K)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false, false)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w1, "3d_self_pony_chain32_fan_in", "3d. Self-Impl Pony MPSC (Chain=32 Splice 8K)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true, false)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w1, "3e_sharded_spsc_fan_in", "3e. Sharded SPSC Ring Lanes (Zero RMW Atomics)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_sharded_spsc_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w1, "3f_self_pony_parker_fan_in", "3f. Self-Impl Pony MPSC + Adaptive Futex Parker", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_self_pony_batched_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false, true)
+		bench_sample(&b, d, s)
+	}
+	when USE_LIBPONYRT {
+		for b := bench_begin(&bctx, &w1, "4a_libponyrt_single_fan_in", "4a. Official Pony (`libponyrt` 0.77.2 Single)", TOTAL_MESSAGES); bench_next(&b); {
+			d, s := bench_libponyrt_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false)
+			bench_sample(&b, d, s)
+		}
+		for b := bench_begin(&bctx, &w1, "4b_libponyrt_chain32_fan_in", "4b. Official Pony (`libponyrt` 0.77.2 Chain=32)", TOTAL_MESSAGES); bench_next(&b); {
+			d, s := bench_libponyrt_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true)
+			bench_sample(&b, d, s)
+		}
+	}
+	for b := bench_begin(&bctx, &w1, "5a_actor_pool_single_fan_in", "5a. `package actor` (Envelope_Pool Single Send)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_library_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, false)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w1, "5a_actor_pool_chain32_fan_in", "5a. `package actor` (Envelope_Pool Chain=32)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_library_fan_in(TOTAL_MESSAGES, NUM_PRODUCERS, true)
+		bench_sample(&b, d, s)
+	}
+	_workload_end(&cfg, &w1)
 
-	lib_a2a_t1, lib_a2a_s1 := bench_library_a2a(A2A_TOTAL_HOPS, 1)
-	print_row("5c. `package actor` A2A + CPU (1 Worker)", A2A_TOTAL_HOPS, lib_a2a_t1, lib_a2a_s1)
+	// Workload 2: Cross-Thread 1-to-1 Ping-Pong Latency
+	w2 := Workload_Section{
+		group = "workload_2_ping_pong",
+		title = fmt.tprintf("WORKLOAD 2: Cross-Thread 1-to-1 Ping-Pong Latency (%d round-trips = %d hops)", PING_PONG_TRIPS, PING_PONG_TRIPS * 2),
+	}
+	for b := bench_begin(&bctx, &w2, "1_chan_ping_pong", "1. Traditional (core:sync/chan) Ping-Pong", PING_PONG_TRIPS * 2); bench_next(&b); {
+		d, s := bench_chan_ping_pong(PING_PONG_TRIPS)
+		bench_sample(&b, d, s)
+	}
+	for b := bench_begin(&bctx, &w2, "3_self_pony_ping_pong", "3. Self-Impl Pony MPSC Ping-Pong", PING_PONG_TRIPS * 2); bench_next(&b); {
+		d, s := bench_self_pony_ping_pong(PING_PONG_TRIPS)
+		bench_sample(&b, d, s)
+	}
+	when USE_LIBPONYRT {
+		for b := bench_begin(&bctx, &w2, "4_libponyrt_ping_pong", "4. Official Pony (`libponyrt` 0.77.2) Ping-Pong", PING_PONG_TRIPS * 2); bench_next(&b); {
+			d, s := bench_libponyrt_ping_pong(PING_PONG_TRIPS)
+			bench_sample(&b, d, s)
+		}
+	}
+	_workload_end(&cfg, &w2)
 
-	lib_a2a_t2, lib_a2a_s2 := bench_library_a2a(A2A_TOTAL_HOPS, 2)
-	print_row("5c. `package actor` A2A + CPU (2 Workers)", A2A_TOTAL_HOPS, lib_a2a_t2, lib_a2a_s2)
+	// Workload 3: 512-Byte Large Payload Zero-Copy Crossover
+	w3 := Workload_Section{
+		group = "workload_3_large_payload",
+		title = fmt.tprintf("WORKLOAD 3: 512-Byte Large Payload Zero-Copy Crossover (%d messages)", LARGE_MESSAGES),
+	}
+	for b := bench_begin(&bctx, &w3, "3c_pony_zerocopy_512b", "3c. Pony MPSC Zero-Copy `iso` Pointer (512B)", LARGE_MESSAGES, bytes_per_op = 512); bench_next(&b); {
+		d, s := bench_large_pony_zerocopy(LARGE_MESSAGES, NUM_PRODUCERS)
+		bench_sample(&b, d, s)
+	}
+	when USE_LIBPONYRT {
+		for b := bench_begin(&bctx, &w3, "4c_libponyrt_512b_pool", "4c. Official Pony (`libponyrt` 0.77.2 512B Pool)", LARGE_MESSAGES, bytes_per_op = 512); bench_next(&b); {
+			d, s := bench_libponyrt_large(LARGE_MESSAGES, NUM_PRODUCERS)
+			bench_sample(&b, d, s)
+		}
+	}
+	_workload_end(&cfg, &w3)
 
-	lib_a2a_t4, lib_a2a_s4 := bench_library_a2a(A2A_TOTAL_HOPS, 4)
-	print_row("5c. `package actor` A2A + CPU (4 Workers)", A2A_TOTAL_HOPS, lib_a2a_t4, lib_a2a_s4)
+	// Workload 4: 1,024-Actor Swarm Scaling
+	w4 := Workload_Section{
+		group = "workload_4_swarm",
+		title = fmt.tprintf("WORKLOAD 4: 1,024-Actor Swarm Scaling (%d messages across %d actors)", TOTAL_MESSAGES, NUM_SWARM_ACTORS),
+	}
+	for b := bench_begin(&bctx, &w4, "3g_work_stealing_swarm_1024", "3g. Sharded Work-Stealing M:N Swarm (1,024)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_work_stealing_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
+		bench_sample(&b, d, s)
+	}
+	when USE_LIBPONYRT {
+		if !cfg.quiet && _matches_bench_filter(&cfg, "workload_4_swarm", "workload_4_swarm/4d_libponyrt_swarm", "4d. Official Pony (`libponyrt` 0.77.2 M:N Swarm)") {
+			spawn_self_mode("--child-pony-w4")
+		}
+	}
+	for b := bench_begin(&bctx, &w4, "5b_actor_swarm_chain_return", "5b. `package actor` M:N Swarm (Chain Return)", TOTAL_MESSAGES); bench_next(&b); {
+		d, s := bench_library_swarm(TOTAL_MESSAGES, NUM_PRODUCERS, NUM_SWARM_ACTORS)
+		bench_sample(&b, d, s)
+	}
+	_workload_end(&cfg, &w4)
 
-	lib_a2a_t8, lib_a2a_s8 := bench_library_a2a(A2A_TOTAL_HOPS, 8)
-	print_row("5c. `package actor` A2A + CPU (8 Workers)", A2A_TOTAL_HOPS, lib_a2a_t8, lib_a2a_s8)
+	// Workload 5: Autonomous Actor-to-Actor Graph + CPU Work
+	w5 := Workload_Section{
+		group = "workload_5_a2a",
+		title = fmt.tprintf("WORKLOAD 5: Autonomous Actor-to-Actor Graph + CPU Work (%d hops, %d actors)", A2A_TOTAL_HOPS, NUM_SWARM_ACTORS),
+	}
+	worker_counts := [?]int{1, 2, 4, 8, 16}
+	for w in worker_counts {
+		bname := fmt.tprintf("3h_pony_mn_a2a_%dw", w)
+		label := fmt.tprintf("3h. Pony M:N Actor-to-Actor + CPU (%d %s)", w, "Worker" if w == 1 else "Workers")
+		for b := bench_begin(&bctx, &w5, bname, label, A2A_TOTAL_HOPS, threads = w, has_threads = true); bench_next(&b); {
+			d, s := bench_pony_mn_a2a(A2A_TOTAL_HOPS, w)
+			bench_sample(&b, d, s)
+		}
+	}
+	when USE_LIBPONYRT {
+		if !cfg.quiet {
+			pony_w5_modes := [?]struct{ flag: cstring, w: int }{
+				{"--child-pony-w5-1", 1},
+				{"--child-pony-w5-2", 2},
+				{"--child-pony-w5-4", 4},
+				{"--child-pony-w5-8", 8},
+			}
+			for entry in pony_w5_modes {
+				fn := fmt.tprintf("workload_5_a2a/4e_libponyrt_a2a_%dw", entry.w)
+				lbl := fmt.tprintf("4e. Official Pony (`libponyrt` 0.77.2, %d %s)", entry.w, "Thread" if entry.w == 1 else "Threads")
+				if _matches_bench_filter(&cfg, "workload_5_a2a", fn, lbl) {
+					spawn_self_mode(entry.flag)
+				}
+			}
+		}
+	}
+	for w in worker_counts {
+		bname := fmt.tprintf("5c_actor_a2a_%dw", w)
+		label := fmt.tprintf("5c. `package actor` A2A + CPU (%d %s)", w, "Worker" if w == 1 else "Workers")
+		for b := bench_begin(&bctx, &w5, bname, label, A2A_TOTAL_HOPS, threads = w, has_threads = true); bench_next(&b); {
+			d, s := bench_library_a2a(A2A_TOTAL_HOPS, w)
+			bench_sample(&b, d, s)
+		}
+	}
+	_workload_end(&cfg, &w5)
+	free_all(context.temp_allocator)
 
-	lib_a2a_t16, lib_a2a_s16 := bench_library_a2a(A2A_TOTAL_HOPS, 16)
-	print_row("5c. `package actor` A2A + CPU (16 Workers)", A2A_TOTAL_HOPS, lib_a2a_t16, lib_a2a_s16)
-	fmt.println("-----------------------------------------------------------------------------------------------------------")
+	if cfg.packet_out_path != "" {
+		ts_unix := i64(time.to_unix_nanoseconds(time.now())) / 1_000_000_000
+		pkt := hugi.Run_Packet{
+			suite_name     = strings.clone("sleipnir_actor_benchmark"),
+			lang           = strings.clone(cfg.lang),
+			commit         = strings.clone(cfg.commit),
+			run_id         = strings.clone(cfg.run_id),
+			os             = strings.clone(ODIN_OS_STRING),
+			arch           = strings.clone(ODIN_ARCH_STRING),
+			optimization   = strings.clone(fmt.tprintf("%v", ODIN_OPTIMIZATION_MODE)),
+			odin_version   = strings.clone(ODIN_VERSION),
+			timestamp_unix = ts_unix,
+			selective      = (cfg.groups_filter != "" && cfg.groups_filter != "all") || cfg.name_filter != "",
+			records        = bctx.records,
+		}
+		bctx.records = nil
+		defer hugi.packet_destroy(&pkt)
+
+		if err := hugi.write_packet_file(cfg.packet_out_path, pkt); err != nil {
+			fmt.eprintfln("actor_benchmark: failed to write hugi packet '%s': %v", cfg.packet_out_path, err)
+			os.exit(1)
+		}
+	}
 }

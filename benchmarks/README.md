@@ -259,3 +259,23 @@ gcc -O3 -march=native -pthread -DUSE_LIBPONYRT \
   -L.tmp/ponyc_build -lponyrt -Wl,-rpath,.tmp/ponyc_build -ldl -lm -latomic \
   -o .tmp/actor_benchmark_c11 && ./.tmp/actor_benchmark_c11
 ```
+
+### Step 4: Automated Multi-Run Tracking & Statistical Comparison (`hugi`)
+
+The Odin benchmark suite supports `--packet-out`, `--runs`, `--warmup`, `--groups` (`workload_1_fan_in`, `workload_2_ping_pong`, `workload_3_large_payload`, `workload_4_swarm`, `workload_5_a2a`), `--filter`, `--commit`, `--lang`, and `--quiet` for statistical history tracking via `hugi`:
+
+```bash
+# Build, run 3 measured + 1 warmup trials per benchmark, and store results in history.hugidb
+hugi run benchmarks --runs 3 --warmup 1
+
+# Filter by workload group or benchmark name (without modifying disk history via --overlay)
+hugi run benchmarks --groups workload_1_fan_in --filter spsc --runs 3 --warmup 1 --overlay
+
+# Compare commits or the two latest recorded runs using Mann-Whitney U and Welch's t-test
+hugi compare --last
+hugi compare --commits <base>..<candidate>
+
+# Export pooled benchmark summaries to Markdown, JSONL, Parquet, Arrow IPC, or CSV
+hugi export --format md --out -
+hugi export --format jsonl --all-commits --out -
+```

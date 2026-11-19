@@ -2,7 +2,8 @@
 	"$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
 	"collections": [
 		{ "name": "sleipnir", "path": "." },
-		{ "name": "actor", "path": "./actor" }
+		{ "name": "actor", "path": "./actor" },
+		{ "name": "hugi", "path": "../hugi/hugi" }
 	],
 	"enable_document_symbols": true,
 	"enable_hover": true,
