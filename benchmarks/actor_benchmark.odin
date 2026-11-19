@@ -2263,7 +2263,7 @@ _replace_cli_str :: proc(dst: ^string, val: string, allocator := context.allocat
 _print_bench_usage :: proc() {
 	fmt.println("Usage: actor_benchmark [options]")
 	fmt.println("  --packet-out PATH  Write hugi Run_Packet (.hpk) to PATH")
-	fmt.println("  --runs N           Measured runs per benchmark (default: 3 with --packet-out, 1 otherwise)")
+	fmt.println("  --runs N           Measured runs per benchmark (default: 7 with --packet-out, 1 otherwise)")
 	fmt.println("  --warmup N         Warmup runs per benchmark (default: 1 with --packet-out, 0 otherwise)")
 	fmt.println("  --groups LIST      Comma/pipe-separated workload groups")
 	fmt.println("                     (workload_1_fan_in,workload_2_ping_pong,workload_3_large_payload,workload_4_swarm,workload_5_a2a)")
@@ -2353,7 +2353,7 @@ _parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg
 	}
 
 	if !runs_explicit {
-		cfg.runs = 3 if cfg.packet_out_path != "" else 1
+		cfg.runs = 7 if cfg.packet_out_path != "" else 1
 	}
 	if !warmup_explicit {
 		cfg.warmup = 1 if cfg.packet_out_path != "" else 0

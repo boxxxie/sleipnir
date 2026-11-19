@@ -1,0 +1,7 @@
+{
+	"db": "benchmarks/history.hugidb",
+	"pkg_dir": "benchmarks",
+	"runs": 7,
+	"warmup": 1,
+	"extra_build_flags": "-microarch:native"
+}
