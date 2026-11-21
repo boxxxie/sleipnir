@@ -29,7 +29,6 @@ import hugi "hugi:."
 import "base:intrinsics"
 import "core:c"
 import "core:fmt"
-import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -2236,6 +2235,11 @@ when USE_LIBPONYRT {
 Bench_CLI_Config :: struct {
 	runs:            int,
 	warmup:          int,
+	pin_cpu:         int,
+	has_pin:         bool,
+	counters:        bool,
+	test_mode:       bool,
+	host_warned:     bool,
 	groups_filter:   string,
 	name_filter:     string,
 	lang:            string,
@@ -2271,12 +2275,15 @@ _print_bench_usage :: proc() {
 	fmt.println("  --commit SHA       Override git commit SHA")
 	fmt.println("  --lang NAME        Language tag in packet (default: odin)")
 	fmt.println("  --run-id ID        Override run ID")
+	fmt.println("  --test             Smoke-run each benchmark once (runs=1, warmup=0)")
+	fmt.println("  --pin N            Logical CPU index hint forwarded by hugi")
 	fmt.println("  --quiet            Suppress terminal table output")
 }
 
 _parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg: Bench_CLI_Config, ok: bool, show_help: bool) {
 	cfg = Bench_CLI_Config{
-		lang = strings.clone("odin", allocator),
+		pin_cpu = -1,
+		lang    = strings.clone("odin", allocator),
 	}
 	runs_explicit := false
 	warmup_explicit := false
@@ -2290,6 +2297,18 @@ _parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg
 		}
 		if arg == "--quiet" || arg == "-quiet" {
 			cfg.quiet = true
+			continue
+		}
+		if arg == "--test" || arg == "-test" {
+			cfg.test_mode = true
+			continue
+		}
+		if arg == "--counters" || arg == "-counters" {
+			cfg.counters = true
+			continue
+		}
+		if arg == "--host-warned" || arg == "-host-warned" {
+			cfg.host_warned = true
 			continue
 		}
 		if !strings.has_prefix(arg, "-") {
@@ -2306,7 +2325,7 @@ _parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg
 			has_inline = true
 		}
 		switch key {
-		case "runs", "warmup", "groups", "group", "filter", "f", "lang", "commit", "run-id", "packet-out":
+		case "runs", "warmup", "pin", "groups", "group", "filter", "f", "lang", "commit", "run-id", "packet-out":
 		case:
 			_bench_cli_destroy(&cfg, allocator)
 			return {}, false, false
@@ -2336,6 +2355,14 @@ _parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg
 			}
 			cfg.warmup = n
 			warmup_explicit = true
+		case "pin":
+			n, p_ok := strconv.parse_int(val)
+			if !p_ok || n < 0 {
+				_bench_cli_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			cfg.pin_cpu = n
+			cfg.has_pin = true
 		case "groups", "group":
 			_replace_cli_str(&cfg.groups_filter, val, allocator)
 		case "filter", "f":
@@ -2357,6 +2384,10 @@ _parse_bench_cli :: proc(args: []string, allocator := context.allocator) -> (cfg
 	}
 	if !warmup_explicit {
 		cfg.warmup = 1 if cfg.packet_out_path != "" else 0
+	}
+	if cfg.test_mode {
+		cfg.runs = 1
+		cfg.warmup = 0
 	}
 	if cfg.commit == "" {
 		_replace_cli_str(&cfg.commit, hugi.resolve_git_commit(".", context.temp_allocator), allocator)
