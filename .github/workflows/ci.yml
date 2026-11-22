@@ -123,6 +123,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Checkout hugi v0.1.4 (runner only)
+        uses: actions/checkout@v4
+        with:
+          repository: boxxxie/hugi
+          ref: v0.1.4
+          path: .tmp/hugi
+          persist-credentials: false
+
+      - name: Init hugi obench submodule
+        run: git -C .tmp/hugi submodule update --init deps/obench
+
       - name: Setup Odin compiler
         uses: laytan/setup-odin@v2
         with:
@@ -131,9 +142,9 @@ jobs:
           cache: false
 
       - name: Type-check full benchmark suite
-        run: odin check benchmarks/actor_benchmark.odin -file
+        run: odin check benchmarks/actor_benchmark.odin -file -collection:hugi=.tmp/hugi/hugi
 
       - name: Build official Pony runtime (libponyrt) and type-check C FFI benchmark
         run: |
           ./benchmarks/build_libponyrt.sh
-          odin check benchmarks/actor_benchmark.odin -file -define:USE_LIBPONYRT=true
+          odin check benchmarks/actor_benchmark.odin -file -collection:hugi=.tmp/hugi/hugi -define:USE_LIBPONYRT=true
