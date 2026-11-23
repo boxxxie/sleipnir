@@ -3,7 +3,8 @@
 	"collections": [
 		{ "name": "sleipnir", "path": "." },
 		{ "name": "actor", "path": "./actor" },
-		{ "name": "hugi", "path": "../hugi/hugi" }
+		{ "name": "hugi", "path": "../hugi/hugi" },
+		{ "name": "temple", "path": "../temple" }
 	],
 	"enable_document_symbols": true,
 	"enable_hover": true,

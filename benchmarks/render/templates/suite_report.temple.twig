@@ -1,0 +1,80 @@
+[Root README](../README.md) · **Suite Renders**
+
+# Sleipnir Benchmarks & Visual Renders
+
+Lock-free M:N Pony actor scheduler, wait-free Sharded SPSC mailbox, C11 reference, and official `libponyrt` (`0.77.2`) benchmark suite for **Sleipnir** (`{{ this.total_benchmarks | int }}` benchmarks across `{{ this.group_count | int }}` groups, `{{ this.total_samples_str | raw }}` samples at commit `{{ this.commit | raw }}` in [`history.hugidb`](history.hugidb)), with visual SVG charts rendered via [`temple`](https://github.com/boxxxie/temple) under [`renders/`](renders/).
+
+---
+
+## Visual Renders (`-o:speed`)
+
+### 1. Workload 1: 4-Producer Fan-In Primitives (`2,000,000` Messages)
+
+![Workload 1 4-Producer Fan-In Primitives](renders/workload_1_fan_in.svg)
+
+### 2. Workload 5: Multi-Core `1,024`-Actor Ring Scaling (`1`–`16` Workers)
+
+![Multi-Core 1024-Actor Ring Scaling](renders/a2a_ring_scaling.svg)
+
+### 3. Workloads 2–4: Ping-Pong, Zero-Copy `512B` Payload & `1,024`-Actor Swarm
+
+![Workloads 2-4 Ping-Pong, Zero-Copy and Swarm](renders/workloads_2_3_4_overview.svg)
+
+---
+
+## Reproducing & Regenerating Renders
+
+```bash
+# 1. Run the suite and append results to benchmarks/history.hugidb
+hugi run benchmarks --runs 7 --warmup 1
+
+# 2. Run a subset of workloads without modifying history.hugidb
+hugi run benchmarks --overlay --runs 1 --groups workload_1_fan_in --filter spsc
+
+# 3. Statistically compare the last two commits (Mann-Whitney U / Welch t-test)
+hugi compare --last
+
+# 4. Regenerate SVG charts in benchmarks/renders/ and tables below using temple AOT templates
+odin run benchmarks/render -collection:temple=../temple
+
+# 5. Optional: build official libponyrt (0.77.2) and run C11 / FFI comparison
+./benchmarks/build_libponyrt.sh
+odin run benchmarks/actor_benchmark.odin -file -o:speed -define:USE_LIBPONYRT=true \
+  -extra-linker-flags:"-L.tmp/ponyc_build -lponyrt -Wl,-rpath,.tmp/ponyc_build -lpthread -ldl -lm -latomic"
+gcc -O3 -march=native -pthread -DUSE_LIBPONYRT -I.tmp/ponyc_src/src/libponyrt -I.tmp/ponyc_src/src/common \
+  benchmarks/actor_benchmark_c11.c -L.tmp/ponyc_build -lponyrt -Wl,-rpath,.tmp/ponyc_build -ldl -lm -latomic \
+  -o .tmp/actor_benchmark_c11 && ./.tmp/actor_benchmark_c11
+```
+
+---
+
+## Full Benchmark Results (`{{ this.total_benchmarks | int }}` Benchmarks at `{{ this.commit | raw }}`)
+
+<!-- BEGIN_BENCHMARK_TABLE -->
+{%- for group in this.groups %}
+### {{ group.title | raw }} (`{{ group.count | int }}` benchmarks)
+
+{%- if group.has_desc %}
+
+{{ group.desc | raw }}
+{%- end %}
+
+| Benchmark | Median (`p50`) | `P95` | Throughput / Ops | `CV%` | Allocs / op |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+{%- for row in group.rows %}
+| `{{ row.name | raw }}` | **{{ row.median | raw }}** | {{ row.p95 | raw }} | {{ row.ops | raw }} | {{ row.cv | raw }} | {{ row.allocs | raw }} |
+{%- end %}
+
+{%- end %}
+<!-- END_BENCHMARK_TABLE -->
+
+---
+
+## Architectural Decision Matrix
+
+| Workload Pattern | Recommended Primitive | Typical Latency / Throughput |
+| :--- | :--- | :--- |
+| **General stateful actors, dynamic topologies, supervision** | [`actor.Scheduler`](../actor/actor.odin) + [`actor.Envelope_Pool`](../actor/pool.odin) (`actor.send`) | `~22 ns` single send, `~15 ns` swarm fan-in |
+| **Producers emitting bursts of messages to one actor** | `actor.send(&sched, &pool, pid, batch[:])` (`Chain=K` splicing) | `~9 ns/msg` (`>100M/s` in `package actor`) |
+| **Pipelines, rings, routers, or ping-pong state machines** | `actor.forward(ctx, next_pid, msg)` (zero-copy `iso` handoff) | Multi-core `M:N` scaling down to `~23–41 ns/hop` at `16` workers |
+| **Hot sink actor fed by `P` known worker threads** | [`actor.Sharded_SPSC_Mailbox(T, N)`](../actor/spsc.odin) | `< 1 ns/msg` (`>1B/s` wait-free lane drain) |
