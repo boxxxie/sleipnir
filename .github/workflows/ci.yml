@@ -123,13 +123,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Checkout temple v1.0.0
+      - name: Checkout temple
         uses: actions/checkout@v4
         with:
           repository: boxxxie/temple
-          ref: v1.0.0
+          ref: main
           path: .tmp/temple
           persist-credentials: false
+
+      - name: Checkout hugi v0.2.0 (runner only)
+        uses: actions/checkout@v4
+        with:
+          repository: boxxxie/hugi
+          ref: v0.2.0
+          path: .tmp/hugi
+          persist-credentials: false
+
+      - name: Init hugi obench submodule
+        run: git -C .tmp/hugi submodule update --init deps/obench
 
       - name: Setup Odin compiler
         uses: laytan/setup-odin@v2
@@ -145,9 +156,9 @@ jobs:
           odin test benchmarks/render -collection:temple=.tmp/temple -vet -strict-style -vet-tabs -warnings-as-errors -vet-packages:bench_render -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
       - name: Type-check full benchmark suite
-        run: odin check benchmarks/actor_benchmark.odin -file
+        run: odin check benchmarks/actor_benchmark.odin -file -collection:hugi=.tmp/hugi/hugi -collection:obench=.tmp/hugi/deps/obench/obench
 
       - name: Build official Pony runtime (libponyrt) and type-check C FFI benchmark
         run: |
           ./benchmarks/build_libponyrt.sh
-          odin check benchmarks/actor_benchmark.odin -file -define:USE_LIBPONYRT=true
+          odin check benchmarks/actor_benchmark.odin -file -collection:hugi=.tmp/hugi/hugi -collection:obench=.tmp/hugi/deps/obench/obench -define:USE_LIBPONYRT=true
