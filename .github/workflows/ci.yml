@@ -123,12 +123,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Checkout temple
+      - name: Checkout runa
         uses: actions/checkout@v4
         with:
-          repository: boxxxie/temple
-          ref: main
-          path: .tmp/temple
+          repository: boxxxie/runa
+          ref: master
+          path: .tmp/runa
           persist-credentials: false
 
       - name: Checkout hugi v0.2.0 (runner only)
@@ -149,11 +149,11 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           cache: false
 
-      - name: Verify temple benchmark renderer
+      - name: Verify runa benchmark renderer
         run: |
-          odin run .tmp/temple/cli -- --check --warn-unused benchmarks/render -out:benchmarks/render/templates_gen.odin -pkg:bench_render -temple-import:temple:.
-          odin check benchmarks/render -collection:temple=.tmp/temple -vet -strict-style -vet-tabs -warnings-as-errors -vet-packages:bench_render
-          odin test benchmarks/render -collection:temple=.tmp/temple -vet -strict-style -vet-tabs -warnings-as-errors -vet-packages:bench_render -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+          odin run .tmp/runa/cli -- --check --warn-unused benchmarks/render -out:benchmarks/render/templates_gen.odin -pkg:bench_render -runa-import:runa:.
+          odin check benchmarks/render -collection:runa=.tmp/runa -vet -strict-style -vet-tabs -warnings-as-errors -vet-packages:bench_render
+          odin test benchmarks/render -collection:runa=.tmp/runa -vet -strict-style -vet-tabs -warnings-as-errors -vet-packages:bench_render -define:ODIN_TEST_FANCY=false -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 
       - name: Type-check full benchmark suite
         run: odin check benchmarks/actor_benchmark.odin -file -collection:hugi=.tmp/hugi/hugi -collection:obench=.tmp/hugi/deps/obench/obench

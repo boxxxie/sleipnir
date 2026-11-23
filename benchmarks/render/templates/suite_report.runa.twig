@@ -2,7 +2,7 @@
 
 # Sleipnir Benchmarks & Visual Renders
 
-Lock-free M:N Pony actor scheduler, wait-free Sharded SPSC mailbox, C11 reference, and official `libponyrt` (`0.77.2`) benchmark suite for **Sleipnir** (`{{ this.total_benchmarks | int }}` benchmarks across `{{ this.group_count | int }}` groups, `{{ this.total_samples_str | raw }}` samples at commit `{{ this.commit | raw }}` in [`history.hugidb`](history.hugidb)), with visual SVG charts rendered via [`temple`](https://github.com/boxxxie/temple) under [`renders/`](renders/).
+Lock-free M:N Pony actor scheduler, wait-free Sharded SPSC mailbox, C11 reference, and official `libponyrt` (`0.77.2`) benchmark suite for **Sleipnir** (`{{ this.total_benchmarks | int }}` benchmarks across `{{ this.group_count | int }}` groups, `{{ this.total_samples_str | raw }}` samples at commit `{{ this.commit | raw }}` in [`history.hugidb`](history.hugidb)), with visual SVG charts rendered via [`runa`](https://github.com/boxxxie/runa) under [`renders/`](renders/).
 
 ---
 
@@ -34,8 +34,8 @@ hugi run benchmarks --overlay --runs 1 --groups workload_1_fan_in --filter spsc
 # 3. Statistically compare the last two commits (Mann-Whitney U / Welch t-test)
 hugi compare --last
 
-# 4. Regenerate SVG charts in benchmarks/renders/ and tables below using temple AOT templates
-odin run benchmarks/render -collection:temple=../temple
+# 4. Regenerate SVG charts in benchmarks/renders/ and tables below using runa AOT templates
+odin run benchmarks/render -collection:runa=../runa
 
 # 5. Optional: build official libponyrt (0.77.2) and run C11 / FFI comparison
 ./benchmarks/build_libponyrt.sh
